@@ -1,0 +1,49 @@
+name: chatgpt2api-go
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: imagecore
+      POSTGRES_DB: imagecore
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U imagecore -d imagecore"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+  core:
+    build: .
+    image: chatgpt2api-go:prototype
+    env_file: .env
+    environment:
+      CORE_DATABASE_URL: postgres://imagecore:${POSTGRES_PASSWORD}@postgres:5432/imagecore?sslmode=disable
+      CORE_IMAGE_DIR: /data/images
+      CORE_LISTEN: :9080
+    ports:
+      - "${CORE_BIND_ADDRESS:-127.0.0.1}:${CORE_PORT:-9080}:9080"
+    volumes:
+      - images:/data/images
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    init: true
+    stop_grace_period: 40s
+    restart: unless-stopped
+    logging: *logging
+volumes:
+  pgdata:
+  images:
