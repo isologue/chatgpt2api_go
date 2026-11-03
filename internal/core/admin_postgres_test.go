@@ -26,7 +26,7 @@ func TestPostgresManagementSettingsAndJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	reset := func() {
-		if _, err := s.db.Exec(ctx, "TRUNCATE core_accounts,core_tasks,core_requests,core_admin_jobs; UPDATE core_settings SET revision=0,values='{}'"); err != nil {
+		if _, err := s.db.Exec(ctx, "TRUNCATE core_idempotency,core_accounts,core_tasks,core_requests,core_admin_jobs; UPDATE core_settings SET revision=0,values='{}'"); err != nil {
 			t.Fatal(err)
 		}
 	}

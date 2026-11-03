@@ -382,7 +382,7 @@ func (m *resourceManager) overview(ctx context.Context) (map[string]any, error) 
 		return m.summary, nil
 	}
 	var images, imageBytes, logs, bodyBytes, requestBytes, dbBytes, pending, pendingBytes int64
-	err := m.s.db.QueryRow(ctx, `SELECT (SELECT count(*) FROM core_images),(SELECT COALESCE(sum(bytes),0) FROM core_images),(SELECT count(*) FROM core_requests),(SELECT COALESCE(sum(response_bytes),0) FROM core_request_payloads),(SELECT COALESCE(sum(octet_length(request_body)),0) FROM core_request_payloads),pg_total_relation_size('core_requests')+pg_total_relation_size('core_request_payloads')+pg_total_relation_size('core_tasks'),(SELECT count(*) FROM core_file_gc),(SELECT COALESCE(sum(bytes),0) FROM core_file_gc)`).Scan(&images, &imageBytes, &logs, &bodyBytes, &requestBytes, &dbBytes, &pending, &pendingBytes)
+	err := m.s.db.QueryRow(ctx, `SELECT (SELECT count(*) FROM core_images),(SELECT COALESCE(sum(bytes),0) FROM core_images),(SELECT count(*) FROM core_requests),(SELECT COALESCE(sum(response_bytes),0) FROM core_request_payloads),(SELECT COALESCE(sum(COALESCE(octet_length(request_body),0)+request_bytes),0) FROM core_request_payloads),pg_total_relation_size('core_requests')+pg_total_relation_size('core_request_payloads')+pg_total_relation_size('core_tasks'),(SELECT count(*) FROM core_file_gc),(SELECT COALESCE(sum(bytes),0) FROM core_file_gc)`).Scan(&images, &imageBytes, &logs, &bodyBytes, &requestBytes, &dbBytes, &pending, &pendingBytes)
 	if err != nil {
 		return nil, err
 	}

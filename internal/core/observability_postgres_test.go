@@ -245,3 +245,72 @@ func TestPostgresWireCaptureConcurrent(t *testing.T) {
 		t.Fatal("deferred endpoint changed value", err)
 	}
 }
+
+// 异步创建的父任务已持久化，不能等待任务结束的调用日志才发送 queued。
+func TestPostgresAsyncCaptureReturnsBeforeGenerationCompletes(t *testing.T) {
+	url := os.Getenv("CORE_TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("requires dedicated CORE_TEST_DATABASE_URL")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, err := OpenPostgres(ctx, url, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err = s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reset := func() {
+		if _, e := s.db.Exec(context.Background(), "TRUNCATE core_idempotency,core_tasks,core_requests,core_request_payloads"); e != nil {
+			t.Error(e)
+		}
+	}
+	reset()
+	defer reset()
+	release := make(chan struct{})
+	c := testConfig(t)
+	engine := NewEngine(c, NewPool(testAccounts(1), 1), s, generateFunc(func(ctx context.Context, _ Account, _ Request, _ map[string]float64) ([]Artifact, error) {
+		select {
+		case <-release:
+			return nil, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}))
+	defer engine.Close()
+	defer close(release)
+	server := httptest.NewServer(NewHandler(engine))
+	defer server.Close()
+	client := server.Client()
+	client.Timeout = 2 * time.Second
+	req, _ := http.NewRequest("POST", server.URL+"/v1/images/generations", strings.NewReader(`{"prompt":"async capture fixture","async":true}`))
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	response, err := client.Do(req)
+	if err != nil {
+		t.Fatal("async creation waited for running generator", err)
+	}
+	defer response.Body.Close()
+	var queued struct {
+		ID     string `json:"task_id"`
+		Status string `json:"status"`
+	}
+	if err = json.NewDecoder(response.Body).Decode(&queued); err != nil || response.StatusCode != 200 || queued.Status != "queued" || queued.ID == "" {
+		t.Fatalf("invalid async creation status=%d parsed=%+v err=%v", response.StatusCode, queued, err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		payload, e := s.ReadPayload(ctx, queued.ID, "create")
+		if e == nil {
+			if payload.Status != 200 {
+				t.Fatal("wrong captured status")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("queued response was not captured", e)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

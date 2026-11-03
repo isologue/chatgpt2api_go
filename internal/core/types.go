@@ -9,14 +9,20 @@ import (
 )
 
 type Request struct {
-	Prompt  string `json:"prompt"`
-	Model   string `json:"model"`
-	N       int    `json:"n"`
-	Size    string `json:"size,omitempty"`
-	Quality string `json:"quality,omitempty"`
-	Format  string `json:"response_format,omitempty"`
-	Async   bool   `json:"async,omitempty"`
-	Stream  bool   `json:"stream,omitempty"`
+	apiKeyID, apiKeyName       string
+	keyConcurrency             int
+	idemScope, idemFingerprint string
+	inputs                     []editInput
+	masks                      []editInput
+	cleanup                    func()
+	Prompt                     string `json:"prompt"`
+	Model                      string `json:"model"`
+	N                          int    `json:"n"`
+	Size                       string `json:"size,omitempty"`
+	Quality                    string `json:"quality,omitempty"`
+	Format                     string `json:"response_format,omitempty"`
+	Async                      bool   `json:"async,omitempty"`
+	Stream                     bool   `json:"stream,omitempty"`
 }
 type APIError struct {
 	Status     int           `json:"-"`
@@ -68,7 +74,7 @@ func (r *Request) Validate(c Config) error {
 		r.Model = "gpt-image-2"
 	}
 	if r.Model != "gpt-image-2" {
-		return Err(400, "unsupported_model", "当前原型仅支持 gpt-image-2 文生图")
+		return Err(400, "unsupported_model", "当前仅支持 gpt-image-2")
 	}
 	if r.N < 1 || r.N > 4 {
 		return Err(400, "invalid_n", "n 必须在 1 到 4 之间")
@@ -93,19 +99,32 @@ func (r *Request) Validate(c Config) error {
 }
 
 type Account struct {
-	Revision     int64     `json:"revision"`
-	ID           string    `json:"id"`
-	Email        string    `json:"email"`
-	AccessToken  string    `json:"access_token"`
-	RefreshToken string    `json:"refresh_token,omitempty"`
-	ClientID     string    `json:"client_id,omitempty"`
-	DeviceID     string    `json:"device_id,omitempty"`
-	UserAgent    string    `json:"user_agent,omitempty"`
-	Score        int       `json:"score"`
-	Enabled      bool      `json:"enabled"`
-	VerifiedAt   time.Time `json:"verified_at,omitempty"`
-	SuccessAt    time.Time `json:"success_at,omitempty"`
-	AvailableAt  time.Time `json:"available_at,omitempty"`
+	Extra            map[string]json.RawMessage `json:"-"`
+	NextRefreshAt    time.Time                  `json:"next_refresh_at,omitempty"`
+	RefreshFailures  int                        `json:"refresh_failures,omitempty"`
+	Revision         int64                      `json:"revision"`
+	ID               string                     `json:"id"`
+	IdentityID       string                     `json:"identity_id,omitempty"`
+	Email            string                     `json:"email"`
+	AccessToken      string                     `json:"access_token"`
+	RefreshToken     string                     `json:"refresh_token,omitempty"`
+	ClientID         string                     `json:"client_id,omitempty"`
+	DeviceID         string                     `json:"device_id,omitempty"`
+	UserAgent        string                     `json:"user_agent,omitempty"`
+	Score            int                        `json:"score"`
+	Enabled          bool                       `json:"enabled"`
+	VerifiedAt       time.Time                  `json:"verified_at,omitempty"`
+	SuccessAt        time.Time                  `json:"success_at,omitempty"`
+	AvailableAt      time.Time                  `json:"available_at,omitempty"`
+	LastUsedAt       time.Time                  `json:"last_used_at,omitempty"`
+	LastRefreshAt    time.Time                  `json:"last_refresh_at,omitempty"`
+	LastRefreshError string                     `json:"last_refresh_error,omitempty"`
+	Hot              bool                       `json:"hot"`
+	HotSince         time.Time                  `json:"hot_since,omitempty"`
+	Quota            *float64                   `json:"quota,omitempty"`
+	QuotaResetAt     time.Time                  `json:"quota_reset_at,omitempty"`
+	Status           string                     `json:"status,omitempty"`
+	LastErrorCode    string                     `json:"last_error_code,omitempty"`
 }
 type Artifact struct {
 	Name  string `json:"name"`

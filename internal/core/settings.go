@@ -93,6 +93,20 @@ func applySettingValues(base Config, values map[string]json.RawMessage) (Config,
 			c.ResponseConcurrency = v
 		case "CORE_VERIFY_CONCURRENCY":
 			c.VerifyConcurrency = v
+		case "CORE_EDIT_MAX_MIB":
+			c.EditMaxMiB = v
+		case "CORE_EDIT_MAX_IMAGES":
+			c.EditMaxImages = v
+		case "CORE_IMPORT_MAX_MIB":
+			c.ImportMaxMiB = v
+		case "CORE_HOT_POOL_SIZE":
+			c.HotPoolSize = v
+		case "CORE_HOT_IDLE":
+			c.HotIdle = d
+		case "CORE_HOT_MAINTENANCE_INTERVAL":
+			c.HotMaintenanceInterval = d
+		case "CORE_COLD_MAINTENANCE_INTERVAL":
+			c.ColdMaintenanceInterval = d
 		case "CORE_AVAILABILITY_TTL":
 			c.Freshness = d
 		case "CORE_TOTAL_TIMEOUT":
@@ -158,6 +172,9 @@ func (e *Engine) applyConfig(c Config) {
 		n.validation.Resize(c.ValidationConcurrency)
 		n.verify.Resize(c.VerifyConcurrency)
 		n.manualVerify.Resize(c.VerifyConcurrency)
+		n.hotMaintenance.Resize(c.VerifyConcurrency)
+		n.coldMaintenance.Resize(c.VerifyConcurrency)
+		n.replenishment.Resize(c.VerifyConcurrency)
 	}
 	if e.resources != nil {
 		e.resources.thumbnails.Resize(c.thumbnailLimit())

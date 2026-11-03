@@ -60,7 +60,15 @@ func run() error {
 	if err = store.RecoverTasks(startup); err != nil {
 		return err
 	}
-	accounts, err := store.LoadAccounts(startup)
+	if err = core.CleanupEditInputs(c); err != nil {
+		return err
+	}
+	accountStartup, accountCancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer accountCancel()
+	if err = store.ReconcileAccountIdentities(accountStartup); err != nil {
+		return err
+	}
+	accounts, err := store.LoadAccounts(accountStartup)
 	if err != nil {
 		return err
 	}
@@ -72,7 +80,14 @@ func run() error {
 	defer native.Close()
 	engine := core.NewEngine(c, pool, store, native)
 	defer engine.Close()
+	accessStartup, accessCancel := context.WithTimeout(ctx, 15*time.Second)
+	err = engine.InitializeAccess(accessStartup)
+	accessCancel()
+	if err != nil {
+		return err
+	}
 	engine.StartResourceMaintenance()
+	engine.StartAccountMaintenance()
 	server := &http.Server{Addr: c.Listen, Handler: core.NewHandler(engine), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 << 10}
 	done := make(chan error, 1)
 	go func() { done <- server.ListenAndServe() }()

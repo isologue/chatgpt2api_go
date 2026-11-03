@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"io"
+
 	"net/http"
 	"strings"
 	"sync"
@@ -15,6 +16,8 @@ import (
 )
 
 type adminJobError struct {
+	Index     *int   `json:"index,omitempty"`
+	Kind      string `json:"kind,omitempty"`
 	AccountID string `json:"account_id,omitempty"`
 	Email     string `json:"email,omitempty"`
 	Message   string `json:"message"`
@@ -34,6 +37,10 @@ type adminJob struct {
 	Created    time.Time       `json:"created_at"`
 	Updated    time.Time       `json:"updated_at"`
 }
+type accountExporter interface {
+	ExportAccounts(context.Context, io.Writer) error
+}
+
 type accountManager interface {
 	InsertManagedAccounts(context.Context, []Account) ([]Account, error)
 	SetAccountEnabled(context.Context, string, bool) error
@@ -47,6 +54,8 @@ type accountManager interface {
 
 func (a *API) registerAccountManagement(m *http.ServeMux) {
 	m.HandleFunc("POST /admin/accounts/import", a.admin(a.importAccounts))
+	a.registerAccountPush(m)
+	m.HandleFunc("GET /admin/accounts/export", a.admin(a.exportAccounts))
 	m.HandleFunc("POST /admin/accounts/verify", a.admin(a.verifyAccounts))
 	m.HandleFunc("PATCH /admin/accounts/{id}", a.admin(a.setAccountEnabled))
 	m.HandleFunc("DELETE /admin/accounts/{id}", a.admin(a.deleteAccount))
@@ -141,7 +150,7 @@ func newAdminJob(kind string) adminJob {
 func jobFailure(j *adminJob, id, email, message string) {
 	j.Failed++
 	if len(j.Errors) < 100 {
-		j.Errors = append(j.Errors, adminJobError{id, email, message})
+		j.Errors = append(j.Errors, adminJobError{AccountID: id, Email: email, Message: message})
 	}
 }
 func (a *API) saveJob(s accountManager, j *adminJob) bool {
@@ -160,7 +169,7 @@ func (a *API) importAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !a.Engine.importBusy.CompareAndSwap(false, true) {
-		sendError(w, Err(429, "import_busy", "已有账号导入任务正在执行"))
+		sendError(w, Err(429, "import_busy", "已有账号导入或推送任务正在执行"))
 		return
 	}
 	handed := false
@@ -169,54 +178,61 @@ func (a *API) importAccounts(w http.ResponseWriter, r *http.Request) {
 			a.Engine.importBusy.Store(false)
 		}
 	}()
-	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
-	raw, err := io.ReadAll(r.Body)
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(5 * time.Minute))
+	f, err := prepareAccountImport(r, a.Engine.CurrentConfig().importLimit())
 	if err != nil {
-		sendError(w, Err(400, "import_too_large", "导入文件超过 32 MiB"))
+		sendError(w, AsError(err))
 		return
 	}
-	var data json.RawMessage = raw
-	var wrapper map[string]json.RawMessage
-	if json.Unmarshal(raw, &wrapper) == nil && wrapper != nil {
-		if wrapper["accounts"] != nil {
-			data = wrapper["accounts"]
-		} else if wrapper["data"] != nil {
-			data = wrapper["data"]
-		} else {
-			data = append(append([]byte{'['}, raw...), ']')
-		}
-	}
-	var rows []json.RawMessage
-	if json.Unmarshal(data, &rows) != nil || len(rows) == 0 {
-		sendError(w, Err(400, "invalid_accounts", "请提供非空 JSON 账号数组、单个账号或 accounts/data 包装数组"))
+	job, _, err := a.launchAccountImport(r.Context(), s, f, "import")
+	if err != nil {
+		f.Close()
+		managementError(w, err)
 		return
 	}
-	j := newAdminJob("import")
-	j.Total = len(rows)
-	accounts := make([]Account, 0, len(rows))
-	seen := map[string]bool{}
-	for i, row := range rows {
-		items, err := ParseAccounts(row)
-		if err != nil || len(items) != 1 {
-			j.Processed++
-			jobFailure(&j, "", "", fmt.Sprintf("第 %d 行账号格式无效或缺少 access_token", i+1))
-			continue
-		}
-		account := items[0]
-		fp := Fingerprint(account.AccessToken)
-		if seen[fp] {
-			j.Processed++
-			j.Duplicates++
-			continue
-		}
-		seen[fp] = true
-		accounts = append(accounts, account)
+	handed = true
+	sendJSON(w, 202, job)
+}
+
+// 文件上传完成后任务归属进程根上下文，客户端断开不取消已经开始的入库。
+func (a *API) launchAccountImport(ctx context.Context, s accountManager, f *accountImportFile, kind string) (adminJob, <-chan adminJob, error) {
+	j := newAdminJob(kind)
+	j.Total = f.total
+	save, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err := s.SaveAdminJob(save, j)
+	cancel()
+	if err != nil {
+		return j, nil, err
 	}
-	handed = a.startAdminJob(w, r, s, j, func(j *adminJob) {
-		defer a.Engine.importBusy.Store(false)
-		for start := 0; start < len(accounts); start += 100 {
-			end := min(start+100, len(accounts))
-			batch := accounts[start:end]
+	e := a.Engine
+	e.admission.RLock()
+	if e.closing.Load() {
+		e.admission.RUnlock()
+		j.Status = "failed"
+		j.Message = "服务正在停止"
+		a.saveJob(s, &j)
+		return j, nil, context.Canceled
+	}
+	e.adminWG.Add(1)
+	e.admission.RUnlock()
+	initial := j
+	done := make(chan adminJob, 1)
+	go func() {
+		defer e.adminWG.Done()
+		defer func() {
+			f.Close()
+			e.importBusy.Store(false)
+			done <- j
+			close(done)
+		}()
+		a.runAccountImport(s, f, &j)
+	}()
+	return initial, done, nil
+}
+func (a *API) runAccountImport(s accountManager, f *accountImportFile, j *adminJob) {
+	batch := make([]Account, 0, 100)
+	flush := func() error {
+		if len(batch) > 0 {
 			ctx, cancel := context.WithTimeout(a.Engine.root, 15*time.Second)
 			a.Engine.accountOps.Lock()
 			inserted, err := s.InsertManagedAccounts(ctx, batch)
@@ -226,24 +242,51 @@ func (a *API) importAccounts(w http.ResponseWriter, r *http.Request) {
 			a.Engine.accountOps.Unlock()
 			cancel()
 			if err != nil {
-				j.Status = "failed"
-				j.Message = "导入中断，已完成批次保留；可重试导入"
-				a.saveJob(s, j)
-				return
+				return err
 			}
-			j.Processed += len(batch)
 			j.Imported += len(inserted)
 			j.Duplicates += len(batch) - len(inserted)
-			if !a.saveJob(s, j) {
-				j.Status = "failed"
-				j.Message = "保存任务进度失败，已完成批次保留；可重试导入"
-				a.saveJob(s, j)
-				return
-			}
+			j.Processed += len(batch)
+			batch = batch[:0]
 		}
-		j.Status = "completed"
-		a.saveJob(s, j)
+		if !a.saveJob(s, j) {
+			return fmt.Errorf("无法保存任务进度")
+		}
+		return nil
+	}
+	index := 0
+	_, _, err := scanAccountDocument(f.file, func(row json.RawMessage) error {
+		index++
+		if err := a.Engine.root.Err(); err != nil {
+			return err
+		}
+		account, err := parseAccountRow(row, f.meta)
+		if err != nil {
+			j.Processed++
+			jobFailure(j, "", "", fmt.Sprintf("第 %d 条：%s", index, err.Error()))
+			if j.Failed <= 100 {
+				zeroBased := index - 1
+				j.Errors[len(j.Errors)-1].Index = &zeroBased
+				j.Errors[len(j.Errors)-1].Kind = "account"
+			}
+		} else {
+			batch = append(batch, account)
+		}
+		if index%100 == 0 {
+			return flush()
+		}
+		return nil
 	})
+	if err == nil {
+		err = flush()
+	}
+	if err != nil {
+		j.Status = "failed"
+		j.Message = "导入中断，已完成批次保留，可重试导入"
+	} else {
+		j.Status = "completed"
+	}
+	a.saveJob(s, j)
 }
 func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 	s, ok := a.manager(w)
@@ -317,7 +360,7 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 						result.Message = "账号已删除"
 					} else {
 						result.Email = account.Email
-						ctx, cancel := context.WithTimeout(a.Engine.root, 2*a.Engine.CurrentConfig().MetadataTimeout)
+						ctx, cancel := context.WithTimeout(a.Engine.root, 3*a.Engine.CurrentConfig().MetadataTimeout)
 						_, err := n.checkAccount(ctx, account, true)
 						cancel()
 						if err != nil {
@@ -432,4 +475,39 @@ func (a *API) getAdminJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sendJSON(w, 200, j)
+}
+
+type exportWriter struct {
+	http.ResponseWriter
+	started bool
+}
+
+func (w *exportWriter) Write(p []byte) (int, error) {
+	w.started = true
+	return w.ResponseWriter.Write(p)
+}
+func (a *API) exportAccounts(w http.ResponseWriter, r *http.Request) {
+	exporter, ok := a.Engine.Store.(accountExporter)
+	if !ok {
+		sendError(w, Err(503, "export_unavailable", "当前存储不支持账号导出"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	controller := http.NewResponseController(w)
+	_ = controller.SetWriteDeadline(time.Now().Add(5 * time.Minute))
+	defer controller.SetWriteDeadline(time.Time{})
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="accounts-full.json"`)
+	w.Header().Set("Cache-Control", "no-store")
+	stream := &exportWriter{ResponseWriter: w}
+	if err := exporter.ExportAccounts(ctx, stream); err != nil {
+		if !stream.started {
+			w.Header().Del("Content-Disposition")
+			sendError(w, Err(503, "account_export_failed", "账号导出失败，请重试"))
+			return
+		}
+		// 流中途失败必须中断传输，不能把截断文件当作成功下载。
+		panic(http.ErrAbortHandler)
+	}
 }

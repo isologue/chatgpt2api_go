@@ -20,15 +20,19 @@ var errPayloadExpired = errors.New("request already removed")
 
 type wireCaptureKey struct{}
 type wireCapture struct {
-	id, kind string
-	request  []byte
+	logPersisted             <-chan struct{}
+	requestFile, contentType string
+	id, kind                 string
+	request                  []byte
 }
 type payloadRecord struct {
-	Request  []byte
-	File     string
-	Bytes    int64
-	Status   int
-	Finished time.Time
+	RequestFile, ContentType string
+	RequestBytes             int64
+	Request                  []byte
+	File                     string
+	Bytes                    int64
+	Status                   int
+	Finished                 time.Time
 }
 type payloadStore interface {
 	SavePayload(context.Context, string, string, payloadRecord) (string, error)
@@ -85,12 +89,20 @@ func (a *API) captureCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = io.NopCloser(bytes.NewReader(raw))
+	r = r.WithContext(context.WithValue(r.Context(), requestHashKey{}, canonicalHash(raw)))
 	a.captureWire(w, r, &wireCapture{kind: "create", request: raw}, a.create)
 }
 func (a *API) captureTask(w http.ResponseWriter, r *http.Request) {
 	a.captureWire(w, r, &wireCapture{kind: "result"}, a.task)
 }
 func (a *API) captureWire(w http.ResponseWriter, r *http.Request, c *wireCapture, next http.HandlerFunc) {
+	r = r.WithContext(context.WithValue(r.Context(), wireCaptureKey{}, c))
+	requestSaved := false
+	defer func() {
+		if c.requestFile != "" && !requestSaved {
+			os.Remove(filepath.Join(a.payloadDir(), c.requestFile))
+		}
+	}()
 	store, ok := a.Engine.Store.(payloadStore)
 	if !ok {
 		next(w, r)
@@ -113,9 +125,25 @@ func (a *API) captureWire(w http.ResponseWriter, r *http.Request, c *wireCapture
 		a.Engine.Stats.PersistenceErrors.Add(1)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 报文索引依赖父日志；等待实际批次提交，避免将“尚未落库”当成“已清理”。
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	old, err := store.SavePayload(ctx, c.id, c.kind, payloadRecord{Request: c.request, File: filepath.Base(ww.file.Name()), Bytes: ww.size, Status: ww.status, Finished: time.Now()})
+	if c.kind == "create" && c.logPersisted != nil {
+		select {
+		case <-c.logPersisted:
+		case <-ctx.Done():
+			os.Remove(ww.file.Name())
+			a.Engine.Stats.PersistenceErrors.Add(1)
+			return
+		}
+	}
+	var requestBytes int64
+	if c.requestFile != "" {
+		if stat, e := os.Stat(filepath.Join(a.payloadDir(), c.requestFile)); e == nil {
+			requestBytes = stat.Size()
+		}
+	}
+	old, err := store.SavePayload(ctx, c.id, c.kind, payloadRecord{RequestFile: c.requestFile, ContentType: c.contentType, RequestBytes: requestBytes, Request: c.request, File: filepath.Base(ww.file.Name()), Bytes: ww.size, Status: ww.status, Finished: time.Now()})
 	if err != nil {
 		os.Remove(ww.file.Name())
 		if !errors.Is(err, errPayloadExpired) {
@@ -123,6 +151,7 @@ func (a *API) captureWire(w http.ResponseWriter, r *http.Request, c *wireCapture
 		}
 		return
 	}
+	requestSaved = true
 	if old != "" && filepath.Base(old) == old {
 		os.Remove(filepath.Join(a.payloadDir(), old))
 	}
@@ -150,14 +179,19 @@ func (s *Postgres) SavePayload(ctx context.Context, id, kind string, p payloadRe
 	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", id+":"+kind); err != nil {
 		return "", err
 	}
-	var old string
-	err = tx.QueryRow(ctx, "SELECT response_file FROM core_request_payloads WHERE id=$1 AND kind=$2", id, kind).Scan(&old)
+	var old, oldRequest string
+	err = tx.QueryRow(ctx, "SELECT response_file,request_file FROM core_request_payloads WHERE id=$1 AND kind=$2", id, kind).Scan(&old, &oldRequest)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return "", err
 	}
-	_, err = tx.Exec(ctx, "INSERT INTO core_request_payloads(id,kind,request_body,response_file,response_bytes,http_status,finished_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id,kind) DO UPDATE SET request_body=EXCLUDED.request_body,response_file=EXCLUDED.response_file,response_bytes=EXCLUDED.response_bytes,http_status=EXCLUDED.http_status,finished_at=EXCLUDED.finished_at", id, kind, p.Request, p.File, p.Bytes, p.Status, p.Finished)
+	_, err = tx.Exec(ctx, "INSERT INTO core_request_payloads(id,kind,request_body,response_file,response_bytes,http_status,finished_at,request_file,request_content_type,request_bytes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(id,kind) DO UPDATE SET request_body=EXCLUDED.request_body,response_file=EXCLUDED.response_file,response_bytes=EXCLUDED.response_bytes,http_status=EXCLUDED.http_status,finished_at=EXCLUDED.finished_at,request_file=EXCLUDED.request_file,request_content_type=EXCLUDED.request_content_type,request_bytes=EXCLUDED.request_bytes", id, kind, p.Request, p.File, p.Bytes, p.Status, p.Finished, p.RequestFile, p.ContentType, p.RequestBytes)
 	if err != nil {
 		return "", err
+	}
+	if oldRequest != "" && oldRequest != p.RequestFile {
+		if _, err = tx.Exec(ctx, "INSERT INTO core_file_gc(namespace,name) VALUES('logs',$1) ON CONFLICT DO NOTHING", oldRequest); err != nil {
+			return "", err
+		}
 	}
 	if old != "" && old != p.File {
 		if _, err = tx.Exec(ctx, "INSERT INTO core_file_gc(namespace,name) VALUES('logs',$1) ON CONFLICT DO NOTHING", old); err != nil {
@@ -168,7 +202,7 @@ func (s *Postgres) SavePayload(ctx context.Context, id, kind string, p payloadRe
 }
 func (s *Postgres) ReadPayload(ctx context.Context, id, kind string) (payloadRecord, error) {
 	var p payloadRecord
-	err := s.db.QueryRow(ctx, "SELECT request_body,response_file,response_bytes,http_status,finished_at FROM core_request_payloads WHERE id=$1 AND kind=$2", id, kind).Scan(&p.Request, &p.File, &p.Bytes, &p.Status, &p.Finished)
+	err := s.db.QueryRow(ctx, "SELECT request_body,response_file,response_bytes,http_status,finished_at,request_file,request_content_type,request_bytes FROM core_request_payloads WHERE id=$1 AND kind=$2", id, kind).Scan(&p.Request, &p.File, &p.Bytes, &p.Status, &p.Finished, &p.RequestFile, &p.ContentType, &p.RequestBytes)
 	return p, err
 }
 
@@ -388,7 +422,18 @@ func (a *API) consoleBody(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if kind == "request" {
-			source = bytes.NewReader(p.Request)
+			if p.RequestFile != "" {
+				if filepath.Base(p.RequestFile) != p.RequestFile {
+					err = fmt.Errorf("invalid request path")
+					break
+				}
+				file, err = os.Open(filepath.Join(a.payloadDir(), p.RequestFile))
+				if err == nil {
+					source = file
+				}
+			} else {
+				source = bytes.NewReader(p.Request)
+			}
 			break
 		}
 		if filepath.Base(p.File) != p.File || p.File == "." || p.File == "" {
@@ -418,6 +463,9 @@ func (a *API) consoleBody(w http.ResponseWriter, r *http.Request) {
 	size := p.Bytes
 	if kind == "request" {
 		size = int64(len(p.Request))
+		if p.RequestFile != "" {
+			size = p.RequestBytes
+		}
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	if raw := r.URL.Query().Get("offset"); raw != "" {
@@ -433,8 +481,17 @@ func (a *API) consoleBody(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Query().Get("raw") == "1" {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if kind == "request" && p.RequestFile != "" {
+			w.Header().Set("Content-Type", p.ContentType)
+			w.Header().Set("Content-Disposition", `attachment; filename="request.multipart"`)
+		} else {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		}
 		io.Copy(w, source)
+		return
+	}
+	if kind == "request" && p.RequestFile != "" {
+		sendJSON(w, 200, map[string]any{"multipart": true, "bytes": size, "content_type": p.ContentType, "http_status": p.Status, "captured_at": p.Finished})
 		return
 	}
 	tree, e := previewJSON(source)

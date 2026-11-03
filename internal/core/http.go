@@ -24,6 +24,9 @@ type API struct {
 }
 
 func NewHandler(e *Engine) http.Handler {
+	if e.access == nil {
+		e.access = newAccessManager(e.Config)
+	}
 	if e.responses == nil {
 		e.responses = newLimiter(e.Config.ResponseConcurrency)
 	}
@@ -33,7 +36,9 @@ func NewHandler(e *Engine) http.Handler {
 	m.HandleFunc("GET /readyz", a.ready)
 	m.HandleFunc("GET /admin/metrics", a.admin(a.metrics))
 	a.registerConsole(m)
+	a.registerAccess(m)
 	m.HandleFunc("POST /v1/images/generations", a.auth(a.captureCreate))
+	m.HandleFunc("POST /v1/images/edits", a.auth(a.edit))
 	m.HandleFunc("GET /v1/images/tasks/{id}", a.auth(a.captureTask))
 	m.HandleFunc("GET /images/{name}", a.image)
 	m.HandleFunc("GET /v1/models", a.auth(func(w http.ResponseWriter, r *http.Request) {
@@ -45,21 +50,39 @@ func secureEqual(a, b string) bool {
 	x, y := sha256.Sum256([]byte(a)), sha256.Sum256([]byte(b))
 	return subtle.ConstantTimeCompare(x[:], y[:]) == 1
 }
-func (a *API) guard(key string, next http.HandlerFunc) http.HandlerFunc {
+func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
-		if !secureEqual(r.Header.Get("Authorization"), "Bearer "+key) {
-			sendError(w, Err(401, "invalid_api_key", "无效的 API key"))
+		key, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		item, exists := a.Engine.access.snapshot.Load().keys[keyDigest(key)]
+		if !ok || key == "" || !exists || !item.Enabled {
+			sendError(w, Err(401, "invalid_api_key", "无效或已停用的 API key"))
 			return
+		}
+		next(w, r.WithContext(context.WithValue(r.Context(), apiIdentityKey{}, item)))
+	}
+}
+func (a *API) admin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			key, ok := strings.CutPrefix(auth, "Bearer ")
+			if !ok || !a.Engine.access.verifyAdmin(key) {
+				sendError(w, Err(401, "invalid_admin_key", "管理员密钥无效"))
+				return
+			}
+		} else {
+			if !a.Engine.access.verifySession(r) {
+				sendError(w, Err(401, "session_expired", "登录已失效，请重新登录"))
+				return
+			}
+			if r.Method != "GET" && r.Method != "HEAD" && !sameAdminOrigin(r) {
+				sendError(w, Err(403, "invalid_origin", "请从当前站点提交操作"))
+				return
+			}
 		}
 		next(w, r)
 	}
-}
-func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
-	return a.guard(a.Engine.Config.APIKey, next)
-}
-func (a *API) admin(next http.HandlerFunc) http.HandlerFunc {
-	return a.guard(a.Engine.Config.AdminKey, next)
 }
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, 200, map[string]bool{"ok": true})
@@ -108,16 +131,44 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 		sendError(w, AsError(err))
 		return
 	}
+	a.serveSubmission(w, r, req)
+}
+func (a *API) serveSubmission(w http.ResponseWriter, r *http.Request, req Request) {
+	if req.cleanup != nil {
+		defer func() {
+			if req.cleanup != nil {
+				req.cleanup()
+			}
+		}()
+	}
+	if identity, ok := r.Context().Value(apiIdentityKey{}).(managedAPIKey); ok {
+		req.apiKeyID = identity.ID
+		req.apiKeyName = identity.Name
+		req.keyConcurrency = identity.Concurrency
+	}
+	if err := prepareIdempotency(r, &req); err != nil {
+		sendError(w, AsError(err))
+		return
+	}
 	task, done, err := a.Engine.Submit(r.Context(), req)
 	if err != nil {
 		sendError(w, AsError(err))
 		return
 	}
-	if capture, ok := r.Context().Value(wireCaptureKey{}).(*wireCapture); ok {
+	if done != nil {
+		req.cleanup = nil
+	} else {
+		w.Header().Set("Idempotency-Replayed", "true")
+	}
+	if capture, ok := r.Context().Value(wireCaptureKey{}).(*wireCapture); ok && done != nil {
 		capture.id = task.ID
 	}
-	if req.Async {
-		sendJSON(w, 200, map[string]any{"created_at": task.Created.Unix(), "model": req.Model, "status": "queued", "task_id": task.ID})
+	if task.Request.Async {
+		sendJSON(w, 200, map[string]any{"created_at": task.Created.Unix(), "model": task.Request.Model, "status": "queued", "task_id": task.ID})
+		return
+	}
+	if done == nil {
+		a.replayGeneration(w, r, task)
 		return
 	}
 	select {
@@ -141,6 +192,10 @@ func (a *API) task(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		sendError(w, Err(503, "database_unavailable", "任务查询失败"))
+		return
+	}
+	if identity, ok := r.Context().Value(apiIdentityKey{}).(managedAPIKey); ok && t.Request.apiKeyID != "" && t.Request.apiKeyID != identity.ID {
+		sendError(w, Err(404, "task_not_found", "任务不存在"))
 		return
 	}
 	if t.Status == "succeeded" || t.Status == "failed" {

@@ -2,14 +2,16 @@
 
 独立 Go + PostgreSQL 服务，默认端口 `9080`。它用于验证高并发生成调度和下载链路，当前还不是 Python 服务的完整替代品。
 
-此目录位于原仓库的独立 Git worktree，使用空历史分支 `codex/go-image-core`。原目录 `G:\Demo\chatgpt2api` 继续使用 `main`。本服务不读取原数据库，不修改原 Compose，不接管原服务端口。
+此目录 `G:\Demo\chatgpt2api-go` 是独立 Git 仓库，使用 `main`，远程为 `git@github.com:isologue/chatgpt2api_go.git`。Python 项目 `G:\Demo\chatgpt2api` 独立保留；两个项目不共享 Git 工作树、数据库或数据卷。
 
 ## 已实现
 
 - Go 原生生成流程：首页、Sentinel、SHA3 PoW、会话准备、SSE、结果补查、图片地址解析和下载；不调用 Python 生成流程。动态挑战仅兼容已实现的指令，求解失败时与旧实现一致提交空值，由上游决定是否接受。
-- 固定数量的执行 goroutine、有界等待队列；满载返回 HTTP `429`，并提供 `Retry-After: 1`。
+- 可在线调整的执行并发、有界接纳与等待容量；满载返回 HTTP `429`，并提供 `Retry-After: 1`。
 - 内存账号优先队列，选号时不访问数据库；锁内不进行网络、日志或数据库 I/O。
 - 账号评分、限流冷却、失效禁用、切号；`no_image_generated` 扣分，安全审核拒绝更新活性但不加减分。
+- 动态热池与冷池后台维护，五条通道各自拥有配置的刷新并发；额度、刷新退避和账号活性持久化。
+- 同身份账号归并，兼容 CPA 单账号与 Sub2API 多账号，完整 JSON 导入导出；兼容 Sub2API 账号推送，数据库与图片卷备份恢复脚本。
 - 按需账号校验：最近成功生成或远程校验任一在有效期内即可复用，但仍检查 AT 到期时间；同账号并发校验合并；RT 旋转时保存新 AT 和 RT。
 - 独立下载并发与图片解码并发；下载排队、连接响应、传输、解码排队和完整解码分别计时；下载重试耗尽后可切号。
 - 图片流式写磁盘，临时文件完整解码通过后才发布；Base64 从文件流式编码给调用方。同源 estuary 内容接口复用账号会话，CDN 和跨源重定向不携带账号凭据。
@@ -26,13 +28,17 @@ docker compose ps
 curl.exe http://127.0.0.1:9080/readyz
 ```
 
-本次开发已生成一份本地 `.env`，无需覆盖。该文件已加入 Git 忽略。数据库密码建议使用随机字母数字，避免连接 URL 中的特殊字符需要转义。
+已有本地 `.env` 时无需覆盖。该文件已加入 Git 忽略。数据库密码建议使用随机字母数字，避免连接 URL 中的特殊字符需要转义。
 
 默认绑定 `127.0.0.1`。需要外部访问时设置 `CORE_BIND_ADDRESS`，并把 `CORE_PUBLIC_URL` 改为调用方能访问的地址。没有配置代理时走直连；Windows Docker Desktop 访问现有本地 HTTP 代理可设置 `CORE_PROXY_URL=http://host.docker.internal:40080`。Compose 不包含新的 WARP 容器。
 
 ## 导入账号
 
-支持原项目导出的 JSON 数组，也支持 `accounts` / `data` 包裹数组。每项至少包含 `access_token` 或 `token`；可包含 `refresh_token`、`client_id`、`email`、`device_id`、`user_agent`。AT 按指纹去重，不会把令牌写到控制台。
+管理页「账号池 → 导入账号」支持 CPA 单账号对象（包括 `type=web`）、Sub2API 的 `accounts` 数组、`data` 包装及原项目/Go 导出的账号数组。自动提取顶层或 `credentials` 中的 AT、RT、client_id、邮箱和指纹，支持 `auth_config` / `authConfig` / `clientId`。每项至少需要 AT；只有 RT 时明确记为失败，当前导入过程不会联网交换凭据。仅 AT、没有 RT 的账号可以导入，但 AT 过期后不能自动续期。
+
+CPA/Sub 原始账号对象完整保存在 `source_record`，包级的 `exported_at`、`proxies` 等元数据保存在 `import_context`，未知字段和大整数不丢失。代理、分组、来源系统的并发和优先级仅保留为数据，不自动应用到本服务的代理与调度。完整导出仍采用本服务账号格式，附带原始记录，支持再次导入；不承诺与原文件字节或顶层布局一致。
+
+HTTP 导入和推送默认最大 **128 MiB**，设置页可在线修改 `CORE_IMPORT_MAX_MIB`。文件先写私有临时文件，验证完整 JSON 后逐条解析、每批 100 条入库；后台显示进度和前 100 条失败原因，关闭页面后继续。相同进程只运行一项导入/推送，避免重复大批任务竞争。结束后删除临时文件。CLI 使用相同解析器分批处理，目前上限 256 MiB、任务预算 5 分钟。
 
 ```powershell
 # 必须先停止这一套 Go core，导入程序需要独占同一调度数据库。
@@ -41,11 +47,25 @@ docker compose run --rm --no-deps --entrypoint /usr/local/bin/import --volume "G
 docker compose up -d core
 ```
 
-原型不会自动复制原服务的账号。请使用独立测试账号，避免两个服务共享同一 RT 后互相覆盖旋转结果。当前导入按 AT 去重，尚未实现同一身份多个 AT 的归并。
+导入同身份不同 AT 时只保留一个调度账号，其他完整记录保存在 `linked_accounts`；不覆盖正在使用的主记录 AT/RT。启动时对旧记录进行可重入的分页归并。完全相同记录重复导入会复用；相同 AT 补送的 RT 或其他新字段也保存为关联记录，不覆盖主凭据或重置评分。不要让两套运行中的服务共同旋转同一 RT。
+
+管理页「账号池 → 完整导出」下载全部账号 JSON，包含完整 AT、RT、密码、扩展字段和归并记录。也可使用带管理员 Bearer 的 `GET /admin/accounts/export`；服务端流式读取数据库，普通列表只显示 Token 尾号。账号导出用于迁移账号，完整恢复还需备份数据库与图片卷，见 [账号维护与恢复说明](docs/account-lifecycle-and-recovery.md)。
+
+## 账号推送
+
+管理页「账号池 → 账号推送」设置独立推送密钥并启用入口。密钥明文保存，仅通过管理员接口读回，弹窗重新打开会展示当前密钥；升级前仅存摘要的旧密钥需要重新保存一次才能回显；留空保存保留旧密钥，更换或关闭入口对后续请求立即生效。外部程序选择 **Sub2API** 模式，服务地址填写本服务根地址，API Key 填独立推送密钥。
+
+- `GET /api/v1/admin/accounts/data`：连接检查，返回空账号数组，不导出本地凭据。
+- `POST /api/v1/admin/accounts/data`：接收直接 Sub 包或 `{"data": {...}}`，鉴权支持 `X-API-Key` 或 `Authorization: Bearer`，要求 `Content-Type: application/json`。
+- 包类型支持省略、`sub2api-data`、`sub2api-bundle`，版本支持省略、0、1；Sub 账号支持 `platform=openai`、OAuth 凭据。
+- 返回等待全部内部批次入库完成；客户端断开后任务继续，账号页可查进度。全部或部分成功返回 200，全部账号失败返回 400；关闭 404、密钥错误 401、忙 409、类型错误 415、超过大小限制 413、服务失败 503。
+- `data.account_created` 是新增，`account_reused` 是复用/归并，`account_failed` 是失败。`account_updated` 固定 0：本服务保存补充凭据，**不会像 Aether 一样覆盖主账号当前凭据**。`errors` 提供 `kind`、从 0 开始的 `index` 和原因，最多 100 条。代理统计固定为 0；附加代理信息保存但不启用。
+
+管理配置接口为 `GET/PUT /admin/account-push`，使用管理密钥；推送密钥不能用于管理、导出或生图接口。独立配置也包含在数据库备份中。大批量发送时，反向代理请求体限制应与导入上限匹配，并给发送端足够的等待时间。
 
 ## 接口
 
-接口需 `Authorization: Bearer <CORE_API_KEY>`。当前只支持 `gpt-image-2` 文生图，`n` 为 `1..4`，单次多图按顺序生成，不返回 `revised_prompt`。不支持图片编辑、聊天、搜索或调用方流式输出。
+接口需 `Authorization: Bearer <图片调用密钥>`。首次启动将 `CORE_API_KEY` 导入调用密钥列表，之后可在「系统设置 → 访问与密钥」新增、修改、停用或删除。当前只支持 `gpt-image-2` 文生图，`n` 为 `1..4`，单次多图按顺序生成，不返回 `revised_prompt`。不支持图片编辑、聊天、搜索或调用方流式输出。
 
 同步与异步都使用 `POST /v1/images/generations`：
 
@@ -86,12 +106,16 @@ docker compose up -d core
 | `CORE_ACCOUNT_SLOTS` | 1 | 每账号同时使用数 |
 | `CORE_DOWNLOAD_CONCURRENCY` | 100 | 同时实际下载数；影响连接、带宽竞争和下载排队，与生成执行数、下载/总超时有关；不会与生成并发相乘 |
 | `CORE_VALIDATION_CONCURRENCY` | 10 | 同时完整解码图片数，影响 CPU 和内存峰值；下载比解码快会排队，等待也消耗下载超时；不会与下载并发相乘 |
-| `CORE_VERIFY_CONCURRENCY` | 50 | 按需校验账号并发；同账号校验合并 |
+| `CORE_VERIFY_CONCURRENCY` | 50 | 每条刷新通道各自的账号并发；同账号跨通道校验合并 |
 | `CORE_RESPONSE_CONCURRENCY` | 32 | 同时构造/发送结果响应数，尤其限制 Base64 回传 |
 | `CORE_DB_CONNECTIONS` | 32 | 业务数据库连接数，另保留 1 条实例锁连接 |
 | `CORE_SWITCH_RETRIES` | 2 | 失败后最多再换 2 个账号，合计最多 3 次尝试 |
 | `CORE_DOWNLOAD_RETRIES` | 1 | 相同图片下载最多再试 1 次 |
-| `CORE_AVAILABILITY_TTL` | 900s | 账号活性有效期 |
+| `CORE_AVAILABILITY_TTL` | 900s | 最近成功校验或生图活性任一在此范围内可复用，仍检查 AT |
+| `CORE_HOT_POOL_SIZE` | 500 | 基础热池数量，使用冷池账号时自动扩张 |
+| `CORE_HOT_IDLE` | 24h | 超过基础规模的闲置热账号退出时间 |
+| `CORE_HOT_MAINTENANCE_INTERVAL` | 30m | 热账号按最近活性到期维护 |
+| `CORE_COLD_MAINTENANCE_INTERVAL` | 24h | 冷账号低频保活间隔 |
 | `CORE_RESPONSE_FORMAT` | url | 默认图片返回格式 |
 | `CORE_ALLOW_USER_RESPONSE_FORMAT` | true | 是否接受调用方指定返回格式 |
 
@@ -105,7 +129,7 @@ docker compose up -d core
 | `CORE_SSE_TIMEOUT` | 80s | 单次上游生成流，包含建联 |
 | `CORE_POLL_TIMEOUT` | 10s | 流结束/异常后缺少图片标识的补查预算 |
 | `CORE_DOWNLOAD_TIMEOUT` | 15s | 取得下载名额后，单次传输和随后校验的预算 |
-| `CORE_METADATA_TIMEOUT` | 30s | 单次元数据查询预算；按需校验另有最多两倍预算 |
+| `CORE_METADATA_TIMEOUT` | 30s | 单次元数据查询预算；完整账号校验另有最多三倍预算 |
 
 生成流自身的 `CORE_SSE_TIMEOUT` 先到期时，有会话 ID 则先补查原结果，未恢复再按 `CORE_SWITCH_RETRIES` 切号；没有会话 ID 则按次数直接切号。该请求后续恢复不再受 `CORE_TOTAL_TIMEOUT` 限制，每轮生成、补查、元数据和下载仍各有时限，调用方取消、外部时限和服务停止继续生效。请求总预算先到期、网络断流、普通补查失败或未出图均不会触发豁免。重试耗尽返回 `504 image_result_uncertain`，结果未知不扣分；明确 `no_image_generated` 扣分并按配置切号，安全拒绝不切号、不加减分且更新活性。
 
@@ -113,13 +137,13 @@ docker compose up -d core
 
 ## 指标与数据
 
-`GET /admin/metrics` 使用独立的 `CORE_ADMIN_KEY`：执行/排队/拒绝数、账号槽位、真实活跃 SSE、生成流硬超时次数与恢复请求数、下载活跃/等待/字节数、图片解码活跃/等待/上限、各阶段直方图，以及 Go 堆和 goroutine 数。计数和直方图在重启后清零。阶段名称为中文，耗时单位毫秒。
+`GET /admin/metrics` 使用当前管理员密钥（首次为 `CORE_ADMIN_KEY`）或浏览器登录会话：执行/排队/拒绝数、账号槽位、真实活跃 SSE、生成流硬超时次数与恢复请求数、下载活跃/等待/字节数、图片解码活跃/等待/上限、各阶段直方图，以及 Go 堆和 goroutine 数。计数和直方图在重启后清零。阶段名称为中文，耗时单位毫秒。
 
 图片下载细分为 `下载槽位等待`、`图片连接响应`（含重定向与等待响应头）、`图片传输`（响应体）、`图片校验预检`、`图片校验排队`、`图片校验`（完整解码）。下载名额在响应体写完后立即释放，等待解码不占下载名额。`upstream.validation_active`、`validation_waiting`、`validation_limit` 可用于观察解码瓶颈。旧版的 `图片传输` 包含连接响应、`图片校验` 包含排队，跨版本对比需先合并对应阶段；不能直接相加各阶段 P95。
 
 PostgreSQL 保存账号、任务、调用日志、图片元数据及管理配置；图片和响应报文文件保存在独立数据卷中。任务保存文件引用，不存图片 Base64。请求日志保存切号账号、错误分类、阶段耗时及 `total_budget_exempt_reason`；`sse_hard_timeout` 表示生成流硬超时后恢复，控制台支持按需查看原始请求/响应详情。重启时将尚未完成的任务标记失败，不自动重发可能已被上游计费的请求。
 
-当前只支持一个调度实例；同一个数据库上的第二个实例会因 PostgreSQL advisory lock 拒绝启动。不能直接扩为多个副本来叠加并发。账号仍在启动时完整加载；评分排序为堆索引。未移植热池后台维护、任务幂等、多租户或完整账号额度刷新。控制台已提供管理页和图片、日志保留策略，自动清理默认关闭。
+当前只支持一个调度实例；同一个数据库上的第二个实例会因 PostgreSQL advisory lock 拒绝启动。不能直接扩为多个副本来叠加并发。账号仍在启动时完整加载；评分排序为堆索引。已提供热/冷池维护与上游图片额度同步；没有任务幂等、多租户和分布式调度。上游未返回图片额度时不能据此承诺可生成数量。控制台已提供管理页和图片、日志保留策略，自动清理默认关闭。
 
 ## 验证与后续开发
 
@@ -152,24 +176,31 @@ go build -o burst ./cmd/burst
 
 ## Go 管理工作台
 
-服务内置轻量管理界面，访问 `/admin/`。输入 `CORE_ADMIN_KEY` 后读取当前服务的实时监控、账号池和调用日志；密钥仅保存在当前页面内存中。`/admin/?demo=1` 可查看带有明确标识的示例界面，无需调用真实上游。界面资源随 Go 二进制内嵌，不依赖外部 CDN。
+服务内置轻量管理界面，访问 `/admin/`。首次使用 `CORE_ADMIN_KEY` 登录后读取实时监控、账号池和调用日志。浏览器使用持久化的 HttpOnly / SameSite=Strict Cookie，刷新或重启服务后可恢复登录；服务端不设置空闲过期，浏览器 Cookie 有 400 天有效期，每次恢复会话时续期。清理 Cookie、主动退出、其他浏览器登录或更换管理员密钥会使旧会话失效。浏览器不保存管理员密钥到 localStorage/sessionStorage。`/admin/?demo=1` 可查看带有明确标识的示例界面，无需调用真实上游。界面资源随 Go 二进制内嵌，不依赖外部 CDN。
+
+「系统设置 → 访问与密钥」提供管理员密钥修改和图片调用 Key 的增删改查、复制、启用/停用。管理员修改需要输入当前密钥并确认新密钥；新密钥立即生效，当前浏览器获得新会话，其他会话及旧密钥失效。管理员密钥以 bcrypt(SHA-256(key)) 保存；调用 Key 供管理员查看和复制而明文持久化，独立保存鉴权摘要。调用 Key、管理员和账号推送密钥互不授权。多个调用 Key 共享号池与全局并发容量；有归属的任务只允许创建它的 Key 查询，历史未记录归属的任务保留兼容行为。图片 URL 仍按原公开访问规则，不提供完整租户隔离或计费。停用/轮换/删除只影响后续请求，已接受的任务继续执行。
+
+访问配置保存在 PostgreSQL。`CORE_ADMIN_KEY` 和 `CORE_API_KEY` 只在首次初始化时导入；后续修改 .env 不会覆盖数据库密钥，删除默认调用 Key 后重启也不会重新创建。请保存好修改后的管理员密钥。单会话指同一浏览器配置文件内共享一个登录 Cookie，多标签页共用会话；异地登录后，旧页面在下一次请求（包括监控刷新）时提示重新登录。
+
+管理接口：`POST/GET/DELETE /admin/session` 用于登录、恢复和退出，`PUT /admin/access/admin-key` 修改管理员密钥，`GET/POST /admin/api-keys` 和 `PUT/DELETE /admin/api-keys/{id}` 管理调用 Key。浏览器写请求要求同源 Origin；原有 Bearer 管理接口仍支持当前管理员密钥。登录连续失败 5 次后等待 30 秒。密钥修改接口要求 16～256 字节。
+
 
 - **运行概览**：按北京时间筛选历史图片结果、成功请求 P50/P95、实时任务并发、各通道使用量与等待数、账号槽位及容器资源数据。趋势仅保留当前浏览会话的最近 60 次采样，后台标签页暂停刷新。
 - **账号池 / 调用日志**：数据库游标分页，每页默认 20 条、最多 100 条；列表不返回完整 AT/RT 或完整日志尝试过程，日志详情按需读取。搜索与筛选会重置分页。
-- **系统设置**：21 个公开参数保存到 PostgreSQL，点击“保存并生效”后立即调整任务执行、等待队列、下载、解码、返回、账号槽位与校验容量。调低并发不会取消在途任务；已接纳请求保留其超时、重试和返回格式快照。数据库连接池、日志写入线程和日志等待队列显示“重启生效”，重启后按保存值重建对应资源。日志等待队列由主队列和溢出队列组成；只有两级队列都满时才进入同步落库兜底。
-- 目前设置页列出了 23 个已开放参数；PoW 和缩略图生成并发支持在线调整。单次图片数量、请求体大小等协议限制在“其他当前限制”中展示。
+- **系统设置**：公开参数保存到 PostgreSQL，点击“保存并生效”后立即调整任务执行、等待队列、下载、解码、返回、账号槽位与校验容量。调低并发不会取消在途任务；已接纳请求保留其超时、重试和返回格式快照。数据库连接池、日志写入线程和日志等待队列显示“重启生效”，重启后按保存值重建对应资源。日志等待队列由主队列和溢出队列组成；只有两级队列都满时才进入同步落库兜底。
+- 设置页列出已开放参数；PoW 和缩略图生成并发支持在线调整。单次图片数量、请求体大小等协议限制在“其他当前限制”中展示。
 
 监控的成功/失败数量按请求计数，一个请求可以包含多张图；安全审核拒绝不计入失败与成功率。账号“已启用”不代表没有冷却或限流，可用空闲槽位反映当前可调度容量。
 
 ### 管理设置与账号操作
 
 - 环境变量提供初始值；数据库保存的同名设置优先。密钥、数据库 URL 和代理凭据不通过管理设置接口读写。复制或导出的配置是当前表单值，不含这些秘密参数。多个页面同时保存时使用版本检查，旧版本返回 409，重新加载后再保存。
-- 账号池支持 JSON 文件或粘贴导入、启用/停用、删除、单账号校验、全部校验。支持单个账号、数组及 `accounts` / `data` 包装数组；按 access_token 去重，每批 100 条提交，坏行单独记录。导入上限 32 MiB。
+- 账号池支持 JSON 文件或粘贴导入、启用/停用、删除、单账号校验、全部校验。支持单个账号、数组及 `accounts` / `data` 包装数组；按 access_token 去重，每批 100 条提交，坏行单独记录。导入上限 128 MiB（可配置）。
 - 导入与手动校验返回后台任务 ID；页面每 2 秒读取正在运行的任务进度，关闭弹窗或浏览器后继续执行。任务详情显示处理数量和前 100 条失败原因，不返回完整令牌。服务重启会将未完成任务标记为中断，已完成批次保留；重新导入会跳过已有令牌。
 - 同时可运行一个导入任务和一个手动校验任务。手动校验使用独立通道，容量与“账号校验并发”相同，不挤占前台通道；同一账号的同时校验会合并。批量任务开始时确定 worker 数；若中途提高校验并发，新容量可供新任务使用，当前批量任务不会额外创建 worker。
 - 停用或删除立即影响后续选号，在途操作不会把管理停用的账号自动恢复，也不会重新插入已删除账号。启用仅恢复调度资格，不保证账号令牌或上游额度有效；可手动校验确认。
 
-管理写接口均要求 `CORE_ADMIN_KEY`：`PUT /admin/config`、`POST /admin/accounts/import`、`POST /admin/accounts/verify`、`PATCH /admin/accounts/{id}`、`DELETE /admin/accounts/{id}`。任务进度通过 `GET /admin/jobs` 和 `GET /admin/jobs/{id}` 读取。
+管理写接口均要求当前管理员密钥或浏览器登录会话：`PUT /admin/config`、`POST /admin/accounts/import`、`POST /admin/accounts/verify`、`PATCH /admin/accounts/{id}`、`DELETE /admin/accounts/{id}`。任务进度通过 `GET /admin/jobs` 和 `GET /admin/jobs/{id}` 读取。
 
 ### 调用日志与监控口径
 
@@ -202,3 +233,23 @@ go build -o burst ./cmd/burst
 `CORE_POW_CONCURRENCY=0` 保持自动模式：按 Go 可用 CPU 数的一半分配（至少 1），也可设为正整数指定同时计算上限。`CORE_THUMBNAIL_CONCURRENCY=1` 控制未缓存缩略图同时生成数，缓存命中直接读取；此容量独立于生图的下载与解码名额。两项都支持设置页保存、在线调整和重启恢复，不设额外业务封顶。调低不会中止正在运行的工作。
 
 运行概览显示 PoW 和缩略图的执行数、等待数及实际上限，对应 `/admin/metrics` 的 `upstream.pow_active/pow_waiting/pow_limit` 和 `thumbnails.active/waiting/limit`。自动模式的表单值为 0，监控显示解析后的实际容量。两者与图片完整解码共享 CPU 和内存；提高并发不保证增加吞吐，应结合执行、排队和 CPU 数据判断。PoW 排队受请求上下文预算控制；缩略图名额等待最多 30 秒，此项不改变缩略图尺寸和缓存策略。
+
+
+## 账号维护、备份与验收
+
+设置页「账号校验」统一配置可用性有效期、每条通道刷新并发、基础热池、闲置退出与热/冷维护间隔。前台、手动、热池补充、热池维护、冷池维护各自拥有 C 个刷新名额；同账号跨通道合并一次校验。近期安全审核拒绝也算活性，不加减分。维护时间按账号持久化时间判断，重启不会重新开始整个等待周期。
+
+备份脚本会短暂停止 `core`，备份完成后恢复原运行状态；保存 PostgreSQL custom dump、图片及原始报文文件、环境文件、Compose 和校验清单。恢复默认只允许空数据库与空图片卷。
+
+```powershell
+pwsh -File .\scripts\backup.ps1 -Destination G:\Backups\chatgpt2api-go-20261103
+pwsh -File .\scripts\restore.ps1 -Source G:\Backups\chatgpt2api-go-20261103 -ProjectName chatgpt2api-go-restored -ComposeFile .\compose.yml -EnvFile .\.env
+```
+
+恢复前配置目标端口与目标环境；脚本不会自动把备份里的环境文件覆盖到当前 `.env`。覆盖已有目标需显式传入 `-ReplaceExisting`，该操作会替换目标数据库和图片卷内容。完整步骤、通道语义和支持边界见 [账号维护与恢复说明](docs/account-lifecycle-and-recovery.md)。
+
+本轮回归记录见 [2026-11-03 验证记录](docs/validation-2026-11-03.md)。持续负载测试只使用本地模拟上游，必须同时配置独立的 `CORE_TEST_DATABASE_URL` 与 `CORE_RUN_ACCOUNT_SOAK=1`，默认 120 秒，可通过 `CORE_ACCOUNT_SOAK_SECONDS` 延长。测试会清空指定测试库的相关表，不能连接业务数据库。
+
+CPA / Sub2API 实际文件、账号推送、十万条导入基线及真实上游限制见 [导入与推送验收记录](docs/import-and-push-validation-2026-11-03.md)。
+
+图片编辑（含 mask）、Key 并发/统计、持久化幂等和管理员离线恢复说明见 [图片编辑与调用控制](docs/image-edits-key-controls.md)。

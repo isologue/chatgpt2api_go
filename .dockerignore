@@ -3,3 +3,7 @@
 data
 output
 bin
+
+backups
+
+.playwright-cli

@@ -5,3 +5,7 @@
 *.exe
 *.test
 *.prof
+
+/backups/
+
+/.playwright-cli/

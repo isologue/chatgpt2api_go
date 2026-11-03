@@ -32,11 +32,11 @@ func TestConcurrentPostgresProtocol(t *testing.T) {
 	if err = store.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.Exec(ctx, "TRUNCATE core_accounts,core_tasks,core_requests"); err != nil {
+	if _, err = store.db.Exec(ctx, "TRUNCATE core_idempotency,core_accounts,core_tasks,core_requests"); err != nil {
 		t.Fatal(err)
 	}
 	// 测试无论成功失败均清除专用数据库中的虚构账号。
-	defer store.db.Exec(context.Background(), "TRUNCATE core_accounts,core_tasks,core_requests")
+	defer store.db.Exec(context.Background(), "TRUNCATE core_idempotency,core_accounts,core_tasks,core_requests")
 	accounts := testAccounts(count)
 	if _, err = store.ImportAccounts(ctx, accounts); err != nil {
 		t.Fatal(err)
@@ -95,6 +95,8 @@ func TestConcurrentPostgresProtocol(t *testing.T) {
 	runtime.ReadMemStats(&mem)
 	release.Do(func() { close(gate) })
 	wg.Wait()
+	// 请求完成后，后台批量日志仍可能在提交；关闭时排空再核对持久化。
+	engine.Close()
 	sort.Float64s(durations)
 	var logs, tasks int
 	if err = store.db.QueryRow(ctx, "SELECT count(*) FROM core_requests WHERE status='succeeded'").Scan(&logs); err != nil {

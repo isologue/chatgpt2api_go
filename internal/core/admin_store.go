@@ -3,37 +3,76 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/jackc/pgx/v5"
+	"io"
 	"time"
 )
 
+// 身份有值时按身份去重；未知身份仍按 AT 指纹去重。在线导入不会覆盖正在使用的旋转凭据。
 func (s *Postgres) InsertManagedAccounts(ctx context.Context, accounts []Account) ([]Account, error) {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(782471902632)"); err != nil {
+		return nil, err
+	}
 	batch := &pgx.Batch{}
 	for _, a := range accounts {
-		raw, _ := json.Marshal(a)
-		batch.Queue("INSERT INTO core_accounts(id,access_fingerprint,data) VALUES($1,$2,$3) ON CONFLICT(access_fingerprint) DO NOTHING RETURNING id", a.ID, Fingerprint(a.AccessToken), raw)
+		a.IdentityID = accountIdentity(a.AccessToken)
+		raw, err := json.Marshal(a)
+		if err != nil {
+			return nil, err
+		}
+		batch.Queue("INSERT INTO core_accounts(id,access_fingerprint,identity_key,data) VALUES($1,$2,NULLIF($3,''),$4) ON CONFLICT DO NOTHING RETURNING id", a.ID, Fingerprint(a.AccessToken), a.IdentityID, raw)
 	}
 	results := tx.SendBatch(ctx, batch)
 	inserted := []Account{}
+	duplicates := []Account{}
 	for _, a := range accounts {
 		var id string
 		err := results.QueryRow().Scan(&id)
 		if err == pgx.ErrNoRows {
+			duplicates = append(duplicates, a)
 			continue
 		}
 		if err != nil {
 			results.Close()
 			return nil, err
 		}
+		a.IdentityID = accountIdentity(a.AccessToken)
 		inserted = append(inserted, a)
 	}
 	if err = results.Close(); err != nil {
 		return nil, err
+	}
+	for _, a := range duplicates {
+		identity := accountIdentity(a.AccessToken)
+		var existing []byte
+		err = tx.QueryRow(ctx, "SELECT data FROM core_accounts WHERE identity_key=NULLIF($1,'') OR access_fingerprint=$2 OR id=$3 ORDER BY id LIMIT 1 FOR UPDATE", identity, Fingerprint(a.AccessToken), a.ID).Scan(&existing)
+		if err != nil {
+			return nil, err
+		}
+		var canonical Account
+		if err = json.Unmarshal(existing, &canonical); err != nil {
+			return nil, err
+		}
+		if canonical.AccessToken == a.AccessToken && sameImportRecord(canonical, a) {
+			continue
+		}
+		// 同名 ID 不能拿来替换不同身份；要求调用方明确处理冲突。
+		if canonical.AccessToken != a.AccessToken && (identity == "" || identity != accountIdentity(canonical.AccessToken)) {
+			return nil, fmt.Errorf("account ID conflicts with another identity")
+		}
+		raw, err := mergeLinkedAccounts(canonical, a)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec(ctx, "UPDATE core_accounts SET data=data || $2::jsonb,updated_at=now() WHERE id=$1", canonical.ID, raw); err != nil {
+			return nil, err
+		}
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
@@ -103,7 +142,7 @@ func (s *Postgres) ListAdminJobs(ctx context.Context) ([]adminJob, error) {
 	return s.listAdminJobs(ctx, "SELECT data FROM core_admin_jobs ORDER BY created_at DESC,id DESC LIMIT 20")
 }
 func (s *Postgres) ListAccountJobs(ctx context.Context) ([]adminJob, error) {
-	return s.listAdminJobs(ctx, "SELECT data FROM core_admin_jobs WHERE kind IN ('import','verify') ORDER BY created_at DESC,id DESC LIMIT 20")
+	return s.listAdminJobs(ctx, "SELECT data FROM core_admin_jobs WHERE kind IN ('import','push','verify') ORDER BY created_at DESC,id DESC LIMIT 20")
 }
 func (s *Postgres) latestCleanupJobs(ctx context.Context) ([]adminJob, error) {
 	return s.listAdminJobs(ctx, "SELECT DISTINCT ON (kind) data FROM core_admin_jobs WHERE kind IN ('cleanup_images','cleanup_logs') ORDER BY kind,created_at DESC,id DESC")
@@ -130,5 +169,40 @@ func (s *Postgres) listAdminJobs(ctx context.Context, query string) ([]adminJob,
 }
 func (s *Postgres) RecoverAdminJobs(ctx context.Context) error {
 	_, err := s.db.Exec(ctx, "UPDATE core_admin_jobs SET status='failed',data=data || jsonb_build_object('status','failed','message','服务重启中断了任务，已完成的导入或校验结果保留，可重新提交','updated_at',now()),updated_at=now() WHERE status='running'")
+	return err
+}
+
+// ExportAccounts streams the latest account JSON from PostgreSQL. It deliberately
+// does not redact credentials: this endpoint is protected by CORE_ADMIN_KEY and
+// is intended for an operator-controlled backup/migration download.
+func (s *Postgres) ExportAccounts(ctx context.Context, w io.Writer) error {
+	rows, err := s.db.Query(ctx, "SELECT data || jsonb_build_object('enabled',COALESCE(managed_enabled,(data->>'enabled')::boolean,false)) FROM core_accounts ORDER BY id")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if _, err = io.WriteString(w, "[\n"); err != nil {
+		return err
+	}
+	first := true
+	for rows.Next() {
+		var raw []byte
+		if err = rows.Scan(&raw); err != nil {
+			return err
+		}
+		if !first {
+			if _, err = io.WriteString(w, ",\n"); err != nil {
+				return err
+			}
+		}
+		if _, err = w.Write(raw); err != nil {
+			return err
+		}
+		first = false
+	}
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	_, err = io.WriteString(w, "\n]\n")
 	return err
 }

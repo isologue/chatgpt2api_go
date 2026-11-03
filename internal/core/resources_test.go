@@ -35,7 +35,7 @@ func resourceTestStore(t *testing.T) (*Postgres, context.Context) {
 		t.Fatal(err)
 	}
 	reset := func() {
-		if _, err := s.db.Exec(ctx, "TRUNCATE core_images,core_requests,core_request_payloads,core_tasks,core_file_gc,core_admin_jobs; UPDATE core_retention SET enabled=false,retain_hours=24,interval_minutes=60,revision=0,next_run_at=now()+interval '1 hour'"); err != nil {
+		if _, err := s.db.Exec(ctx, "TRUNCATE core_idempotency,core_images,core_requests,core_request_payloads,core_tasks,core_file_gc,core_admin_jobs; UPDATE core_retention SET enabled=false,retain_hours=24,interval_minutes=60,revision=0,next_run_at=now()+interval '1 hour'"); err != nil {
 			t.Error(err)
 		}
 	}

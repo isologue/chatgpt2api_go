@@ -43,11 +43,23 @@ func OpenPostgres(ctx context.Context, url string, connections int) (*Postgres, 
 const schema = `
 CREATE TABLE IF NOT EXISTS core_accounts(id text PRIMARY KEY, access_fingerprint text NOT NULL UNIQUE, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now());
 ALTER TABLE core_accounts ADD COLUMN IF NOT EXISTS managed_enabled boolean;
+ALTER TABLE core_accounts ADD COLUMN IF NOT EXISTS identity_key text;
+CREATE UNIQUE INDEX IF NOT EXISTS core_accounts_identity ON core_accounts(identity_key) WHERE identity_key IS NOT NULL;
+CREATE TABLE IF NOT EXISTS core_access(id int PRIMARY KEY CHECK(id=1),admin_hash text NOT NULL,session_hash text NOT NULL DEFAULT '',session_created_at timestamptz,revision bigint NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS core_api_keys(id text PRIMARY KEY,name text NOT NULL,key_value text NOT NULL,key_hash text NOT NULL UNIQUE,enabled boolean NOT NULL DEFAULT true,revision bigint NOT NULL DEFAULT 0,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE core_api_keys ADD COLUMN IF NOT EXISTS concurrency bigint NOT NULL DEFAULT 0 CHECK(concurrency>=0);
+CREATE TABLE IF NOT EXISTS core_account_push(id int PRIMARY KEY CHECK(id=1),enabled boolean NOT NULL DEFAULT false,key_hash text NOT NULL DEFAULT '',revision bigint NOT NULL DEFAULT 0);
+ALTER TABLE core_account_push ADD COLUMN IF NOT EXISTS key_value text NOT NULL DEFAULT '';
+INSERT INTO core_account_push(id) VALUES(1) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS core_settings(id int PRIMARY KEY CHECK(id=1),revision bigint NOT NULL DEFAULT 0,values jsonb NOT NULL DEFAULT '{}'::jsonb,updated_at timestamptz NOT NULL DEFAULT now());
 INSERT INTO core_settings(id) VALUES(1) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS core_admin_jobs(id text PRIMARY KEY,kind text NOT NULL,status text NOT NULL,data jsonb NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS core_admin_jobs_created ON core_admin_jobs(created_at DESC);
 CREATE TABLE IF NOT EXISTS core_tasks(id text PRIMARY KEY, created_at timestamptz NOT NULL, status text NOT NULL, request jsonb NOT NULL, result jsonb, error jsonb, updated_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE core_tasks ADD COLUMN IF NOT EXISTS api_key_id text NOT NULL DEFAULT '';
+ALTER TABLE core_tasks ADD COLUMN IF NOT EXISTS api_key_name text NOT NULL DEFAULT '';
+ALTER TABLE core_tasks ADD COLUMN IF NOT EXISTS error_status int;
+CREATE TABLE IF NOT EXISTS core_idempotency(scope text PRIMARY KEY,fingerprint text NOT NULL,task_id text NOT NULL UNIQUE REFERENCES core_tasks(id) ON DELETE CASCADE,created_at timestamptz NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS core_tasks_status ON core_tasks(status) WHERE status IN ('queued','processing');
 CREATE TABLE IF NOT EXISTS core_requests(id text PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT now(), model text NOT NULL, is_async boolean NOT NULL, response_format text NOT NULL, status text NOT NULL, duration_ms bigint NOT NULL, attempts jsonb NOT NULL, error jsonb);
 CREATE INDEX IF NOT EXISTS core_requests_created_at ON core_requests(created_at DESC);
@@ -56,6 +68,9 @@ ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS finished_at timestamptz;
 ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS queue_ms bigint;
 ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS switch_count int;
 ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS image_count int;
+ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS api_key_id text NOT NULL DEFAULT '';
+ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS api_key_name text NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS core_requests_key_page ON core_requests(api_key_id,created_at DESC,id DESC);
 CREATE INDEX IF NOT EXISTS core_requests_page ON core_requests(created_at DESC,id DESC);
 CREATE INDEX IF NOT EXISTS core_requests_status_page ON core_requests(status,created_at DESC,id DESC);
 CREATE INDEX IF NOT EXISTS core_admin_jobs_kind_page ON core_admin_jobs(kind,created_at DESC,id DESC);
@@ -68,6 +83,9 @@ INSERT INTO core_retention(resource) VALUES('images'),('logs') ON CONFLICT DO NO
 CREATE TABLE IF NOT EXISTS core_file_gc(namespace text NOT NULL,name text NOT NULL,bytes bigint NOT NULL DEFAULT 0,attempts int NOT NULL DEFAULT 0,next_at timestamptz NOT NULL DEFAULT now(),error text NOT NULL DEFAULT '',PRIMARY KEY(namespace,name));
 CREATE INDEX IF NOT EXISTS core_file_gc_due ON core_file_gc(next_at);
 CREATE TABLE IF NOT EXISTS core_request_payloads(id text NOT NULL,kind text NOT NULL,request_body bytea,response_file text NOT NULL,response_bytes bigint NOT NULL,http_status int NOT NULL,finished_at timestamptz NOT NULL,PRIMARY KEY(id,kind));
+ALTER TABLE core_request_payloads ADD COLUMN IF NOT EXISTS request_file text NOT NULL DEFAULT '';
+ALTER TABLE core_request_payloads ADD COLUMN IF NOT EXISTS request_content_type text NOT NULL DEFAULT '';
+ALTER TABLE core_request_payloads ADD COLUMN IF NOT EXISTS request_bytes bigint NOT NULL DEFAULT 0;
 
 `
 
@@ -95,6 +113,7 @@ func (s *Postgres) Close() {
 		defer cancel()
 		_, _ = s.lease.Exec(ctx, "SELECT pg_advisory_unlock(782471902631)")
 		s.lease.Release()
+		s.lease = nil
 	}
 	if s.db != nil {
 		s.db.Close()
@@ -121,43 +140,35 @@ func (s *Postgres) LoadAccounts(ctx context.Context) ([]Account, error) {
 	return out, rows.Err()
 }
 func (s *Postgres) ImportAccounts(ctx context.Context, accounts []Account) (int, error) {
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(ctx)
-	batch := &pgx.Batch{}
-	for _, a := range accounts {
-		b, _ := json.Marshal(a)
-		batch.Queue("INSERT INTO core_accounts(id,access_fingerprint,data) VALUES($1,$2,$3) ON CONFLICT(access_fingerprint) DO NOTHING", a.ID, Fingerprint(a.AccessToken), b)
-	}
-	r := tx.SendBatch(ctx, batch)
-	count := 0
-	for range accounts {
-		tag, e := r.Exec()
-		if e != nil {
-			r.Close()
-			return 0, e
-		}
-		count += int(tag.RowsAffected())
-	}
-	if err = r.Close(); err != nil {
-		return 0, err
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return count, nil
+	added, err := s.InsertManagedAccounts(ctx, accounts)
+	return len(added), err
 }
 func (s *Postgres) SaveAccount(ctx context.Context, a Account) error {
-	b, _ := json.Marshal(a)
-	_, err := s.db.Exec(ctx, "UPDATE core_accounts SET access_fingerprint=$2,data=jsonb_set($3::jsonb,'{enabled}',to_jsonb(COALESCE(managed_enabled,($3::jsonb->>'enabled')::boolean,false))),updated_at=now() WHERE id=$1 AND COALESCE((data->>'revision')::bigint,0) <= $4", a.ID, Fingerprint(a.AccessToken), b, a.Revision)
+	b, marshalErr := accountStateJSON(a)
+	if marshalErr != nil {
+		return marshalErr
+	}
+	_, err := s.db.Exec(ctx, "UPDATE core_accounts SET access_fingerprint=$2,data=jsonb_set(data || ($3::jsonb - 'linked_accounts'),'{enabled}',to_jsonb(COALESCE(managed_enabled,($3::jsonb->>'enabled')::boolean,false))),updated_at=now() WHERE id=$1 AND COALESCE((data->>'revision')::bigint,0) <= $4", a.ID, Fingerprint(a.AccessToken), b, a.Revision)
 	return err
 }
 func (s *Postgres) CreateTask(ctx context.Context, t Task) error {
 	b, _ := json.Marshal(t.Request)
-	_, err := s.db.Exec(ctx, "INSERT INTO core_tasks(id,created_at,status,request) VALUES($1,$2,$3,$4)", t.ID, t.Created, t.Status, b)
-	return err
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	_, err = tx.Exec(ctx, "INSERT INTO core_tasks(id,created_at,status,request,api_key_id,api_key_name) VALUES($1,$2,$3,$4,$5,$6)", t.ID, t.Created, t.Status, b, t.Request.apiKeyID, t.Request.apiKeyName)
+	if err != nil {
+		return err
+	}
+	if t.Request.idemScope != "" {
+		_, err = tx.Exec(ctx, "INSERT INTO core_idempotency(scope,fingerprint,task_id) VALUES($1,$2,$3)", t.Request.idemScope, t.Request.idemFingerprint, t.ID)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 func (s *Postgres) TaskState(ctx context.Context, id, status string, result *Generation, e *APIError) error {
 	var rb, eb []byte
@@ -167,13 +178,14 @@ func (s *Postgres) TaskState(ctx context.Context, id, status string, result *Gen
 	if e != nil {
 		eb, _ = json.Marshal(e)
 	}
-	_, err := s.db.Exec(ctx, "UPDATE core_tasks SET status=$2,result=$3,error=$4,updated_at=now() WHERE id=$1", id, status, rb, eb)
+	_, err := s.db.Exec(ctx, "UPDATE core_tasks SET status=$2,result=$3,error=$4,error_status=$5,updated_at=now() WHERE id=$1", id, status, rb, eb, errorHTTPStatus(e))
 	return err
 }
 func (s *Postgres) GetTask(ctx context.Context, id string) (Task, error) {
 	var t Task
 	var req, result, e []byte
-	err := s.db.QueryRow(ctx, "SELECT id,created_at,status,request,result,error FROM core_tasks WHERE id=$1", id).Scan(&t.ID, &t.Created, &t.Status, &req, &result, &e)
+	var httpStatus *int
+	err := s.db.QueryRow(ctx, "SELECT id,created_at,status,request,result,error,api_key_id,api_key_name,error_status FROM core_tasks WHERE id=$1", id).Scan(&t.ID, &t.Created, &t.Status, &req, &result, &e, &t.Request.apiKeyID, &t.Request.apiKeyName, &httpStatus)
 	if err != nil {
 		return t, err
 	}
@@ -190,13 +202,19 @@ func (s *Postgres) GetTask(ctx context.Context, id string) (Task, error) {
 			return t, err
 		}
 	}
+	if t.Error != nil {
+		t.Error.Status = 502
+		if httpStatus != nil {
+			t.Error.Status = *httpStatus
+		}
+	}
 	return t, nil
 }
 
 // 重启时明确标记中断，不偷偷重发可能已经计费的上游请求。
 func (s *Postgres) RecoverTasks(ctx context.Context) error {
 	e, _ := json.Marshal(Err(503, "server_restarted", "服务重启，任务中断；请重新提交"))
-	_, err := s.db.Exec(ctx, "UPDATE core_tasks SET status='failed',error=$1,updated_at=now() WHERE status IN ('queued','processing')", e)
+	_, err := s.db.Exec(ctx, "UPDATE core_tasks SET status='failed',error=$1,error_status=503,updated_at=now() WHERE status IN ('queued','processing')", e)
 	return err
 }
 
@@ -204,7 +222,7 @@ type batchLogStore interface {
 	LogBatch(context.Context, []requestLog) error
 }
 
-const requestLogInsert = "INSERT INTO core_requests(id,created_at,started_at,finished_at,queue_ms,switch_count,image_count,model,is_async,response_format,status,duration_ms,attempts,error) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"
+const requestLogInsert = "INSERT INTO core_requests(id,created_at,started_at,finished_at,queue_ms,switch_count,image_count,model,is_async,response_format,status,duration_ms,attempts,error,api_key_id,api_key_name) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"
 
 func requestLogValues(l requestLog) (any, error) {
 	a, err := json.Marshal(l.attempts)
@@ -241,7 +259,7 @@ func requestLogValues(l requestLog) (any, error) {
 	if l.err == nil {
 		images = l.req.N
 	}
-	return []any{l.id, timing.Finished, started, timing.Finished, timing.QueueMS, switches, images, l.req.Model, l.req.Async, l.req.Format, status, l.duration.Milliseconds(), a, eb}, nil
+	return []any{l.id, timing.Finished, started, timing.Finished, timing.QueueMS, switches, images, l.req.Model, l.req.Async, l.req.Format, status, l.duration.Milliseconds(), a, eb, l.req.apiKeyID, l.req.apiKeyName}, nil
 }
 
 func (s *Postgres) Log(ctx context.Context, id string, r Request, attempts []Attempt, e *APIError, d time.Duration) error {

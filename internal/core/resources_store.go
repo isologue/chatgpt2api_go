@@ -152,7 +152,7 @@ func (s *Postgres) retireLogs(ctx context.Context, ids []string, cutoff time.Tim
 	if rows.Err() != nil {
 		return 0, rows.Err()
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO core_file_gc(namespace,name,bytes) SELECT 'logs',response_file,response_bytes FROM core_request_payloads WHERE id=ANY($1) AND response_file<>'' ON CONFLICT DO NOTHING`, eligible)
+	_, err = tx.Exec(ctx, `INSERT INTO core_file_gc(namespace,name,bytes) SELECT 'logs',response_file,response_bytes FROM core_request_payloads WHERE id=ANY($1) AND response_file<>'' UNION ALL SELECT 'logs',request_file,request_bytes FROM core_request_payloads WHERE id=ANY($1) AND request_file<>'' ON CONFLICT DO NOTHING`, eligible)
 	if err != nil {
 		return 0, err
 	}

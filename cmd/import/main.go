@@ -28,13 +28,15 @@ func run(file string) error {
 		defer f.Close()
 		reader = f
 	}
-	raw, err := io.ReadAll(io.LimitReader(reader, 256<<20+1))
-	if err != nil || len(raw) > 256<<20 {
-		return fmt.Errorf("import file exceeds limit")
-	}
-	accounts, err := core.ParseAccounts(raw)
+	spool, err := os.CreateTemp("", "c2go-cli-import-*.json")
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot create temporary import file")
+	}
+	defer os.Remove(spool.Name())
+	defer spool.Close()
+	n, err := io.Copy(spool, io.LimitReader(reader, 256<<20+1))
+	if err != nil || n > 256<<20 {
+		return fmt.Errorf("import file exceeds limit or cannot be read")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -49,10 +51,37 @@ func run(file string) error {
 	if err = s.Migrate(ctx); err != nil {
 		return err
 	}
-	count, err := s.ImportAccounts(ctx, accounts)
-	if err != nil {
-		return fmt.Errorf("account import failed")
+	count, total := 0, 0
+	batch := make([]core.Account, 0, 100)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		added, err := s.ImportAccounts(ctx, batch)
+		if err != nil {
+			return err
+		}
+		count += added
+		batch = batch[:0]
+		return nil
 	}
-	fmt.Printf("Imported %d accounts; skipped %d duplicates.\n", count, len(accounts)-count)
+	err = core.WalkAccounts(spool, func(a core.Account, parseErr error) error {
+		if parseErr != nil {
+			return parseErr
+		}
+		total++
+		batch = append(batch, a)
+		if len(batch) == 100 {
+			return flush()
+		}
+		return nil
+	})
+	if err == nil {
+		err = flush()
+	}
+	if err != nil {
+		return fmt.Errorf("account import failed; completed batches are retained")
+	}
+	fmt.Printf("Imported %d accounts; reused %d accounts.\n", count, total-count)
 	return nil
 }

@@ -18,26 +18,27 @@ import (
 )
 
 type Native struct {
-	c                                                                                Config
-	pool                                                                             *Pool
-	store                                                                            Store
-	http                                                                             tlsclient.HttpClient
-	verify, downloads, validation                                                    *limiter
-	manualVerify                                                                     *limiter
-	pow                                                                              *limiter
-	settings                                                                         *runtimeConfig
-	flight                                                                           singleflight.Group
-	lifecycle                                                                        sync.Mutex
-	closed                                                                           bool
-	flights                                                                          sync.WaitGroup
-	root                                                                             context.Context
-	cancel                                                                           context.CancelFunc
-	activeSSE, started, downloadActive, downloadWaiting, downloadBytes, verifyActive atomic.Int64
-	validationActive, validationWaiting, manualVerifyActive                          atomic.Int64
-	turnstileFailures                                                                atomic.Int64
-	sseHardTimeouts, streamRecoveries                                                atomic.Int64
-	stageMu                                                                          sync.Mutex
-	stages                                                                           map[string]*stageHistogram
+	c                                                                                            Config
+	pool                                                                                         *Pool
+	store                                                                                        Store
+	http                                                                                         tlsclient.HttpClient
+	verify, downloads, validation                                                                *limiter
+	manualVerify, hotMaintenance, coldMaintenance, replenishment                                 *limiter
+	pow                                                                                          *limiter
+	settings                                                                                     *runtimeConfig
+	flight                                                                                       singleflight.Group
+	lifecycle                                                                                    sync.Mutex
+	closed                                                                                       bool
+	flights                                                                                      sync.WaitGroup
+	root                                                                                         context.Context
+	cancel                                                                                       context.CancelFunc
+	activeSSE, started, downloadActive, downloadWaiting, downloadBytes, verifyActive             atomic.Int64
+	validationActive, validationWaiting, manualVerifyActive                                      atomic.Int64
+	refreshSucceeded, refreshFailed, lastRefreshSuccess, lastRefreshFailure, persistenceFailures atomic.Int64
+	turnstileFailures                                                                            atomic.Int64
+	sseHardTimeouts, streamRecoveries                                                            atomic.Int64
+	stageMu                                                                                      sync.Mutex
+	stages                                                                                       map[string]*stageHistogram
 }
 type stageHistogram struct {
 	Count    int64
@@ -57,7 +58,7 @@ func NewNative(c Config, p *Pool, s Store) (*Native, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Native{c: c, pool: p, store: s, http: client, validation: newLimiter(c.ValidationConcurrency), verify: newLimiter(c.VerifyConcurrency), manualVerify: newLimiter(c.VerifyConcurrency), downloads: newLimiter(c.DownloadConcurrency), pow: newLimiter(c.powLimit()), root: ctx, cancel: cancel, stages: map[string]*stageHistogram{}}, nil
+	return &Native{c: c, pool: p, store: s, http: client, validation: newLimiter(c.ValidationConcurrency), verify: newLimiter(c.VerifyConcurrency), manualVerify: newLimiter(c.VerifyConcurrency), hotMaintenance: newLimiter(c.VerifyConcurrency), coldMaintenance: newLimiter(c.VerifyConcurrency), replenishment: newLimiter(c.VerifyConcurrency), downloads: newLimiter(c.DownloadConcurrency), pow: newLimiter(c.powLimit()), root: ctx, cancel: cancel, stages: map[string]*stageHistogram{}}, nil
 }
 func (n *Native) Close() {
 	n.lifecycle.Lock()
@@ -99,7 +100,7 @@ func (n *Native) Snapshot() map[string]any {
 		hist[k] = map[string]any{"count": h.Count, "mean_ms": h.Sum / float64(h.Count), "max_ms": h.Max, "histogram": h.Buckets, "bucket_upper_ms": stageBounds}
 	}
 	n.stageMu.Unlock()
-	return map[string]any{"pow_active": n.pow.Used(), "pow_waiting": n.pow.Waiting(), "pow_limit": n.pow.Limit(), "sse_hard_timeouts": n.sseHardTimeouts.Load(), "stream_timeout_recoveries": n.streamRecoveries.Load(), "turnstile_solver_failures": n.turnstileFailures.Load(), "generation_started": n.started.Load(), "sse_active": n.activeSSE.Load(), "verification_active": n.verifyActive.Load(), "verification_limit": n.verify.Limit(), "verification_waiting": n.verify.Waiting(), "manual_verification_active": n.manualVerifyActive.Load(), "manual_verification_limit": n.manualVerify.Limit(), "manual_verification_waiting": n.manualVerify.Waiting(), "download_active": n.downloadActive.Load(), "download_waiting": n.downloadWaiting.Load(), "download_limit": n.downloads.Limit(), "download_bytes": n.downloadBytes.Load(), "validation_active": n.validationActive.Load(), "validation_waiting": n.validationWaiting.Load(), "validation_limit": n.validation.Limit(), "stages": hist}
+	return map[string]any{"account_persistence_errors": n.persistenceFailures.Load(), "account_refresh_succeeded": n.refreshSucceeded.Load(), "account_refresh_failed": n.refreshFailed.Load(), "last_refresh_success_unix": n.lastRefreshSuccess.Load(), "last_refresh_failure_unix": n.lastRefreshFailure.Load(), "replenishment_active": n.replenishment.Used(), "replenishment_limit": n.replenishment.Limit(), "replenishment_waiting": n.replenishment.Waiting(), "pow_active": n.pow.Used(), "pow_waiting": n.pow.Waiting(), "pow_limit": n.pow.Limit(), "sse_hard_timeouts": n.sseHardTimeouts.Load(), "stream_timeout_recoveries": n.streamRecoveries.Load(), "turnstile_solver_failures": n.turnstileFailures.Load(), "generation_started": n.started.Load(), "sse_active": n.activeSSE.Load(), "verification_active": n.verifyActive.Load(), "verification_limit": n.verify.Limit(), "verification_waiting": n.verify.Waiting(), "manual_verification_active": n.manualVerifyActive.Load(), "manual_verification_limit": n.manualVerify.Limit(), "manual_verification_waiting": n.manualVerify.Waiting(), "hot_maintenance_active": n.hotMaintenance.Used(), "hot_maintenance_waiting": n.hotMaintenance.Waiting(), "hot_maintenance_limit": n.hotMaintenance.Limit(), "cold_maintenance_active": n.coldMaintenance.Used(), "cold_maintenance_waiting": n.coldMaintenance.Waiting(), "cold_maintenance_limit": n.coldMaintenance.Limit(), "download_active": n.downloadActive.Load(), "download_waiting": n.downloadWaiting.Load(), "download_limit": n.downloads.Limit(), "download_bytes": n.downloadBytes.Load(), "validation_active": n.validationActive.Load(), "validation_waiting": n.validationWaiting.Load(), "validation_limit": n.validation.Limit(), "stages": hist}
 }
 func tokenExpiring(token string) bool {
 	parts := strings.Split(token, ".")
@@ -118,9 +119,31 @@ func tokenExpiring(token string) bool {
 	return !ok || time.Unix(int64(exp), 0).Before(time.Now().Add(5*time.Minute))
 }
 func (n *Native) ensureAccount(ctx context.Context, a Account) (Account, error) {
-	return n.checkAccount(ctx, a, false)
+	fresh, err := n.checkAccount(ctx, a, false)
+	if err == nil && fresh.Quota != nil && *fresh.Quota <= 0 {
+		err = RetryError("account_quota_exhausted", "账号图片额度已耗尽")
+		ae := AsError(err)
+		ae.Penalty = 0
+		ae.Cooldown = time.Minute
+		if fresh.QuotaResetAt.After(time.Now()) {
+			ae.Cooldown = time.Until(fresh.QuotaResetAt)
+		}
+	}
+	return fresh, err
 }
 func (n *Native) checkAccount(ctx context.Context, a Account, force bool) (Account, error) {
+	gate, active := n.verify, &n.verifyActive
+	if force {
+		gate, active = n.manualVerify, &n.manualVerifyActive
+	}
+	lane := "foreground"
+	if force {
+		lane = "manual"
+	}
+	return n.checkAccountWithGate(ctx, a, force, gate, active, lane)
+}
+
+func (n *Native) checkAccountWithGate(ctx context.Context, a Account, force bool, gate *limiter, active *atomic.Int64, lane string) (Account, error) {
 	if current, ok := n.pool.Get(a.ID); ok {
 		a = current
 	}
@@ -128,7 +151,7 @@ func (n *Native) checkAccount(ctx context.Context, a Account, force bool) (Accou
 	if !force && !tokenExpiring(a.AccessToken) && time.Since(fresh) < n.config(ctx).Freshness {
 		return a, nil
 	}
-	ch := n.flight.DoChan(a.ID, func() (any, error) {
+	ch := n.flight.DoChan(a.ID, func() (value any, flightErr error) {
 		n.lifecycle.Lock()
 		if n.closed {
 			n.lifecycle.Unlock()
@@ -137,23 +160,31 @@ func (n *Native) checkAccount(ctx context.Context, a Account, force bool) (Accou
 		n.flights.Add(1)
 		n.lifecycle.Unlock()
 		defer n.flights.Done()
+		defer func() {
+			if flightErr != nil && n.root.Err() == nil {
+				n.refreshFailed.Add(1)
+				n.lastRefreshFailure.Store(time.Now().Unix())
+				snapshot := n.pool.RecordRefreshFailure(a.ID, flightErr)
+				if snapshot.ID != "" {
+					persist, cancel := context.WithTimeout(n.root, 5*time.Second)
+					defer cancel()
+					if n.store.SaveAccount(persist, snapshot) != nil {
+						n.persistenceFailures.Add(1)
+					}
+				}
+			}
+		}()
 		a := a
-		ctx, cancel := context.WithTimeout(context.WithValue(n.root, configKey{}, n.config(ctx)), 2*n.config(ctx).MetadataTimeout)
+		ctx, cancel := context.WithTimeout(context.WithValue(n.root, configKey{}, n.config(ctx)), 3*n.config(ctx).MetadataTimeout)
 		defer cancel()
-		gate := n.verify
-		if force {
-			gate = n.manualVerify
-		}
 		if err := gate.Acquire(ctx); err != nil {
 			return nil, err
 		}
 		defer gate.Release()
-		active := &n.verifyActive
-		if force {
-			active = &n.manualVerifyActive
+		if active != nil {
+			active.Add(1)
+			defer active.Add(-1)
 		}
-		active.Add(1)
-		defer active.Add(-1)
 		if current, ok := n.pool.Get(a.ID); ok {
 			a = current
 		}
@@ -181,10 +212,29 @@ func (n *Native) checkAccount(ctx context.Context, a Account, force bool) (Accou
 			}
 		}
 		s := n.session(a)
-		if _, err := s.json(ctx, "GET", "/backend-api/me", nil, nil); err != nil {
+		me, err := s.json(ctx, "GET", "/backend-api/me", nil, nil)
+		if err != nil {
 			return nil, err
 		}
+		a = applyAccountInfo(a, me)
+		init, initErr := s.json(ctx, "POST", "/backend-api/conversation/init", map[string]any{"gizmo_id": nil, "requested_default_model": nil, "conversation_id": nil, "timezone_offset_min": -480}, nil)
+		if initErr != nil {
+			code := AsError(initErr).Code
+			if code != "upstream_http_404" && code != "upstream_http_405" {
+				return nil, initErr
+			}
+		} else {
+			a = applyQuotaInfo(a, init)
+		}
 		a.VerifiedAt = time.Now()
+		a.LastRefreshAt = a.VerifiedAt
+		a.LastRefreshError = ""
+		a.Status = "available"
+		if a.Quota != nil && *a.Quota <= 0 {
+			a.Status = "quota_exhausted"
+		}
+		a.NextRefreshAt = time.Time{}
+		a.RefreshFailures = 0
 		a = n.pool.UpdateCredentials(a)
 		if a.ID == "" {
 			return nil, Err(409, "account_removed", "账号已删除")
@@ -192,6 +242,8 @@ func (n *Native) checkAccount(ctx context.Context, a Account, force bool) (Accou
 		if err := n.store.SaveAccount(ctx, a); err != nil {
 			return nil, Err(503, "account_persistence_failed", "保存账号校验信息失败")
 		}
+		n.refreshSucceeded.Add(1)
+		n.lastRefreshSuccess.Store(time.Now().Unix())
 		return a, nil
 	})
 	select {
@@ -286,8 +338,16 @@ func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[
 	if r.Quality != "auto" {
 		prompt += "\n输出图片质量为 " + r.Quality + "。"
 	}
+	content, attachments, err := s.editContent(ctx, r, prompt, stages)
+	if err != nil {
+		return nil, err
+	}
+	metadata := map[string]any{"developer_mode_connector_ids": []string{}, "selected_github_repos": []string{}, "selected_all_github_repos": false, "system_hints": []string{"picture_v2"}, "serialization_metadata": map[string]any{"custom_symbol_offsets": []int{}}}
+	if len(attachments) > 0 {
+		metadata["attachments"] = attachments
+	}
 	parent, message := uuid.NewString(), uuid.NewString()
-	payload := map[string]any{"action": "next", "fork_from_shared_post": false, "parent_message_id": parent, "model": n.c.UpstreamModel, "client_prepare_state": "success", "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "conversation_mode": map[string]any{"kind": "primary_assistant"}, "system_hints": []string{"picture_v2"}, "partial_query": map[string]any{"id": message, "author": map[string]string{"role": "user"}, "content": map[string]any{"content_type": "text", "parts": []string{prompt}}}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": map[string]string{"app_name": "chatgpt.com"}}
+	payload := map[string]any{"action": "next", "fork_from_shared_post": false, "parent_message_id": parent, "model": n.c.UpstreamModel, "client_prepare_state": "success", "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "conversation_mode": map[string]any{"kind": "primary_assistant"}, "system_hints": []string{"picture_v2"}, "partial_query": map[string]any{"id": message, "author": map[string]string{"role": "user"}, "content": content, "metadata": metadata}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": map[string]string{"app_name": "chatgpt.com"}}
 	start = time.Now()
 	cp, err := s.json(ctx, "POST", "/backend-api/f/conversation/prepare", payload, headers)
 	n.measure(stages, "会话准备", start)
@@ -305,7 +365,7 @@ func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[
 	payload["paragen_cot_summary_display_override"] = "allow"
 	payload["force_parallel_switch"] = "auto"
 	payload["client_contextual_info"] = map[string]any{"is_dark_mode": false, "time_since_loaded": 1200, "page_height": 1072, "page_width": 1724, "pixel_ratio": 1.2, "screen_height": 1440, "screen_width": 2560, "app_name": "chatgpt.com"}
-	payload["messages"] = []any{map[string]any{"id": message, "author": map[string]string{"role": "user"}, "create_time": float64(time.Now().UnixMilli()) / 1000, "content": map[string]any{"content_type": "text", "parts": []string{prompt}}, "metadata": map[string]any{"developer_mode_connector_ids": []string{}, "selected_github_repos": []string{}, "selected_all_github_repos": false, "system_hints": []string{"picture_v2"}, "serialization_metadata": map[string]any{"custom_symbol_offsets": []int{}}}}}
+	payload["messages"] = []any{map[string]any{"id": message, "author": map[string]string{"role": "user"}, "create_time": float64(time.Now().UnixMilli()) / 1000, "content": content, "metadata": metadata}}
 	start = time.Now()
 	state, streamErr := s.stream(ctx, payload, headers)
 	n.measure(stages, "上游生成流", start)

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"github.com/google/uuid"
 	"log/slog"
@@ -18,12 +19,13 @@ type logTiming struct {
 }
 
 type requestLog struct {
-	id       string
-	req      Request
-	attempts []Attempt
-	err      *APIError
-	duration time.Duration
-	timing   logTiming
+	persisted chan struct{}
+	id        string
+	req       Request
+	attempts  []Attempt
+	err       *APIError
+	duration  time.Duration
+	timing    logTiming
 }
 
 type completed struct {
@@ -31,46 +33,53 @@ type completed struct {
 	err    *APIError
 }
 type job struct {
-	id       string
-	request  Request
-	ctx      context.Context
-	cancel   context.CancelFunc
-	stop     func() bool
-	accepted time.Time
-	done     chan completed
+	releaseKey   func()
+	logPersisted chan struct{}
+	id           string
+	request      Request
+	ctx          context.Context
+	cancel       context.CancelFunc
+	stop         func() bool
+	accepted     time.Time
+	done         chan completed
 }
 type Metrics struct{ Accepted, Rejected, Completed, Failed, Safety, Active, Queued, PersistenceErrors atomic.Int64 }
 type Engine struct {
-	resources    *resourceManager
-	Config       Config
-	Pool         *Pool
-	Store        Store
-	Generator    Generator
-	Stats        Metrics
-	root         context.Context
-	cancel       context.CancelFunc
-	permits      *limiter
-	execution    *limiter
-	responses    *limiter
-	settings     *runtimeConfig
-	settingsMu   sync.Mutex
-	accountOps   sync.Mutex
-	adminWG      sync.WaitGroup
-	logQueue     chan requestLog
-	logOverflow  chan requestLog
-	logWG        sync.WaitGroup
-	logQueueFull atomic.Int64
-	logActive    atomic.Int64
-	importBusy   atomic.Bool
-	verifyBusy   atomic.Bool
-	wg           sync.WaitGroup
-	closing      atomic.Bool
-	admission    sync.RWMutex
+	keyMu           sync.Mutex
+	keyActive       map[string]int
+	idemLocks       [256]sync.Mutex
+	access          *accessManager
+	maintenanceOnce sync.Once
+	resources       *resourceManager
+	Config          Config
+	Pool            *Pool
+	Store           Store
+	Generator       Generator
+	Stats           Metrics
+	root            context.Context
+	cancel          context.CancelFunc
+	permits         *limiter
+	execution       *limiter
+	responses       *limiter
+	settings        *runtimeConfig
+	settingsMu      sync.Mutex
+	accountOps      sync.Mutex
+	adminWG         sync.WaitGroup
+	logQueue        chan requestLog
+	logOverflow     chan requestLog
+	logWG           sync.WaitGroup
+	logQueueFull    atomic.Int64
+	logActive       atomic.Int64
+	importBusy      atomic.Bool
+	verifyBusy      atomic.Bool
+	wg              sync.WaitGroup
+	closing         atomic.Bool
+	admission       sync.RWMutex
 }
 
 func NewEngine(c Config, p *Pool, s Store, g Generator) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &Engine{Config: c, Pool: p, Store: s, Generator: g, root: ctx, cancel: cancel, permits: newLimiter(c.Workers + c.QueueSize), execution: newLimiter(c.Workers), responses: newLimiter(c.ResponseConcurrency), settings: newRuntimeConfig(c), logQueue: make(chan requestLog, max(1, c.LogQueueSize)), logOverflow: make(chan requestLog, max(1, c.LogQueueSize))}
+	e := &Engine{access: newAccessManager(c), Config: c, Pool: p, Store: s, Generator: g, root: ctx, cancel: cancel, permits: newLimiter(c.Workers + c.QueueSize), execution: newLimiter(c.Workers), responses: newLimiter(c.ResponseConcurrency), settings: newRuntimeConfig(c), logQueue: make(chan requestLog, max(1, c.LogQueueSize)), logOverflow: make(chan requestLog, max(1, c.LogQueueSize))}
 	if db, ok := s.(*Postgres); ok {
 		e.resources = &resourceManager{e: e, s: db, pins: map[string]int{}, busy: map[string]bool{}, thumbnails: newLimiter(c.thumbnailLimit())}
 	}
@@ -84,18 +93,55 @@ func NewEngine(c Config, p *Pool, s Store, g Generator) *Engine {
 	return e
 }
 func (e *Engine) Submit(ctx context.Context, r Request) (Task, <-chan completed, error) {
+	if r.idemScope != "" {
+		db, ok := e.Store.(*Postgres)
+		if !ok {
+			return Task{}, nil, Err(503, "idempotency_unavailable", "当前存储不支持持久化幂等")
+		}
+		stripe := sha256.Sum256([]byte(r.idemScope))
+		lock := &e.idemLocks[stripe[0]]
+		lock.Lock()
+		defer lock.Unlock()
+		lookup, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		task, found, err := db.lookupIdempotency(lookup, r.idemScope, r.idemFingerprint)
+		if err != nil {
+			return Task{}, nil, err
+		}
+		if found {
+			return task, nil, nil
+		}
+	}
+	return e.submitNew(ctx, r)
+}
+func (e *Engine) submitNew(ctx context.Context, r Request) (Task, <-chan completed, error) {
 	config := configIn(ctx, e.CurrentConfig())
 	e.admission.RLock()
 	defer e.admission.RUnlock()
 	if e.closing.Load() {
 		return Task{}, nil, Err(503, "shutting_down", "服务正在停止")
 	}
+	releaseKey, err := e.acquireKey(r)
+	if err != nil {
+		return Task{}, nil, err
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			releaseKey()
+		}
+	}()
 	if !e.permits.TryAcquire() {
 		e.Stats.Rejected.Add(1)
 		return Task{}, nil, Err(429, "image_queue_full", "图片执行槽位与等待队列已满")
 	}
+	var logPersisted chan struct{}
+	if capture, ok := ctx.Value(wireCaptureKey{}).(*wireCapture); ok && !r.Async {
+		logPersisted = make(chan struct{})
+		capture.logPersisted = logPersisted
+	}
 	t := Task{ID: "task_" + uuid.NewString(), Created: time.Now(), Status: "queued", Request: r}
-	if r.Async {
+	if r.Async || r.idemScope != "" {
 		// 接纳阶段的数据库等待也必须有界，避免写入故障卡住准入锁与停机。
 		persist, cancel := context.WithTimeout(ctx, 10*time.Second)
 		err := e.Store.CreateTask(persist, t)
@@ -110,7 +156,8 @@ func (e *Engine) Submit(ctx context.Context, r Request) (Task, <-chan completed,
 	ctx = context.WithValue(ctx, configKey{}, config)
 	jctx, cancel := newImageBudget(ctx, t.Created.Add(config.TotalTimeout))
 	stop := context.AfterFunc(e.root, cancel)
-	j := &job{id: t.ID, request: r, ctx: jctx, cancel: cancel, stop: stop, accepted: t.Created, done: make(chan completed, 1)}
+	j := &job{releaseKey: releaseKey, logPersisted: logPersisted, id: t.ID, request: r, ctx: jctx, cancel: cancel, stop: stop, accepted: t.Created, done: make(chan completed, 1)}
+	transferred = true
 	e.Stats.Accepted.Add(1)
 	e.Stats.Queued.Add(1)
 	e.wg.Add(1)
@@ -126,18 +173,26 @@ func (e *Engine) Submit(ctx context.Context, r Request) (Task, <-chan completed,
 	return t, j.done, nil
 }
 func (e *Engine) failQueued(j *job, err *APIError) {
+	defer j.releaseKey()
+	if j.request.cleanup != nil {
+		defer j.request.cleanup()
+	}
 	e.Stats.Queued.Add(-1)
 	e.Stats.Failed.Add(1)
 	e.permits.Release()
 	j.cancel()
 	j.stop()
-	if j.request.Async {
+	if j.request.Async || j.request.idemScope != "" {
 		e.persistTask(j.id, "failed", nil, err)
 	}
-	e.enqueueLog(requestLog{id: j.id, req: j.request, err: err, duration: time.Since(j.accepted), timing: logTiming{Started: j.accepted, Finished: time.Now(), QueueMS: time.Since(j.accepted).Milliseconds()}})
+	e.enqueueLog(requestLog{persisted: j.logPersisted, id: j.id, req: j.request, err: err, duration: time.Since(j.accepted), timing: logTiming{Started: j.accepted, Finished: time.Now(), QueueMS: time.Since(j.accepted).Milliseconds()}})
 	j.done <- completed{nil, err}
 }
 func (e *Engine) execute(j *job) {
+	defer j.releaseKey()
+	if j.request.cleanup != nil {
+		defer j.request.cleanup()
+	}
 	executionStarted := time.Now()
 	e.Stats.Queued.Add(-1)
 	e.Stats.Active.Add(1)
@@ -147,13 +202,13 @@ func (e *Engine) execute(j *job) {
 	var attempts []Attempt
 	if err := j.ctx.Err(); err != nil {
 		apiErr = AsError(err)
-	} else if j.request.Async && !e.persistTask(j.id, "processing", nil, nil) {
+	} else if (j.request.Async || j.request.idemScope != "") && !e.persistTask(j.id, "processing", nil, nil) {
 		apiErr = Err(503, "task_persistence_failed", "任务状态写入失败，未开始生成")
 	}
 	if apiErr == nil {
 		result, attempts, apiErr = e.generate(j.ctx, j.request)
 	}
-	if j.request.Async {
+	if j.request.Async || j.request.idemScope != "" {
 		status := "succeeded"
 		if apiErr != nil {
 			status = "failed"
@@ -162,7 +217,7 @@ func (e *Engine) execute(j *job) {
 			apiErr = Err(503, "task_persistence_failed", "结果已生成，但任务状态持久化失败")
 		}
 	}
-	e.enqueueLog(requestLog{id: j.id, req: j.request, attempts: attempts, err: apiErr, duration: time.Since(j.accepted), timing: logTiming{Started: j.accepted, Finished: time.Now(), QueueMS: executionStarted.Sub(j.accepted).Milliseconds()}})
+	e.enqueueLog(requestLog{persisted: j.logPersisted, id: j.id, req: j.request, attempts: attempts, err: apiErr, duration: time.Since(j.accepted), timing: logTiming{Started: j.accepted, Finished: time.Now(), QueueMS: executionStarted.Sub(j.accepted).Milliseconds()}})
 	if apiErr == nil {
 		e.Stats.Completed.Add(1)
 	} else if apiErr.Code == "content_policy_violation" {
@@ -199,12 +254,19 @@ func (e *Engine) persistLogActive(l requestLog) {
 }
 
 func (e *Engine) persistLog(l requestLog) {
+	defer finishLog(l)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ctx = context.WithValue(ctx, logTimingKey{}, l.timing)
 	if err := e.Store.Log(ctx, l.id, l.req, l.attempts, l.err, l.duration); err != nil {
 		e.Stats.PersistenceErrors.Add(1)
 		slog.Error("request_log_write_failed", "task_id", l.id)
+	}
+}
+
+func finishLog(l requestLog) {
+	if l.persisted != nil {
+		close(l.persisted)
 	}
 }
 
@@ -274,6 +336,9 @@ func (e *Engine) logLoop() {
 				err := bl.LogBatch(ctx, batch)
 				cancel()
 				if err == nil {
+					for _, item := range batch {
+						finishLog(item)
+					}
 					return
 				}
 				slog.Error("request_log_batch_write_failed", "count", len(batch), "reason", err.Error())

@@ -26,7 +26,7 @@ func TestPostgresPersistenceAndLease(t *testing.T) {
 	if err = s.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.db.Exec(ctx, "TRUNCATE core_accounts,core_tasks,core_requests")
+	_, err = s.db.Exec(ctx, "TRUNCATE core_idempotency,core_accounts,core_tasks,core_requests")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestPostgresPersistenceAndLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 测试只用于专用数据库；清理本测试的记录，保持原型账号池为空。
-	if _, err = s.db.Exec(ctx, "TRUNCATE core_accounts,core_tasks,core_requests"); err != nil {
+	if _, err = s.db.Exec(ctx, "TRUNCATE core_idempotency,core_accounts,core_tasks,core_requests"); err != nil {
 		t.Fatal(err)
 	}
 }

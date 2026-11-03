@@ -59,6 +59,9 @@ type consoleSetting struct {
 
 func settingsFor(c Config) []consoleSetting {
 	items := []consoleSetting{
+		{Key: "CORE_EDIT_MAX_MIB", Label: "图片编辑请求大小", Group: "output", Value: c.editMaxMiB(), Default: 32, Unit: "MiB", Description: "图生图 multipart 请求总大小，含全部输入图片及表单。上传先落私有临时磁盘；过大返回 413。提高后临时磁盘和上传带宽增加。", Related: []string{"CORE_EDIT_MAX_IMAGES", "CORE_METADATA_TIMEOUT"}},
+		{Key: "CORE_EDIT_MAX_IMAGES", Label: "图片编辑输入张数", Group: "output", Value: c.editMaxImages(), Default: 4, Description: "单次图生图允许上传的参考图片数量；与输出张数 n 独立。每次切号需重新上传全部参考图。", Related: []string{"CORE_EDIT_MAX_MIB", "CORE_SWITCH_RETRIES"}},
+		{Key: "CORE_IMPORT_MAX_MIB", Label: "账号导入大小上限", Group: "output", Value: int(c.importLimit() >> 20), Default: 128, Unit: "MiB", Description: "管理页与推送入口共享的单次文件上限。文件先写临时磁盘，再逐条解析、每批 100 条入库；提高上限会增加临时磁盘和处理时间。", Related: []string{}},
 		{Key: "CORE_POW_CONCURRENCY", Label: "PoW 计算并发", Group: "concurrency", Value: c.PowConcurrency, Default: 0, Description: "请求进入上游前工作量证明的同时计算数量。0 表示自动使用可用 CPU 数的一半（至少 1）；正数指定上限。提高会增加 CPU 竞争，与图片解码及缩略图共享 CPU。实际容量见运行概览。", Related: []string{"CORE_IMAGE_WORKERS", "CORE_VALIDATION_CONCURRENCY", "CORE_THUMBNAIL_CONCURRENCY", "CORE_TOTAL_TIMEOUT"}},
 		{Key: "CORE_THUMBNAIL_CONCURRENCY", Label: "缩略图生成并发", Group: "output", Value: c.thumbnailLimit(), Default: 1, Description: "图片管理首次读取未缓存图片时，同时生成缩略图的数量；已有缓存直接读取，不占名额。提高会增加 CPU 与解码内存占用；独立于生图下载和解码槽位。", Related: []string{"CORE_VALIDATION_CONCURRENCY", "CORE_POW_CONCURRENCY", "CORE_MAX_IMAGE_BYTES"}},
 		{Key: "CORE_LOG_WRITERS", Label: "日志写入线程", Group: "output", Value: max(1, c.LogWriters), Default: 2, Description: "后台批量写入调用日志的并行数。提高可减少日志积压，但会增加 PostgreSQL 写入竞争；不占图片执行槽位。", Related: []string{"CORE_LOG_QUEUE_SIZE", "CORE_DB_CONNECTIONS"}},
@@ -69,8 +72,12 @@ func settingsFor(c Config) []consoleSetting {
 		{Key: "CORE_DOWNLOAD_CONCURRENCY", Label: "图片下载并发", Group: "concurrency", Value: c.DownloadConcurrency, Default: 100, Description: "同时执行的图片下载数。提高后会增加网络连接与带宽竞争；名额占满时等待。", Related: []string{"CORE_IMAGE_WORKERS", "CORE_VALIDATION_CONCURRENCY", "CORE_DOWNLOAD_TIMEOUT"}},
 		{Key: "CORE_VALIDATION_CONCURRENCY", Label: "图片解码并发", Group: "concurrency", Value: c.ValidationConcurrency, Default: 10, Description: "同时完整解码校验的图片数，影响 CPU 和内存峰值。解码等待也消耗下载超时；与下载并发不相乘。", Related: []string{"CORE_DOWNLOAD_CONCURRENCY", "CORE_MAX_IMAGE_BYTES", "CORE_DOWNLOAD_TIMEOUT"}},
 		{Key: "CORE_RESPONSE_CONCURRENCY", Label: "图片结果返回并发", Group: "concurrency", Value: c.ResponseConcurrency, Default: 32, Description: "限制结果读取和返回操作，尤其影响 Base64 结果的内存和带宽占用；不代表上游生成并发。", Related: []string{"CORE_RESPONSE_FORMAT", "CORE_IMAGE_WORKERS"}},
-		{Key: "CORE_VERIFY_CONCURRENCY", Label: "账号校验并发", Group: "accounts", Value: c.VerifyConcurrency, Default: 50, Description: "前台按需校验与手动批量校验各有独立通道，每条通道最多同时校验此数量的账号。同一账号的重复校验会合并等待。", Related: []string{"CORE_AVAILABILITY_TTL", "CORE_METADATA_TIMEOUT"}},
+		{Key: "CORE_VERIFY_CONCURRENCY", Label: "账号校验并发", Group: "accounts", Value: c.VerifyConcurrency, Default: 50, Description: "前台、热池补充、热池维护、冷池维护、手动校验各有独立的 C 个名额。同账号跨通道合并一次远程校验；调高此项会同时扩大每条通道。", Related: []string{"CORE_AVAILABILITY_TTL", "CORE_METADATA_TIMEOUT"}},
 		{Key: "CORE_AVAILABILITY_TTL", Label: "账号可用性有效期", Group: "accounts", Value: int(c.Freshness / time.Second), Default: 900, Unit: "秒", Description: "近期校验成功或生图成功任一时间在有效期内即可复用；AT 过期检查仍会执行。", Related: []string{"CORE_VERIFY_CONCURRENCY"}},
+		{Key: "CORE_HOT_POOL_SIZE", Label: "基础热池数量", Group: "accounts", Value: c.HotPoolSize, Default: 500, Description: "优先使用热池账号；用满后可选冷池账号并动态扩张，不限制生图总并发。", Related: []string{"CORE_ACCOUNT_SLOTS", "CORE_HOT_IDLE"}},
+		{Key: "CORE_HOT_IDLE", Label: "热池闲置退出时间", Group: "accounts", Value: int(c.HotIdle / time.Second), Default: 86400, Unit: "秒", Description: "闲置达到此时间且未占用槽位的账号退出热池；系统会补足基础数量。", Related: []string{"CORE_HOT_POOL_SIZE"}},
+		{Key: "CORE_HOT_MAINTENANCE_INTERVAL", Label: "热池维护间隔", Group: "accounts", Value: int(c.HotMaintenanceInterval / time.Second), Default: 1800, Unit: "秒", Description: "热池账号最近校验成功或生图成功（包括审核拒绝）超过此时间才刷新；重启沿用保存的时间。", Related: []string{"CORE_VERIFY_CONCURRENCY", "CORE_AVAILABILITY_TTL"}},
+		{Key: "CORE_COLD_MAINTENANCE_INTERVAL", Label: "冷池维护间隔", Group: "accounts", Value: int(c.ColdMaintenanceInterval / time.Second), Default: 86400, Unit: "秒", Description: "冷池按账号最后成功活性时间按需维护保活，失败退避，不建立全池任务队列。", Related: []string{"CORE_VERIFY_CONCURRENCY"}},
 		{Key: "CORE_TOTAL_TIMEOUT", Label: "图片请求总预算", Group: "timeouts", Value: int(c.TotalTimeout / time.Second), Default: 120, Unit: "秒", Description: "普通请求的执行和切号共用总预算。生成流硬超时后的恢复会豁免总预算，仍受各阶段超时和切号次数限制。", Related: []string{"CORE_SSE_TIMEOUT", "CORE_POLL_TIMEOUT", "CORE_SWITCH_RETRIES"}},
 		{Key: "CORE_SSE_TIMEOUT", Label: "上游生成流硬超时", Group: "timeouts", Value: int(c.SSETimeout / time.Second), Default: 80, Unit: "秒", Description: "限制单次上游生成流的最长等待。到期会进入结果恢复和补查流程。", Related: []string{"CORE_POLL_TIMEOUT", "CORE_SWITCH_RETRIES"}},
 		{Key: "CORE_POLL_TIMEOUT", Label: "图片结果补查超时", Group: "timeouts", Value: int(c.PollTimeout / time.Second), Default: 10, Unit: "秒", Description: "生成流未取得完整图片标识时，限制补查等待；补查失败后按错误类型及剩余切号次数处理。", Related: []string{"CORE_SSE_TIMEOUT", "CORE_SWITCH_RETRIES"}},
@@ -138,6 +145,7 @@ type consoleQuery struct {
 	Limit                  int
 	Search, Status, Cursor string
 	Async, Format          string
+	KeyID                  string
 	From, To               *time.Time
 }
 type consoleReader interface {
@@ -154,6 +162,10 @@ func readConsoleQuery(r *http.Request) (consoleQuery, error) {
 			return q, Err(400, "invalid_limit", "每页数量必须为 1 到 100")
 		}
 		q.Limit = n
+	}
+	q.KeyID = r.URL.Query().Get("api_key_id")
+	if len(q.KeyID) > 256 {
+		return q, Err(400, "invalid_key_id", "Key ID 过长")
 	}
 	q.Async = r.URL.Query().Get("async")
 	q.Format = r.URL.Query().Get("response_format")
