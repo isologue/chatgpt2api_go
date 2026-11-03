@@ -278,3 +278,5 @@ python3 scripts/backup.py restore --directory /your/backup/path/new-backup --pro
 ```
 
 备份短暂停止 core，完成或失败后恢复其原运行状态，保存数据库、图片及原始报文卷、Compose 和环境文件。备份目录应在持久化磁盘上并限制访问；包含完整账号凭据与密钥。恢复先校验 SHA256 与压缩包路径，默认拒绝非空目标；不会覆盖当前 Compose 或环境文件。独立恢复演练建议使用独立项目/数据卷，--no-start 保持 core 停止，便于检查数据库和图片，避免克隆账号触发后台远程刷新。WebDAV 远端数据由图床服务单独备份。
+
+本轮 WebDAV 降级、监控持久化、Linux 恢复演练与线上负载结果见 [2026-11-03 验收报告](docs/webdav-monitor-recovery-validation-2026-11-03.md)。
