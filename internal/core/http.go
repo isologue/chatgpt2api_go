@@ -36,12 +36,14 @@ func NewHandler(e *Engine) http.Handler {
 	m.HandleFunc("GET /admin/metrics", a.admin(a.metrics))
 	a.registerConsole(m)
 	a.registerAccess(m)
+	a.registerText(m)
+	a.registerExports(m)
 	m.HandleFunc("POST /v1/images/generations", a.auth(a.captureCreate))
 	m.HandleFunc("POST /v1/images/edits", a.auth(a.edit))
 	m.HandleFunc("GET /v1/images/tasks/{id}", a.auth(a.captureTask))
 	m.HandleFunc("GET /images/{name}", a.image)
 	m.HandleFunc("GET /v1/models", a.auth(func(w http.ResponseWriter, r *http.Request) {
-		sendJSON(w, 200, map[string]any{"object": "list", "data": []any{map[string]any{"id": "gpt-image-2", "object": "model", "owned_by": "chatgpt2api-go"}}})
+		sendJSON(w, 200, map[string]any{"object": "list", "data": []any{map[string]any{"id": "gpt-image-2", "object": "model", "owned_by": "chatgpt2api-go"}, map[string]any{"id": "auto", "object": "model", "owned_by": "chatgpt2api-go"}, map[string]any{"id": "gpt-5-5", "object": "model", "owned_by": "chatgpt2api-go"}, map[string]any{"id": "gpt-5-5-thinking", "object": "model", "owned_by": "chatgpt2api-go"}}})
 	}))
 	return m
 }

@@ -18,6 +18,7 @@ import (
 )
 
 type Native struct {
+	routes                                                                                       *proxyRouter
 	c                                                                                            Config
 	pool                                                                                         *Pool
 	store                                                                                        Store
@@ -58,7 +59,7 @@ func NewNative(c Config, p *Pool, s Store) (*Native, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Native{c: c, pool: p, store: s, http: client, validation: newLimiter(c.ValidationConcurrency), verify: newLimiter(c.VerifyConcurrency), manualVerify: newLimiter(c.VerifyConcurrency), hotMaintenance: newLimiter(c.VerifyConcurrency), coldMaintenance: newLimiter(c.VerifyConcurrency), replenishment: newLimiter(c.VerifyConcurrency), downloads: newLimiter(c.DownloadConcurrency), pow: newLimiter(c.powLimit()), root: ctx, cancel: cancel, stages: map[string]*stageHistogram{}}, nil
+	return &Native{c: c, pool: p, store: s, http: client, routes: newProxyRouter(), validation: newLimiter(c.ValidationConcurrency), verify: newLimiter(c.VerifyConcurrency), manualVerify: newLimiter(c.VerifyConcurrency), hotMaintenance: newLimiter(c.VerifyConcurrency), coldMaintenance: newLimiter(c.VerifyConcurrency), replenishment: newLimiter(c.VerifyConcurrency), downloads: newLimiter(c.DownloadConcurrency), pow: newLimiter(c.powLimit()), root: ctx, cancel: cancel, stages: map[string]*stageHistogram{}}, nil
 }
 func (n *Native) Close() {
 	n.lifecycle.Lock()
@@ -72,6 +73,9 @@ func (n *Native) Close() {
 	// 按需校验由 singleflight 独立执行，必须在关闭传输和数据库前等它退出。
 	n.flights.Wait()
 	n.http.Close()
+	if n.routes != nil {
+		n.routes.close()
+	}
 }
 func (n *Native) measure(stages map[string]float64, name string, start time.Time) {
 	ms := float64(time.Since(start).Microseconds()) / 1000
@@ -212,6 +216,7 @@ func (n *Native) checkAccountWithGate(ctx context.Context, a Account, force bool
 			}
 		}
 		s := n.session(a)
+		defer s.close()
 		me, err := s.json(ctx, "GET", "/backend-api/me", nil, nil)
 		if err != nil {
 			return nil, err
@@ -271,65 +276,10 @@ func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[
 		return nil, err
 	}
 	s := n.session(a)
-	start = time.Now()
-	script, build, err := s.bootstrap(ctx)
-	n.measure(stages, "首页建联", start)
+	defer s.close()
+	headers, err := s.requirements(ctx, stages)
 	if err != nil {
 		return nil, err
-	}
-	config := powConfig(s.a.UserAgent, script, build)
-	p := requirementsToken(config)
-	start = time.Now()
-	prepared, err := s.json(ctx, "POST", "/backend-api/sentinel/chat-requirements/prepare", map[string]any{"p": p}, nil)
-	n.measure(stages, "获取准入挑战", start)
-	if err != nil {
-		return nil, err
-	}
-	if yes(obj(prepared["arkose"])["required"]) {
-		return nil, RetryError("arkose_required", "上游要求暂不支持的 Arkose 验证")
-	}
-	proof := ""
-	if pow := obj(prepared["proofofwork"]); yes(pow["required"]) {
-		start = time.Now()
-		if err := n.pow.Acquire(ctx); err != nil {
-			return nil, err
-		}
-		n.measure(stages, "工作量证明排队", start)
-		start = time.Now()
-		proof, err = solveProof(ctx, str(pow["seed"]), str(pow["difficulty"]), powConfig(s.a.UserAgent, script, build))
-		n.pow.Release()
-		n.measure(stages, "工作量证明计算", start)
-		if err != nil {
-			return nil, RetryError("pow_failed", "工作量证明计算失败")
-		}
-	}
-	turnstile := ""
-	if t := obj(prepared["turnstile"]); yes(t["required"]) {
-		start = time.Now()
-		turnstile, err = solveTurnstile(ctx, str(t["dx"]), p)
-		n.measure(stages, "动态挑战计算", start)
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		if err != nil {
-			// 与原服务一致：求解失败时提交空值，由上游准入接口决定是否接受。
-			// 只累计指标，避免高并发时逐条告警占用日志写入。
-			n.turnstileFailures.Add(1)
-			turnstile = ""
-		}
-	}
-	start = time.Now()
-	final, err := s.json(ctx, "POST", "/backend-api/sentinel/chat-requirements/finalize", map[string]any{"prepare_token": prepared["prepare_token"], "proof_token": proof, "turnstile_token": turnstile}, nil)
-	n.measure(stages, "提交准入证明", start)
-	if err != nil {
-		return nil, err
-	}
-	if str(final["token"]) == "" {
-		return nil, RetryError("sentinel_token_missing", "上游未返回准入令牌")
-	}
-	headers := map[string]string{"OpenAI-Sentinel-Chat-Requirements-Token": str(final["token"])}
-	if proof != "" {
-		headers["OpenAI-Sentinel-Proof-Token"] = proof
 	}
 	prompt := r.Prompt
 	if r.Size != "" && r.Size != "auto" {
@@ -445,6 +395,9 @@ func (s *session) bootstrap(ctx context.Context) (string, string, error) {
 	defer cancel()
 	resp, err := s.request(ctx, "GET", "/", nil, map[string]string{"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none", "Sec-Fetch-User": "?1", "Upgrade-Insecure-Requests": "1"})
 	if err != nil {
+		if ae, ok := err.(*APIError); ok {
+			return "", "", ae
+		}
 		return "", "", RetryError("bootstrap_failed", "访问上游首页失败")
 	}
 	defer resp.Body.Close()

@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,10 +24,15 @@ const defaultUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 func Fingerprint(s string) string { sum := sha256.Sum256([]byte(s)); return hex.EncodeToString(sum[:]) }
 
 type session struct {
-	n         *Native
-	a         Account
-	jar       http.CookieJar
-	sessionID string
+	n            *Native
+	a            Account
+	jar          http.CookieJar
+	sessionID    string
+	routeClient  tlsclient.HttpClient
+	routeRelease func()
+	routeMu      sync.Mutex
+	routeClosed  bool
+	routeProxy   bool
 }
 
 func newTransport(c Config) (tlsclient.HttpClient, error) {
@@ -54,6 +60,7 @@ func (n *Native) session(a Account) *session {
 
 // 连接复用，但 CookieJar 属于本次账号会话，不通过共享客户端混用身份。
 func (s *session) request(ctx context.Context, method, path string, payload any, extra map[string]string) (*http.Response, error) {
+
 	var body io.Reader
 	if payload != nil {
 		body = bytes.NewReader(compactJSON(payload))
@@ -75,7 +82,7 @@ func (s *session) request(ctx context.Context, method, path string, payload any,
 	for _, c := range s.jar.Cookies(req.URL) {
 		req.AddCookie(c)
 	}
-	resp, err := s.n.http.Do(req)
+	resp, err := s.do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +96,9 @@ func (s *session) json(ctx context.Context, method, path string, payload any, ex
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, RetryError("upstream_metadata_timeout", "上游元数据请求超时")
+		}
+		if ae, ok := err.(*APIError); ok {
+			return nil, ae
 		}
 		return nil, RetryError("upstream_transport_failed", "上游连接失败")
 	}
@@ -159,8 +169,11 @@ func (n *Native) refreshToken(ctx context.Context, a Account) (Account, error) {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", defaultUA)
-	resp, err := n.http.Do(req)
+	resp, err := n.doRoute(req)
 	if err != nil {
+		if ae, ok := err.(*APIError); ok {
+			return a, ae
+		}
 		return a, RetryError("token_refresh_failed", "续期账号令牌失败")
 	}
 	defer resp.Body.Close()

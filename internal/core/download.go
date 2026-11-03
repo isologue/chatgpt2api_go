@@ -27,7 +27,7 @@ func (n *Native) download(ctx context.Context, link string, stages map[string]fl
 		if err == nil {
 			return artifact, nil
 		}
-		if retry == n.config(ctx).DownloadRetries {
+		if strings.HasPrefix(AsError(err).Code, "proxy_") || retry == n.config(ctx).DownloadRetries {
 			return Artifact{}, err
 		}
 	}
@@ -77,9 +77,16 @@ func (n *Native) transfer(ctx context.Context, link string, stages map[string]fl
 		if session != nil && origin != nil && strings.EqualFold(u.Scheme, origin.Scheme) && strings.EqualFold(u.Host, origin.Host) && u.Path == "/backend-api/estuary/content" {
 			resp, e = session.request(ctx, "GET", u.RequestURI(), nil, map[string]string{"Accept": "*/*"})
 		} else {
-			resp, e = n.http.Do(req)
+			if session != nil {
+				resp, e = session.do(req)
+			} else {
+				resp, e = n.doRoute(req)
+			}
 		}
 		if e != nil {
+			if ae, ok := e.(*APIError); ok {
+				return artifact, ae
+			}
 			return artifact, RetryError("image_download_failed", "连接图片下载服务失败")
 		}
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {

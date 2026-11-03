@@ -45,6 +45,9 @@ type job struct {
 }
 type Metrics struct{ Accepted, Rejected, Completed, Failed, Safety, Active, Queued, PersistenceErrors atomic.Int64 }
 type Engine struct {
+	textSlots       *limiter
+	fileSlots       *limiter
+	filePermits     *limiter
 	webdav          *webDAVStorage
 	keyMu           sync.Mutex
 	keyActive       map[string]int
@@ -81,7 +84,7 @@ type Engine struct {
 
 func NewEngine(c Config, p *Pool, s Store, g Generator) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &Engine{webdav: newWebDAVStorage(c.WebDAV), access: newAccessManager(c), Config: c, Pool: p, Store: s, Generator: g, root: ctx, cancel: cancel, permits: newLimiter(c.Workers + c.QueueSize), execution: newLimiter(c.Workers), responses: newLimiter(c.ResponseConcurrency), settings: newRuntimeConfig(c), logQueue: make(chan requestLog, max(1, c.LogQueueSize)), logOverflow: make(chan requestLog, max(1, c.LogQueueSize))}
+	e := &Engine{textSlots: newLimiter(c.textLimit()), fileSlots: newLimiter(c.fileLimit()), filePermits: newLimiter(c.fileLimit() + c.FileQueueSize), webdav: newWebDAVStorage(c.WebDAV), access: newAccessManager(c), Config: c, Pool: p, Store: s, Generator: g, root: ctx, cancel: cancel, permits: newLimiter(c.Workers + c.QueueSize), execution: newLimiter(c.Workers), responses: newLimiter(c.ResponseConcurrency), settings: newRuntimeConfig(c), logQueue: make(chan requestLog, max(1, c.LogQueueSize)), logOverflow: make(chan requestLog, max(1, c.LogQueueSize))}
 	if db, ok := s.(*Postgres); ok {
 		e.resources = &resourceManager{e: e, s: db, pins: map[string]int{}, busy: map[string]bool{}, thumbnails: newLimiter(c.thumbnailLimit())}
 	}
@@ -476,7 +479,7 @@ func (e *Engine) Close() {
 }
 
 func (e *Engine) Snapshot() map[string]any {
-	return map[string]any{"accepted": e.Stats.Accepted.Load(), "rejected": e.Stats.Rejected.Load(), "succeeded": e.Stats.Completed.Load(), "failed": e.Stats.Failed.Load(), "safety_rejected": e.Stats.Safety.Load(), "active_requests": e.Stats.Active.Load(), "queued_requests": e.Stats.Queued.Load(), "worker_limit": e.CurrentConfig().Workers, "queue_limit": e.CurrentConfig().QueueSize, "persistence_errors": e.Stats.PersistenceErrors.Load(), "webdav": e.webdav.snapshot(), "log_active": e.logActive.Load(), "log_queue_waiting": len(e.logQueue) + len(e.logOverflow), "log_queue_limit": cap(e.logQueue) + cap(e.logOverflow), "log_queue_primary_waiting": len(e.logQueue), "log_queue_overflow_waiting": len(e.logOverflow), "log_queue_primary_limit": cap(e.logQueue), "log_queue_overflow_limit": cap(e.logOverflow), "log_queue_full": e.logQueueFull.Load(), "log_writers": max(1, e.CurrentConfig().LogWriters), "response_active": e.responses.Used(), "response_waiting": e.responses.Waiting(), "response_limit": e.responses.Limit(), "account_pool": e.Pool.Snapshot()}
+	return map[string]any{"text_active": e.textSlots.Used(), "text_limit": e.textSlots.Limit(), "file_active": e.fileSlots.Used(), "file_queued": max(0, e.filePermits.Used()-e.fileSlots.Used()), "file_limit": e.fileSlots.Limit(), "file_queue_limit": e.CurrentConfig().FileQueueSize, "accepted": e.Stats.Accepted.Load(), "rejected": e.Stats.Rejected.Load(), "succeeded": e.Stats.Completed.Load(), "failed": e.Stats.Failed.Load(), "safety_rejected": e.Stats.Safety.Load(), "active_requests": e.Stats.Active.Load(), "queued_requests": e.Stats.Queued.Load(), "worker_limit": e.CurrentConfig().Workers, "queue_limit": e.CurrentConfig().QueueSize, "persistence_errors": e.Stats.PersistenceErrors.Load(), "webdav": e.webdav.snapshot(), "log_active": e.logActive.Load(), "log_queue_waiting": len(e.logQueue) + len(e.logOverflow), "log_queue_limit": cap(e.logQueue) + cap(e.logOverflow), "log_queue_primary_waiting": len(e.logQueue), "log_queue_overflow_waiting": len(e.logOverflow), "log_queue_primary_limit": cap(e.logQueue), "log_queue_overflow_limit": cap(e.logOverflow), "log_queue_full": e.logQueueFull.Load(), "log_writers": max(1, e.CurrentConfig().LogWriters), "response_active": e.responses.Used(), "response_waiting": e.responses.Waiting(), "response_limit": e.responses.Limit(), "account_pool": e.Pool.Snapshot()}
 }
 
 func (e *Engine) safeGenerate(ctx context.Context, a Account, r Request, s map[string]float64) (images []Artifact, err error) {

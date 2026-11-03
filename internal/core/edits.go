@@ -18,6 +18,7 @@ import (
 )
 
 type editInput struct {
+	Library                bool
 	Path, Name, MIME, Hash string
 	Width, Height          int
 	Bytes                  int64

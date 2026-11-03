@@ -43,7 +43,13 @@ func (s *session) uploadEdit(ctx context.Context, input editInput, mask *editInp
 	if _, err = file.Seek(0, 0); err != nil {
 		return nil, err
 	}
-	meta, err := s.json(ctx, "POST", "/backend-api/files", map[string]any{"file_name": input.Name, "file_size": input.Bytes, "use_case": "multimodal", "width": input.Width, "height": input.Height}, nil)
+	payload := map[string]any{"file_name": input.Name, "file_size": input.Bytes, "use_case": "multimodal", "width": input.Width, "height": input.Height}
+	if input.Library {
+		payload["use_case"] = "my_files"
+		payload["store_in_library"] = true
+		payload["library_persistence_mode"] = "opportunistic"
+	}
+	meta, err := s.json(ctx, "POST", "/backend-api/files", payload, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -63,8 +69,11 @@ func (s *session) uploadEdit(ctx context.Context, input editInput, mask *editInp
 	for k, v := range map[string]string{"Content-Type": input.MIME, "x-ms-blob-type": "BlockBlob", "x-ms-version": "2020-04-08", "Origin": s.n.c.UpstreamURL, "Referer": s.n.c.UpstreamURL + "/", "User-Agent": s.a.UserAgent} {
 		request.Header.Set(k, v)
 	}
-	resp, err := s.n.http.Do(request)
+	resp, err := s.do(request)
 	if err != nil {
+		if ae, ok := err.(*APIError); ok {
+			return nil, ae
+		}
 		return nil, RetryError("image_upload_failed", "参考图片上传失败或超时")
 	}
 	_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
@@ -76,7 +85,7 @@ func (s *session) uploadEdit(ctx context.Context, input editInput, mask *editInp
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"id": id, "mimeType": input.MIME, "name": input.Name, "size": input.Bytes, "width": input.Width, "height": input.Height}, nil
+	return map[string]any{"library_file_id": str(meta["library_file_id"]), "id": id, "mimeType": input.MIME, "name": input.Name, "size": input.Bytes, "width": input.Width, "height": input.Height}, nil
 }
 func (s *session) editContent(ctx context.Context, r Request, prompt string, stages map[string]float64) (map[string]any, []any, error) {
 	if len(r.inputs) == 0 {

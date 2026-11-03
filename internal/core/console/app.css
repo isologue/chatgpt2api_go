@@ -29,3 +29,13 @@
 #webdav-panel .panel{padding:24px}#webdav-panel input[type=password]{width:100%;max-width:480px;min-width:0;height:39px;border:1px solid #e6e8dd;background:#fcfcf9;border-radius:9px;padding:0 12px;color:var(--ink);font:13px var(--font)}
 
 .monitor-history-controls{display:flex;gap:16px;flex-wrap:wrap;padding:0 24px 8px}.monitor-history-controls label{display:flex;align-items:center;gap:8px;font-size:12px}.monitor-history-controls select{max-width:160px;padding:6px;border:1px solid var(--border);border-radius:6px;background:var(--surface)}#history-status{padding:0 24px;line-height:1.5}#history-peak{font-size:11px}
+
+/* Unified upstream proxy settings */
+.proxy-list-label,.proxy-results-heading{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.proxy-list{width:100%;min-height:164px;resize:vertical;font-family:var(--font-mono,monospace);font-size:13px;line-height:1.65;padding:12px 13px}
+.proxy-explanation{padding:16px 18px;border:1px solid var(--line);border-radius:10px;font-size:13px;line-height:1.7}
+.proxy-explanation p{margin:6px 0 0;color:var(--muted)}
+.proxy-actions{flex-wrap:wrap}.proxy-results{margin-top:24px;border-top:1px solid var(--line);padding-top:20px}
+.proxy-results-heading{margin-bottom:12px}.proxy-results-heading h3{margin:0;font-size:15px}.proxy-results .table-wrap{overflow-x:auto}
+.proxy-address{min-width:220px;max-width:430px;overflow-wrap:anywhere}.proxy-address p{margin:5px 0 0;line-height:1.5}
+@media(max-width:640px){.proxy-actions .button{flex:1}.proxy-results-heading{align-items:flex-start;flex-direction:column;gap:6px}}

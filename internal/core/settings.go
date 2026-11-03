@@ -45,6 +45,13 @@ func applySettingValues(base Config, values map[string]json.RawMessage) (Config,
 	for key, raw := range values {
 		var number float64
 		switch key {
+		case "CORE_PROXY":
+			value, err := decodeProxyConfig(raw)
+			if err != nil {
+				return c, err
+			}
+			c.Proxy = value
+			continue
 		case "CORE_WEBDAV":
 			if string(raw) == "null" {
 				return c, fmt.Errorf("WebDAV 配置无效")
@@ -90,11 +97,23 @@ func applySettingValues(base Config, values map[string]json.RawMessage) (Config,
 			return c, fmt.Errorf("%s 必须为有效的非负整数", key)
 		}
 		v := int(number)
-		if v == 0 && key != "CORE_POW_CONCURRENCY" && key != "CORE_IMAGE_QUEUE_SIZE" && key != "CORE_SWITCH_RETRIES" && key != "CORE_DOWNLOAD_RETRIES" {
+		if v == 0 && key != "CORE_FILE_QUEUE_SIZE" && key != "CORE_POW_CONCURRENCY" && key != "CORE_IMAGE_QUEUE_SIZE" && key != "CORE_SWITCH_RETRIES" && key != "CORE_DOWNLOAD_RETRIES" {
 			return c, fmt.Errorf("%s 必须大于 0", key)
 		}
 		d := time.Duration(v) * time.Second
 		switch key {
+		case "CORE_TEXT_CONCURRENCY":
+			c.TextConcurrency = v
+		case "CORE_FILE_CONCURRENCY":
+			c.FileConcurrency = v
+		case "CORE_FILE_QUEUE_SIZE":
+			c.FileQueueSize = v
+		case "CORE_TEXT_TIMEOUT":
+			c.TextTimeout = d
+		case "CORE_FILE_TIMEOUT":
+			c.FileTimeout = d
+		case "CORE_MAX_FILE_BYTES":
+			c.MaxFileBytes = int64(v)
 		case "CORE_MONITOR_INTERVAL_SECONDS":
 			if v > 86400 {
 				return c, fmt.Errorf("监控采样间隔不能超过 86400 秒")
@@ -196,6 +215,9 @@ func (s *Postgres) ConfigFromSettings(ctx context.Context, base Config) (Config,
 	return applySettingValues(base, v.Values)
 }
 func (e *Engine) applyConfig(c Config) {
+	e.textSlots.Resize(c.textLimit())
+	e.fileSlots.Resize(c.fileLimit())
+	e.filePermits.Resize(c.fileLimit() + c.FileQueueSize)
 	e.execution.Resize(c.Workers)
 	e.permits.Resize(c.Workers + c.QueueSize)
 	e.responses.Resize(c.ResponseConcurrency)

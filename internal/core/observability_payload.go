@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -81,7 +82,9 @@ func (w *wireWriter) Write(p []byte) (int, error) {
 	}
 	return n, err
 }
-func (a *API) payloadDir() string { return filepath.Join(a.Engine.Config.ImageDir, ".request-logs") }
+func (w *wireWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+func (w *wireWriter) Flush()                      { _ = http.NewResponseController(w.ResponseWriter).Flush() }
+func (a *API) payloadDir() string                 { return filepath.Join(a.Engine.Config.ImageDir, ".request-logs") }
 func (a *API) captureCreate(w http.ResponseWriter, r *http.Request) {
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1024*1024))
 	if err != nil {
@@ -480,10 +483,29 @@ func (a *API) consoleBody(w http.ResponseWriter, r *http.Request) {
 		io.CopyN(w, source, length)
 		return
 	}
+	// SSE 只读取一个有界预览；完整原文仍按需流式读取，避免详情展开加载整个流。
+	var streamPreview string
+	if kind != "request" {
+		head, readErr := io.ReadAll(io.LimitReader(source, 4096))
+		if readErr != nil {
+			sendError(w, Err(503, "body_read_failed", "原始报文读取失败"))
+			return
+		}
+		if _, seekErr := source.Seek(0, io.SeekStart); seekErr != nil {
+			sendError(w, Err(503, "body_read_failed", "原始报文读取失败"))
+			return
+		}
+		trimmed := strings.TrimSpace(string(head))
+		if strings.HasPrefix(trimmed, "data:") || strings.HasPrefix(trimmed, "event:") || strings.HasPrefix(trimmed, ":") {
+			streamPreview = strings.ToValidUTF8(string(head), "�")
+		}
+	}
 	if r.URL.Query().Get("raw") == "1" {
 		if kind == "request" && p.RequestFile != "" {
 			w.Header().Set("Content-Type", p.ContentType)
 			w.Header().Set("Content-Disposition", `attachment; filename="request.multipart"`)
+		} else if streamPreview != "" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		} else {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		}
@@ -492,6 +514,10 @@ func (a *API) consoleBody(w http.ResponseWriter, r *http.Request) {
 	}
 	if kind == "request" && p.RequestFile != "" {
 		sendJSON(w, 200, map[string]any{"multipart": true, "bytes": size, "content_type": p.ContentType, "http_status": p.Status, "captured_at": p.Finished})
+		return
+	}
+	if streamPreview != "" {
+		sendJSON(w, 200, map[string]any{"raw_only": true, "content_type": "text/event-stream", "preview": streamPreview, "bytes": size, "http_status": p.Status, "captured_at": p.Finished})
 		return
 	}
 	tree, e := previewJSON(source)

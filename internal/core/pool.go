@@ -9,11 +9,14 @@ import (
 
 // 仅维护可选号索引，数据库不参与每次选号。锁内不做 I/O、远程校验或日志。
 type entry struct {
-	a           Account
-	used, index int
-	seq         uint64
-	cooling     bool
-	deleted     bool
+	textIndex         int
+	textDelayed, paid bool
+	textSeq           uint64
+	a                 Account
+	used, index       int
+	seq               uint64
+	cooling           bool
+	deleted           bool
 }
 type accountHeap struct {
 	items   []*entry
@@ -24,7 +27,7 @@ func (h accountHeap) Len() int { return len(h.items) }
 func (h accountHeap) Less(i, j int) bool {
 	a, b := h.items[i], h.items[j]
 	if h.cooling {
-		return a.a.AvailableAt.Before(b.a.AvailableAt)
+		return imageAvailable(a.a).Before(imageAvailable(b.a))
 	}
 	if a.a.Hot != b.a.Hot {
 		return a.a.Hot
@@ -58,6 +61,8 @@ func (h *accountHeap) Pop() any {
 }
 
 type Pool struct {
+	textReady, textDelayed    textAccountHeap
+	textSeq                   uint64
 	mu                        sync.Mutex
 	ready, delayed            accountHeap
 	all                       map[string]*entry
@@ -72,8 +77,9 @@ type Pool struct {
 func NewPool(accounts []Account, slots int) *Pool {
 	p := &Pool{all: make(map[string]*entry), slots: slots}
 	p.delayed.cooling = true
+	p.textDelayed.delayed = true
 	for _, a := range accounts {
-		e := &entry{a: a, index: -1}
+		e := &entry{a: a, index: -1, textIndex: -1, paid: paidAccount(a)}
 		p.all[a.ID] = e
 		p.ids = append(p.ids, a.ID)
 		if a.Hot {
@@ -87,6 +93,7 @@ func NewPool(accounts []Account, slots int) *Pool {
 	return p
 }
 func (p *Pool) enqueue(e *entry) {
+	p.enqueueText(e)
 	if e.deleted || !e.a.Enabled || e.used >= p.slots || e.index >= 0 {
 		return
 	}
@@ -95,14 +102,14 @@ func (p *Pool) enqueue(e *entry) {
 			return
 		}
 		if time.Now().Before(e.a.QuotaResetAt) {
-			e.a.AvailableAt = maxTime(e.a.AvailableAt, e.a.QuotaResetAt)
+			// 图片额度等待仅作用于图片索引，不阻塞文本。
 		} else {
 			e.a.Quota = nil
 		}
 	}
 	p.seq++
 	e.seq = p.seq
-	if time.Now().Before(e.a.AvailableAt) {
+	if time.Now().Before(imageAvailable(e.a)) {
 		heap.Push(&p.delayed, e)
 	} else {
 		heap.Push(&p.ready, e)
@@ -111,7 +118,7 @@ func (p *Pool) enqueue(e *entry) {
 }
 func (p *Pool) promote() {
 	now := time.Now()
-	for p.delayed.Len() > 0 && !p.delayed.items[0].a.AvailableAt.After(now) {
+	for p.delayed.Len() > 0 && !imageAvailable(p.delayed.items[0].a).After(now) {
 		e := heap.Pop(&p.delayed).(*entry)
 		p.enqueue(e)
 	}
@@ -133,6 +140,7 @@ func (p *Pool) Acquire(exclude map[string]bool) (Account, bool) {
 			skipped = append(skipped, e)
 			continue
 		}
+		p.detachText(e)
 		e.used++
 		p.used++
 		e.a.LastUsedAt = time.Now()
@@ -144,7 +152,8 @@ func (p *Pool) Acquire(exclude map[string]bool) (Account, bool) {
 	}
 	return Account{}, false
 }
-func (p *Pool) Release(id string, err *APIError) Account {
+func (p *Pool) Release(id string, err *APIError) Account { return p.release(id, err, true) }
+func (p *Pool) release(id string, err *APIError, image bool) Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e := p.all[id]
@@ -164,7 +173,7 @@ func (p *Pool) Release(id string, err *APIError) Account {
 		p.used--
 	}
 	now := time.Now()
-	if err == nil {
+	if err == nil && image {
 		e.a.Score = min(100, e.a.Score+1)
 		e.a.SuccessAt = now
 		e.a.LastErrorCode = ""
@@ -175,8 +184,12 @@ func (p *Pool) Release(id string, err *APIError) Account {
 				p.setHot(e, false, now)
 			}
 		}
+	} else if err == nil {
+		// 文本成功不扣图片额度，不刷新生图成功时间。
 	} else if err.Code == "content_policy_violation" {
-		e.a.SuccessAt = now
+		if image {
+			e.a.SuccessAt = now
+		}
 		e.a.LastErrorCode = err.Code
 	} else {
 		e.a.Score = max(0, e.a.Score-err.Penalty)
@@ -231,6 +244,7 @@ func (p *Pool) UpdateCredentials(a Account) Account {
 	if e := p.all[a.ID]; e != nil && !e.deleted {
 		p.detach(e)
 		e.a.AccessToken = a.AccessToken
+		e.paid = paidAccount(e.a)
 		e.a.RefreshToken = a.RefreshToken
 		e.a.VerifiedAt = a.VerifiedAt
 		e.a.LastRefreshAt = a.LastRefreshAt
@@ -355,6 +369,7 @@ func (p *Pool) Get(id string) (Account, bool) {
 
 // 管理操作只在短临界区中调整索引；数据库 I/O 由调用方在锁外完成。
 func (p *Pool) detach(e *entry) {
+	p.detachText(e)
 	if e.index < 0 {
 		return
 	}
@@ -387,7 +402,7 @@ func (p *Pool) Add(accounts []Account) {
 		if _, exists := p.all[a.ID]; exists {
 			continue
 		}
-		e := &entry{a: a, index: -1}
+		e := &entry{a: a, index: -1, textIndex: -1, paid: paidAccount(a)}
 		p.all[a.ID] = e
 		p.ids = append(p.ids, a.ID)
 		if a.Hot {

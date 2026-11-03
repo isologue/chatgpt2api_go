@@ -40,7 +40,7 @@ func OpenPostgres(ctx context.Context, url string, connections int) (*Postgres, 
 	return s, nil
 }
 
-const schema = `
+const schema = exportSchema + `
 CREATE TABLE IF NOT EXISTS core_monitor_samples(sampled_at timestamptz PRIMARY KEY, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS core_accounts(id text PRIMARY KEY, access_fingerprint text NOT NULL UNIQUE, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now());
 ALTER TABLE core_accounts ADD COLUMN IF NOT EXISTS managed_enabled boolean;
@@ -214,7 +214,12 @@ func (s *Postgres) GetTask(ctx context.Context, id string) (Task, error) {
 
 // 重启时明确标记中断，不偷偷重发可能已经计费的上游请求。
 func (s *Postgres) RecoverTasks(ctx context.Context) error {
+
 	e, _ := json.Marshal(Err(503, "server_restarted", "服务重启，任务中断；请重新提交"))
+	_, fileErr := s.db.Exec(ctx, "UPDATE core_file_tasks SET status='error',error=$1,updated_at=now() WHERE status IN ('queued','running')", e)
+	if fileErr != nil {
+		return fileErr
+	}
 	_, err := s.db.Exec(ctx, "UPDATE core_tasks SET status='failed',error=$1,error_status=503,updated_at=now() WHERE status IN ('queued','processing')", e)
 	return err
 }

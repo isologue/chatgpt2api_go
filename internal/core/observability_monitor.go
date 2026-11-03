@@ -94,7 +94,7 @@ func (s *Postgres) ConsoleResults(ctx context.Context, span resultRange) (map[st
 		defer cancel()
 		var success, failed, safety, images, unknown int64
 		var p50, p95, queueP95 float64
-		e := s.db.QueryRow(query, `SELECT count(*) FILTER(WHERE status='succeeded'),count(*) FILTER(WHERE status='failed'),count(*) FILTER(WHERE status='safety_rejected'),COALESCE(sum(image_count) FILTER(WHERE status='succeeded'),0),count(*) FILTER(WHERE status='succeeded' AND image_count IS NULL),COALESCE(percentile_cont(0.5) WITHIN GROUP(ORDER BY duration_ms) FILTER(WHERE status='succeeded'),0),COALESCE(percentile_cont(0.95) WITHIN GROUP(ORDER BY duration_ms) FILTER(WHERE status='succeeded'),0),COALESCE(percentile_cont(0.95) WITHIN GROUP(ORDER BY queue_ms) FILTER(WHERE queue_ms IS NOT NULL),0) FROM core_requests WHERE created_at >= $1 AND created_at < $2`, span.From, span.To).Scan(&success, &failed, &safety, &images, &unknown, &p50, &p95, &queueP95)
+		e := s.db.QueryRow(query, `SELECT count(*) FILTER(WHERE status='succeeded'),count(*) FILTER(WHERE status='failed'),count(*) FILTER(WHERE status='safety_rejected'),COALESCE(sum(image_count) FILTER(WHERE status='succeeded'),0),count(*) FILTER(WHERE status='succeeded' AND image_count IS NULL),COALESCE(percentile_cont(0.5) WITHIN GROUP(ORDER BY duration_ms) FILTER(WHERE status='succeeded'),0),COALESCE(percentile_cont(0.95) WITHIN GROUP(ORDER BY duration_ms) FILTER(WHERE status='succeeded'),0),COALESCE(percentile_cont(0.95) WITHIN GROUP(ORDER BY queue_ms) FILTER(WHERE queue_ms IS NOT NULL),0) FROM core_requests WHERE model='gpt-image-2' AND created_at >= $1 AND created_at < $2`, span.From, span.To).Scan(&success, &failed, &safety, &images, &unknown, &p50, &p95, &queueP95)
 		if e != nil {
 			return nil, e
 		}

@@ -35,6 +35,7 @@ func (a *API) registerConsole(m *http.ServeMux) {
 	a.registerAccountManagement(m)
 	a.registerResources(m)
 	a.registerWebDAV(m)
+	a.registerProxy(m)
 	m.HandleFunc("GET /admin/monitor/history", a.admin(a.monitorHistory))
 	m.HandleFunc("GET /admin/accounts", a.admin(a.consoleAccounts))
 	m.HandleFunc("GET /admin/requests", a.admin(a.consoleRequests))
@@ -61,6 +62,12 @@ type consoleSetting struct {
 
 func settingsFor(c Config) []consoleSetting {
 	items := []consoleSetting{
+		{Key: "CORE_TEXT_CONCURRENCY", Label: "聊天与搜索执行并发", Group: "textfiles", Value: c.textLimit(), Default: 100, Description: "聊天、Responses、Messages、网页搜索共用；满时立即429，不占图片任务队列。仍受账号槽位和调用Key并发限制。", Related: []string{"CORE_ACCOUNT_SLOTS", "CORE_VERIFY_CONCURRENCY", "CORE_TEXT_TIMEOUT"}},
+		{Key: "CORE_TEXT_TIMEOUT", Label: "聊天与搜索总超时", Group: "textfiles", Value: int(c.textBudget() / time.Second), Default: 180, Unit: "秒", Description: "从接纳开始，包含校验、流、搜索补查及有限切号。已输出流式文本后不切号重放。", Related: []string{"CORE_TEXT_CONCURRENCY", "CORE_SWITCH_RETRIES"}},
+		{Key: "CORE_FILE_CONCURRENCY", Label: "PPT / PSD 执行并发", Group: "textfiles", Value: c.fileLimit(), Default: 4, Description: "独立长任务执行池，不占图片任务执行槽位；与图片共享账号槽位、下载及图片解码名额。文件生成需要付费账号。", Related: []string{"CORE_FILE_QUEUE_SIZE", "CORE_ACCOUNT_SLOTS", "CORE_DOWNLOAD_CONCURRENCY"}},
+		{Key: "CORE_FILE_QUEUE_SIZE", Label: "PPT / PSD 等待队列", Group: "textfiles", Value: c.FileQueueSize, Default: 16, Unit: "个", Description: "执行与等待均满时返回429；0表示不排队。任务持久化到PostgreSQL，服务重启时中断任务会标记失败。", Related: []string{"CORE_FILE_CONCURRENCY", "CORE_FILE_TIMEOUT"}},
+		{Key: "CORE_FILE_TIMEOUT", Label: "PPT / PSD 总预算", Group: "textfiles", Value: int(c.fileBudget() / time.Second), Default: 600, Unit: "秒", Description: "从接纳开始，包含排队、校验、参考图上传、生成、轮询和文件下载。", Related: []string{"CORE_FILE_QUEUE_SIZE", "CORE_DOWNLOAD_TIMEOUT"}},
+		{Key: "CORE_MAX_FILE_BYTES", Label: "导出单文件大小上限", Group: "textfiles", Value: c.fileMax(), Default: 268435456, Unit: "字节", Description: "PPTX、PSD、素材ZIP逐个限流落盘，不把整份文件读入内存。默认256MiB；内容头和文件结构会校验。", Related: []string{"CORE_DOWNLOAD_TIMEOUT", "CORE_FILE_TIMEOUT", "CORE_DOWNLOAD_CONCURRENCY"}},
 		{Key: "CORE_MONITOR_INTERVAL_SECONDS", Label: "监控持久化采样间隔", Group: "output", Value: c.monitorIntervalSeconds(), Default: 10, Unit: "秒", Description: "服务端独立采集并写入 PostgreSQL，关闭页面后仍采样。越小越精细，数据库写入和存储越多；短于采样间隔的尖峰可能未被记录。", Related: []string{"CORE_MONITOR_RETENTION_HOURS"}},
 		{Key: "CORE_MONITOR_RETENTION_HOURS", Label: "监控历史保留时间", Group: "output", Value: c.monitorRetentionHours(), Default: 168, Unit: "小时", Description: "仅清理过期监控采样，不删除调用日志、任务或图片。默认保留 7 天，每小时分批清理。", Related: []string{"CORE_MONITOR_INTERVAL_SECONDS"}},
 		{Key: "CORE_EDIT_MAX_MIB", Label: "图片编辑请求大小", Group: "output", Value: c.editMaxMiB(), Default: 32, Unit: "MiB", Description: "图生图 multipart 请求总大小，含全部输入图片及表单。上传先落私有临时磁盘；过大返回 413。提高后临时磁盘和上传带宽增加。", Related: []string{"CORE_EDIT_MAX_IMAGES", "CORE_METADATA_TIMEOUT"}},
