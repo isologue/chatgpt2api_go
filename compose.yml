@@ -20,15 +20,14 @@ services:
         max-size: "20m"
         max-file: "3"
   core:
-    build: .
-    image: chatgpt2api-go:prototype
+    image: milodk/chatgpt2api-go:latest
     env_file: .env
     environment:
       CORE_DATABASE_URL: postgres://imagecore:${POSTGRES_PASSWORD}@postgres:5432/imagecore?sslmode=disable
       CORE_IMAGE_DIR: /data/images
       CORE_LISTEN: :9080
     ports:
-      - "${CORE_BIND_ADDRESS:-127.0.0.1}:${CORE_PORT:-9080}:9080"
+      - "${CORE_BIND_ADDRESS:-0.0.0.0}:${CORE_PORT:-9080}:9080"
     volumes:
       - images:/data/images
     depends_on:
