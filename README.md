@@ -30,7 +30,9 @@ curl.exe http://127.0.0.1:9080/readyz
 
 已有本地 `.env` 时无需覆盖。该文件已加入 Git 忽略。数据库密码建议使用随机字母数字，避免连接 URL 中的特殊字符需要转义。
 
-默认绑定 `127.0.0.1`。需要外部访问时设置 `CORE_BIND_ADDRESS`，并把 `CORE_PUBLIC_URL` 改为调用方能访问的地址。没有配置代理时走直连；Windows Docker Desktop 访问现有本地 HTTP 代理可设置 `CORE_PROXY_URL=http://host.docker.internal:40080`。Compose 不包含新的 WARP 容器。
+默认绑定 `127.0.0.1`。需要外部访问时设置 `CORE_BIND_ADDRESS=0.0.0.0`，并放行对应端口。`CORE_PUBLIC_URL` 默认留空，图片 URL 使用返回结果的当前请求地址（协议、IP/域名和端口）；本地访问返回本地地址，通过服务器 IP 访问则返回服务器 IP。同步生成、编辑、异步结果查询及幂等重放均适用。
+
+可在「设置 → 结果与存储 → 图片公开访问地址」配置统一的公开地址，保存后立即生效并持久化；清空恢复自动识别。支持 `https://img.example.com` 或仅填域名（默认 HTTPS），也支持带端口及反代路径前缀的完整地址。设置中保存的值优先于环境变量；已有非空 `CORE_PUBLIC_URL` 会继续生效，不会自动清除。自动模式使用请求的 Host 和实际 TLS，不使用客户端提供的转发头；反向代理应保留 Host，若 HTTPS 在反代终止，请在设置中填写完整的 `https://域名`。没有配置代理时走直连；Windows Docker Desktop 访问现有本地 HTTP 代理可设置 `CORE_PROXY_URL=http://host.docker.internal:40080`。Compose 不包含新的 WARP 容器。
 
 ## 导入账号
 

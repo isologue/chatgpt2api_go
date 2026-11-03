@@ -50,6 +50,17 @@ func applySettingValues(base Config, values map[string]json.RawMessage) (Config,
 				return c, fmt.Errorf("%s 必须为布尔值", key)
 			}
 			continue
+		case "CORE_PUBLIC_URL":
+			var value *string
+			if err := json.Unmarshal(raw, &value); err != nil || value == nil {
+				return c, fmt.Errorf("%s 必须为字符串，留空表示自动识别访问地址", key)
+			}
+			publicURL, err := normalizePublicURL(*value)
+			if err != nil {
+				return c, err
+			}
+			c.PublicURL = publicURL
+			continue
 		case "CORE_RESPONSE_FORMAT":
 			var value string
 			if err := json.Unmarshal(raw, &value); err != nil {

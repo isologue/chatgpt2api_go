@@ -49,15 +49,15 @@ func TestPostgresManagementSettingsAndJobs(t *testing.T) {
 			t.Fatal("caller gained admin access", route.path, w.Code)
 		}
 	}
-	w := requestJSON(t, h, "PUT", "/admin/config", `{"revision":0,"values":{"CORE_DOWNLOAD_CONCURRENCY":7,"CORE_VALIDATION_CONCURRENCY":3,"CORE_IMAGE_WORKERS":12,"CORE_DB_CONNECTIONS":9,"CORE_RESPONSE_FORMAT":"base64","CORE_POW_CONCURRENCY":3,"CORE_THUMBNAIL_CONCURRENCY":4}}`, c.AdminKey)
+	w := requestJSON(t, h, "PUT", "/admin/config", `{"revision":0,"values":{"CORE_DOWNLOAD_CONCURRENCY":7,"CORE_VALIDATION_CONCURRENCY":3,"CORE_IMAGE_WORKERS":12,"CORE_DB_CONNECTIONS":9,"CORE_RESPONSE_FORMAT":"base64","CORE_POW_CONCURRENCY":3,"CORE_THUMBNAIL_CONCURRENCY":4,"CORE_PUBLIC_URL":"images.example.com/"}}`, c.AdminKey)
 	if w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())
 	}
-	if n.pow.Limit() != 3 || e.resources.thumbnails.Limit() != 4 || e.CurrentConfig().DownloadConcurrency != 7 || n.downloads.Limit() != 7 || e.execution.Limit() != 12 || e.CurrentConfig().DBConnections != c.DBConnections {
+	if n.pow.Limit() != 3 || e.resources.thumbnails.Limit() != 4 || e.CurrentConfig().PublicURL != "https://images.example.com" || e.CurrentConfig().DownloadConcurrency != 7 || n.downloads.Limit() != 7 || e.execution.Limit() != 12 || e.CurrentConfig().DBConnections != c.DBConnections {
 		t.Fatal("live settings not applied")
 	}
 	restored, err := s.ConfigFromSettings(ctx, c)
-	if err != nil || restored.PowConcurrency != 3 || restored.ThumbnailConcurrency != 4 || restored.DBConnections != 9 || restored.DefaultFormat != "b64_json" {
+	if err != nil || restored.PowConcurrency != 3 || restored.ThumbnailConcurrency != 4 || restored.DBConnections != 9 || restored.DefaultFormat != "b64_json" || restored.PublicURL != "https://images.example.com" {
 		t.Fatal("restart settings missing", restored, err)
 	}
 	w = requestJSON(t, h, "PUT", "/admin/config", `{"revision":0,"values":{"CORE_DOWNLOAD_CONCURRENCY":8}}`, c.AdminKey)
@@ -67,6 +67,14 @@ func TestPostgresManagementSettingsAndJobs(t *testing.T) {
 	w = requestJSON(t, h, "PUT", "/admin/config", `{"revision":1,"values":{"CORE_PROXY_URL":"oops"}}`, c.AdminKey)
 	if w.Code != 400 {
 		t.Fatal("secret setting accepted", w.Code)
+	}
+	w = requestJSON(t, h, "PUT", "/admin/config", `{"revision":1,"values":{"CORE_PUBLIC_URL":""}}`, c.AdminKey)
+	if w.Code != 200 || e.CurrentConfig().PublicURL != "" {
+		t.Fatal("clearing public URL failed", w.Code, w.Body.String())
+	}
+	restored, err = s.ConfigFromSettings(ctx, c)
+	if err != nil || restored.PublicURL != "" {
+		t.Fatal("automatic URL setting was not persisted", err)
 	}
 	rows := []string{}
 	for i := range 205 {

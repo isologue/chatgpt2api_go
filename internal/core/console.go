@@ -87,6 +87,7 @@ func settingsFor(c Config) []consoleSetting {
 		{Key: "CORE_DOWNLOAD_RETRIES", Label: "图片下载重试次数", Group: "timeouts", Value: c.DownloadRetries, Default: 1, Unit: "次", Description: "同一张图片首次下载失败后的追加尝试次数。下载仍失败时，再按切号逻辑处理。", Related: []string{"CORE_DOWNLOAD_TIMEOUT", "CORE_SWITCH_RETRIES"}},
 		{Key: "CORE_DB_CONNECTIONS", Label: "PostgreSQL 业务连接池", Group: "output", Value: c.DBConnections, Default: 32, Description: "业务数据库连接数，影响任务和日志读写；另有 1 个实例租约连接，实际总数为该值加 1。", Related: []string{"CORE_IMAGE_WORKERS"}},
 		{Key: "CORE_MAX_IMAGE_BYTES", Label: "单张图片大小上限", Group: "output", Value: c.MaxImageBytes, Default: 67108864, Unit: "字节", Description: "拒绝超过上限的图片下载。默认 64 MiB，需结合解码并发评估内存。", Related: []string{"CORE_VALIDATION_CONCURRENCY"}},
+		{Key: "CORE_PUBLIC_URL", Label: "图片公开访问地址", Group: "output", Value: c.PublicURL, Default: "", Kind: "text", Description: "留空时按返回结果的当前请求地址生成图片 URL，保留 IP、域名和端口。可填写 https://img.example.com；仅填写域名默认 HTTPS。反代请保留 Host，HTTPS 在反代终止时请填写完整公开地址。保存后立即生效。", Related: []string{"CORE_RESPONSE_FORMAT"}},
 		{Key: "CORE_RESPONSE_FORMAT", Label: "默认结果格式", Group: "output", Value: c.DefaultFormat, Default: "url", Kind: "select", Description: "URL 直接返回图片地址；Base64 将图片嵌入响应，会增加响应大小和内存占用。", Related: []string{"CORE_ALLOW_USER_RESPONSE_FORMAT", "CORE_RESPONSE_CONCURRENCY"}},
 		{Key: "CORE_ALLOW_USER_RESPONSE_FORMAT", Label: "允许调用方指定返回格式", Group: "output", Value: c.AllowUserFormat, Default: true, Kind: "boolean", Description: "开启时接受 response_format，并兼容 base64、b64_json 等别名；关闭时统一使用默认格式。", Related: []string{"CORE_RESPONSE_FORMAT"}},
 	}

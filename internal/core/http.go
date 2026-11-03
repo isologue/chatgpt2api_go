@@ -237,7 +237,7 @@ func (a *API) writeTaskSuccess(w http.ResponseWriter, r *http.Request, t Task) {
 	defer closeFiles(files)
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, "{\"created_at\":%d,\"model\":%q,\"progress\":\"100%%\",\"status\":\"succeeded\",\"task_id\":%q,\"data\":", t.Created.Unix(), t.Request.Model, t.ID)
-	a.streamGeneration(w, t.Result, t.Request.Format, files)
+	a.streamGeneration(w, t.Result, t.Request.Format, files, a.imageBaseURL(r))
 	io.WriteString(w, "}")
 }
 func (a *API) reserveResponse(w http.ResponseWriter, r *http.Request) bool {
@@ -268,7 +268,7 @@ func (a *API) writeGeneration(w http.ResponseWriter, r *http.Request, g *Generat
 	}
 	defer closeFiles(files)
 	w.Header().Set("Content-Type", "application/json")
-	a.streamGeneration(w, g, format, files)
+	a.streamGeneration(w, g, format, files, a.imageBaseURL(r))
 }
 func (a *API) openArtifacts(g *Generation) ([]*os.File, error) {
 	if g == nil {
@@ -296,7 +296,7 @@ func closeFiles(files []*os.File) {
 }
 
 // Base64 边读文件边编码，不构造整张图的 base64 字符串，避免并发响应放大堆内存。
-func (a *API) streamGeneration(w io.Writer, g *Generation, format string, files []*os.File) {
+func (a *API) streamGeneration(w io.Writer, g *Generation, format string, files []*os.File, baseURL string) {
 	if _, err := fmt.Fprintf(w, "{\"created\":%d,\"data\":[", g.Created); err != nil {
 		return
 	}
@@ -322,7 +322,7 @@ func (a *API) streamGeneration(w io.Writer, g *Generation, format string, files 
 				return
 			}
 		} else {
-			data, _ := json.Marshal(map[string]string{"url": a.Engine.Config.PublicURL + "/images/" + image.Name})
+			data, _ := json.Marshal(map[string]string{"url": baseURL + "/images/" + image.Name})
 			if _, err := w.Write(data); err != nil {
 				return
 			}
