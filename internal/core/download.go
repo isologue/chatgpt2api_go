@@ -19,7 +19,7 @@ import (
 )
 
 func (n *Native) download(ctx context.Context, link string, stages map[string]float64, session *session) (Artifact, error) {
-	for retry := 0; retry <= n.c.DownloadRetries; retry++ {
+	for retry := 0; retry <= n.config(ctx).DownloadRetries; retry++ {
 		if ctx.Err() != nil {
 			return Artifact{}, ctx.Err()
 		}
@@ -27,7 +27,7 @@ func (n *Native) download(ctx context.Context, link string, stages map[string]fl
 		if err == nil {
 			return artifact, nil
 		}
-		if retry == n.c.DownloadRetries {
+		if retry == n.config(ctx).DownloadRetries {
 			return Artifact{}, err
 		}
 	}
@@ -40,28 +40,32 @@ func (n *Native) transfer(ctx context.Context, link string, stages map[string]fl
 	}
 	start := time.Now()
 	n.downloadWaiting.Add(1)
-	select {
-	case n.downloads <- struct{}{}:
+	if err := n.downloads.Acquire(ctx); err != nil {
 		n.downloadWaiting.Add(-1)
-	case <-ctx.Done():
-		n.downloadWaiting.Add(-1)
-		return artifact, ctx.Err()
+		return artifact, err
 	}
+	n.downloadWaiting.Add(-1)
 	n.measure(stages, "下载槽位等待", start)
 	n.downloadActive.Add(1)
 	released := false
 	release := func() {
 		if !released {
 			released = true
-			<-n.downloads
+			n.downloads.Release()
 			n.downloadActive.Add(-1)
 		}
 	}
 	defer release()
-	ctx, cancel := context.WithTimeout(ctx, n.c.DownloadTimeout)
+	ctx, cancel := context.WithTimeout(ctx, n.config(ctx).DownloadTimeout)
 	defer cancel()
 	// 仅同源 estuary 内容接口复用账号会话；CDN 及跨源重定向均不发送凭据。
-	start = time.Now()
+	connectionStart := time.Now()
+	connectionMeasured := false
+	defer func() {
+		if !connectionMeasured {
+			n.measure(stages, "图片连接响应", connectionStart)
+		}
+	}()
 	var resp *http.Response
 	for redirects := 0; redirects <= 5; redirects++ {
 		req, e := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
@@ -92,11 +96,13 @@ func (n *Native) transfer(ctx context.Context, link string, stages map[string]fl
 	if resp == nil {
 		return artifact, RetryError("image_download_failed", "下载响应为空")
 	}
+	n.measure(stages, "图片连接响应", connectionStart)
+	connectionMeasured = true
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		return artifact, RetryError("image_download_failed", fmt.Sprintf("图片下载 HTTP %d", resp.StatusCode))
 	}
-	if resp.ContentLength > n.c.MaxImageBytes {
+	if resp.ContentLength > n.config(ctx).MaxImageBytes {
 		return artifact, RetryError("image_download_failed", "图片超出大小限制")
 	}
 	file, e := os.CreateTemp(n.c.ImageDir, ".partial-")
@@ -105,12 +111,13 @@ func (n *Native) transfer(ctx context.Context, link string, stages map[string]fl
 	}
 	temp := file.Name()
 	defer func() { file.Close(); os.Remove(temp) }()
-	count, e := io.Copy(file, io.LimitReader(resp.Body, n.c.MaxImageBytes+1))
+	start = time.Now()
+	count, e := io.Copy(file, io.LimitReader(resp.Body, n.config(ctx).MaxImageBytes+1))
 	resp.Body.Close()
 	release()
 	n.measure(stages, "图片传输", start)
 	n.downloadBytes.Add(count)
-	if e != nil || count == 0 || count > n.c.MaxImageBytes || (resp.ContentLength >= 0 && resp.ContentLength != count) {
+	if e != nil || count == 0 || count > n.config(ctx).MaxImageBytes || (resp.ContentLength >= 0 && resp.ContentLength != count) {
 		return artifact, RetryError("image_download_failed", "图片下载中断或内容不完整")
 	}
 	if _, e = file.Seek(0, 0); e != nil {
@@ -118,18 +125,27 @@ func (n *Native) transfer(ctx context.Context, link string, stages map[string]fl
 	}
 	start = time.Now()
 	config, format, e := image.DecodeConfig(file)
+	n.measure(stages, "图片校验预检", start)
 	if e != nil || config.Width < 1 || config.Height < 1 || int64(config.Width)*int64(config.Height) > 64*1024*1024 {
 		return artifact, RetryError("image_download_failed", "下载内容不是有效图片或尺寸超限")
 	}
-	// 检查完整解码，单独限制解码并发，避免下载结束后的图片解码放大内存。
-	select {
-	case n.validation <- struct{}{}:
-	case <-ctx.Done():
-		return artifact, ctx.Err()
+	// 解码等待和执行分开记录；等待解码时已释放下载名额。
+	start = time.Now()
+	n.validationWaiting.Add(1)
+	if err := n.validation.Acquire(ctx); err != nil {
+		n.validationWaiting.Add(-1)
+		n.measure(stages, "图片校验排队", start)
+		return artifact, err
 	}
-	_, _ = file.Seek(0, 0)
-	_, _, e = image.Decode(file)
-	<-n.validation
+	n.validationWaiting.Add(-1)
+	n.measure(stages, "图片校验排队", start)
+	start = time.Now()
+	func() {
+		n.validationActive.Add(1)
+		defer func() { n.validation.Release(); n.validationActive.Add(-1) }()
+		_, _ = file.Seek(0, 0)
+		_, _, e = image.Decode(file)
+	}()
 	n.measure(stages, "图片校验", start)
 	if e != nil {
 		return artifact, RetryError("image_download_failed", "图片内容损坏，完整解码失败")

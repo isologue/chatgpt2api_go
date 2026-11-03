@@ -2,11 +2,15 @@ package core
 
 import (
 	"context"
+	"errors"
 	httpx "github.com/bogdanfinn/fhttp"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"strconv"
 	"testing"
+	"time"
 )
 
 // 同源内容接口需要会话，重定向后的 CDN 请求不得携带账号令牌或 Cookie。
@@ -46,5 +50,90 @@ func TestEstuaryDownloadSessionIsolation(t *testing.T) {
 	image, err := n.download(context.Background(), origin.URL+"/backend-api/estuary/content?id=file&sig=test", map[string]float64{}, session)
 	if err != nil || image.Bytes != int64(len(png)) {
 		t.Fatalf("artifact=%v error=%v", image, err)
+	}
+}
+
+// 下载已结束但解码队列占满时，不能继续占用下载名额；取消要清理临时文件与等待计数。
+func TestDecodeWaitReleasesDownloadAndCancellation(t *testing.T) {
+	png := tinyPNG()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write(png) }))
+	defer server.Close()
+	c := testConfig(t)
+	c.ValidationConcurrency = 1
+	c.DownloadRetries = 0
+	n, err := NewNative(c, NewPool(nil, 1), newMemoryStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+	n.validation.TryAcquire()
+	defer func() { n.validation.Release() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	stages := map[string]float64{}
+	go func() { _, err := n.download(ctx, server.URL+"/image", stages, nil); done <- err }()
+	deadline := time.Now().Add(3 * time.Second)
+	for n.validationWaiting.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if n.validationWaiting.Load() != 1 {
+		t.Fatal("image did not wait for decoding")
+	}
+	if n.downloadActive.Load() != 0 || n.downloadWaiting.Load() != 0 || n.validationActive.Load() != 0 {
+		t.Fatal("decoding wait retained download slot or active decoder")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error=%v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancelled decoding wait did not finish")
+	}
+	if n.validationWaiting.Load() != 0 {
+		t.Fatal("decoding waiter leaked")
+	}
+	files, err := os.ReadDir(c.ImageDir)
+	if err != nil || len(files) != 0 {
+		t.Fatalf("temporary file leaked: %v %v", files, err)
+	}
+	if _, ok := stages["图片校验排队"]; !ok {
+		t.Fatal("missing decoding wait timing")
+	}
+}
+
+func TestDownloadSeparatesHeadersBodyAndDecodeWait(t *testing.T) {
+	png := tinyPNG()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(30 * time.Millisecond)
+		w.Header().Set("Content-Length", strconv.Itoa(len(png)))
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		time.Sleep(30 * time.Millisecond)
+		w.Write(png)
+	}))
+	defer server.Close()
+	c := testConfig(t)
+	n, err := NewNative(c, NewPool(nil, 1), newMemoryStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+	stages := map[string]float64{}
+	if _, err := n.download(context.Background(), server.URL+"/image", stages, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"图片连接响应", "图片传输", "图片校验预检", "图片校验排队", "图片校验"} {
+		if _, ok := stages[k]; !ok {
+			t.Errorf("missing stage %s", k)
+		}
+	}
+	if stages["图片连接响应"] < 20 || stages["图片传输"] < 20 {
+		t.Fatalf("headers/body were not measured separately: %v", stages)
+	}
+	if n.validationWaiting.Load() != 0 || n.validationActive.Load() != 0 || n.downloadActive.Load() != 0 {
+		t.Fatal("download/decoding counter leaked")
 	}
 }

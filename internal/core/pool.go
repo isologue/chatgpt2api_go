@@ -12,6 +12,7 @@ type entry struct {
 	used, index int
 	seq         uint64
 	cooling     bool
+	deleted     bool
 }
 type accountHeap struct {
 	items   []*entry
@@ -59,6 +60,7 @@ type Pool struct {
 	slots                     int
 	seq                       uint64
 	enabled, used, readySlots int
+	deletedCount              int
 }
 
 func NewPool(accounts []Account, slots int) *Pool {
@@ -75,7 +77,7 @@ func NewPool(accounts []Account, slots int) *Pool {
 	return p
 }
 func (p *Pool) enqueue(e *entry) {
-	if !e.a.Enabled || e.used >= p.slots || e.index >= 0 {
+	if e.deleted || !e.a.Enabled || e.used >= p.slots || e.index >= 0 {
 		return
 	}
 	p.seq++
@@ -154,34 +156,121 @@ func (p *Pool) Release(id string, err *APIError) Account {
 		}
 	}
 	e.a.Revision = max(e.a.Revision+1, time.Now().UnixNano())
+	if e.deleted && e.used == 0 {
+		delete(p.all, id)
+		p.deletedCount--
+	}
 	p.enqueue(e)
 	return e.a
 }
 func (p *Pool) UpdateCredentials(a Account) Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e := p.all[a.ID]; e != nil {
+	if e := p.all[a.ID]; e != nil && !e.deleted {
 		e.a.AccessToken = a.AccessToken
 		e.a.RefreshToken = a.RefreshToken
 		e.a.VerifiedAt = a.VerifiedAt
 		e.a.Revision = max(e.a.Revision+1, time.Now().UnixNano())
 		return e.a
 	}
-	return a
+	return Account{}
 }
 func (p *Pool) Snapshot() map[string]int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.promote()
-	return map[string]int{"total_accounts": len(p.all), "enabled_accounts": p.enabled, "disabled_accounts": len(p.all) - p.enabled, "used_slots": p.used, "available_slots": p.readySlots, "total_slots": p.enabled * p.slots}
+	total := len(p.all) - p.deletedCount
+	return map[string]int{"total_accounts": total, "enabled_accounts": p.enabled, "disabled_accounts": total - p.enabled, "used_slots": p.used, "available_slots": p.readySlots, "total_slots": p.enabled * p.slots}
 }
 
 func (p *Pool) Get(id string) (Account, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.all[id]
-	if !ok {
+	if !ok || e.deleted {
 		return Account{}, false
 	}
 	return e.a, true
+}
+
+// 管理操作只在短临界区中调整索引；数据库 I/O 由调用方在锁外完成。
+func (p *Pool) detach(e *entry) {
+	if e.index < 0 {
+		return
+	}
+	if e.cooling {
+		heap.Remove(&p.delayed, e.index)
+	} else {
+		heap.Remove(&p.ready, e.index)
+		p.readySlots -= p.slots - e.used
+	}
+}
+func (p *Pool) SetSlots(slots int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.slots == slots {
+		return
+	}
+	p.slots = slots
+	p.ready.items = nil
+	p.delayed.items = nil
+	p.readySlots = 0
+	for _, e := range p.all {
+		e.index = -1
+		p.enqueue(e)
+	}
+}
+func (p *Pool) Add(accounts []Account) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range accounts {
+		if _, exists := p.all[a.ID]; exists {
+			continue
+		}
+		e := &entry{a: a, index: -1}
+		p.all[a.ID] = e
+		if a.Enabled {
+			p.enabled++
+		}
+		p.enqueue(e)
+	}
+}
+func (p *Pool) SetEnabled(id string, enabled bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.all[id]
+	if e == nil || e.deleted {
+		return false
+	}
+	p.detach(e)
+	if e.a.Enabled != enabled {
+		if enabled {
+			p.enabled++
+		} else {
+			p.enabled--
+		}
+	}
+	e.a.Enabled = enabled
+	e.a.Revision = max(e.a.Revision+1, time.Now().UnixNano())
+	p.enqueue(e)
+	return true
+}
+func (p *Pool) Remove(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.all[id]
+	if e == nil || e.deleted {
+		return
+	}
+	p.detach(e)
+	if e.a.Enabled {
+		p.enabled--
+	}
+	e.a.Enabled = false
+	e.deleted = true
+	if e.used == 0 {
+		delete(p.all, id)
+	} else {
+		p.deletedCount++
+	}
 }

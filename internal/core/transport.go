@@ -83,7 +83,7 @@ func (s *session) request(ctx context.Context, method, path string, payload any,
 	return resp, nil
 }
 func (s *session) json(ctx context.Context, method, path string, payload any, extra map[string]string) (map[string]any, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.n.c.MetadataTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.n.config(ctx).MetadataTimeout)
 	defer cancel()
 	resp, err := s.request(ctx, method, path, payload, extra)
 	if err != nil {

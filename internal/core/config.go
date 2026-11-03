@@ -3,20 +3,22 @@ package core
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 )
 
 type Config struct {
-	ValidationConcurrency                                                                                                                        int
-	OAuthURL                                                                                                                                     string
-	Listen, DatabaseURL, APIKey, AdminKey, PublicURL, ImageDir, ProxyURL, UpstreamURL, UpstreamModel, TLSProfile                                 string
-	Workers, QueueSize, DownloadConcurrency, AccountSlots, SwitchRetries, DownloadRetries, DBConnections, VerifyConcurrency, ResponseConcurrency int
-	TotalTimeout, SSETimeout, PollTimeout, DownloadTimeout, MetadataTimeout, Freshness                                                           time.Duration
-	MaxImageBytes                                                                                                                                int64
-	DefaultFormat                                                                                                                                string
-	AllowUserFormat                                                                                                                              bool
+	PowConcurrency, ThumbnailConcurrency                                                                                                                                   int
+	ValidationConcurrency                                                                                                                                                  int
+	OAuthURL                                                                                                                                                               string
+	Listen, DatabaseURL, APIKey, AdminKey, PublicURL, ImageDir, ProxyURL, UpstreamURL, UpstreamModel, TLSProfile                                                           string
+	Workers, QueueSize, DownloadConcurrency, AccountSlots, SwitchRetries, DownloadRetries, DBConnections, VerifyConcurrency, ResponseConcurrency, LogWriters, LogQueueSize int
+	TotalTimeout, SSETimeout, PollTimeout, DownloadTimeout, MetadataTimeout, Freshness                                                                                     time.Duration
+	MaxImageBytes                                                                                                                                                          int64
+	DefaultFormat                                                                                                                                                          string
+	AllowUserFormat                                                                                                                                                        bool
 }
 
 func LoadConfig() (Config, error) {
@@ -28,7 +30,8 @@ func LoadConfig() (Config, error) {
 		d    int
 		zero bool
 	}{
-		{"CORE_VALIDATION_CONCURRENCY", &c.ValidationConcurrency, 4, false}, {"CORE_IMAGE_WORKERS", &c.Workers, 1000, false}, {"CORE_IMAGE_QUEUE_SIZE", &c.QueueSize, 1000, true}, {"CORE_DOWNLOAD_CONCURRENCY", &c.DownloadConcurrency, 64, false}, {"CORE_ACCOUNT_SLOTS", &c.AccountSlots, 1, false}, {"CORE_SWITCH_RETRIES", &c.SwitchRetries, 2, true}, {"CORE_DOWNLOAD_RETRIES", &c.DownloadRetries, 1, true}, {"CORE_DB_CONNECTIONS", &c.DBConnections, 32, false}, {"CORE_VERIFY_CONCURRENCY", &c.VerifyConcurrency, 50, false}, {"CORE_RESPONSE_CONCURRENCY", &c.ResponseConcurrency, 32, false},
+		{"CORE_POW_CONCURRENCY", &c.PowConcurrency, 0, true}, {"CORE_THUMBNAIL_CONCURRENCY", &c.ThumbnailConcurrency, 1, false},
+		{"CORE_LOG_WRITERS", &c.LogWriters, 2, false}, {"CORE_LOG_QUEUE_SIZE", &c.LogQueueSize, 2048, false}, {"CORE_VALIDATION_CONCURRENCY", &c.ValidationConcurrency, 10, false}, {"CORE_IMAGE_WORKERS", &c.Workers, 1000, false}, {"CORE_IMAGE_QUEUE_SIZE", &c.QueueSize, 1000, true}, {"CORE_DOWNLOAD_CONCURRENCY", &c.DownloadConcurrency, 100, false}, {"CORE_ACCOUNT_SLOTS", &c.AccountSlots, 1, false}, {"CORE_SWITCH_RETRIES", &c.SwitchRetries, 2, true}, {"CORE_DOWNLOAD_RETRIES", &c.DownloadRetries, 1, true}, {"CORE_DB_CONNECTIONS", &c.DBConnections, 32, false}, {"CORE_VERIFY_CONCURRENCY", &c.VerifyConcurrency, 50, false}, {"CORE_RESPONSE_CONCURRENCY", &c.ResponseConcurrency, 32, false},
 	}
 	for _, v := range ints {
 		*v.p, err = strconv.Atoi(env(v.k, strconv.Itoa(v.d)))
@@ -70,3 +73,12 @@ func env(k, d string) string {
 	}
 	return d
 }
+
+// 0 保留按可用 CPU 数自动计算的默认行为；正数为显式上限。
+func (c Config) powLimit() int {
+	if c.PowConcurrency > 0 {
+		return c.PowConcurrency
+	}
+	return max(1, runtime.GOMAXPROCS(0)/2)
+}
+func (c Config) thumbnailLimit() int { return max(1, c.ThumbnailConcurrency) }

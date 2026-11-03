@@ -116,12 +116,13 @@ type Generation struct {
 	Images  []Artifact `json:"images"`
 }
 type Attempt struct {
-	AccountID  string             `json:"account_id"`
-	Email      string             `json:"email"`
-	Started    time.Time          `json:"started_at"`
-	DurationMS int64              `json:"duration_ms"`
-	Code       string             `json:"code,omitempty"`
-	Stages     map[string]float64 `json:"stages_ms,omitempty"`
+	TotalBudgetExemptReason string             `json:"total_budget_exempt_reason,omitempty"`
+	AccountID               string             `json:"account_id"`
+	Email                   string             `json:"email"`
+	Started                 time.Time          `json:"started_at"`
+	DurationMS              int64              `json:"duration_ms"`
+	Code                    string             `json:"code,omitempty"`
+	Stages                  map[string]float64 `json:"stages_ms,omitempty"`
 }
 type Task struct {
 	ID      string      `json:"task_id"`

@@ -16,6 +16,7 @@ type imageRef struct {
 	Sediment bool
 }
 type streamState struct {
+	Text                 string
 	ConversationID       string
 	Refs                 []imageRef
 	Blocked, ToolInvoked bool
@@ -65,6 +66,18 @@ func (s *streamState) consume(e map[string]any) {
 		s.ConversationID = id
 	}
 	role := str(obj(message["author"])["role"])
+	if role == "assistant" && str(obj(message["content"])["content_type"]) == "text" {
+		var text strings.Builder
+		for _, part := range array(obj(message["content"])["parts"]) {
+			text.WriteString(str(part))
+			if text.Len() >= 1000 {
+				break
+			}
+		}
+		if text.Len() > 0 {
+			s.Text = truncateText(text.String())
+		}
+	}
 	if role == "user" {
 		return
 	}
@@ -102,10 +115,17 @@ func (s *streamState) conversation(v any) {
 }
 func (s *session) stream(ctx context.Context, payload any, headers map[string]string) (streamState, error) {
 	state := streamState{}
-	ctx, cancel := context.WithTimeout(ctx, s.n.c.SSETimeout)
+	parent := ctx
+	ctx, cancel := context.WithTimeoutCause(ctx, s.n.config(ctx).SSETimeout, errSSEHardTimeout)
 	defer cancel()
 	resp, err := s.request(ctx, "POST", "/backend-api/f/conversation", payload, headers)
 	if err != nil {
+		if errors.Is(context.Cause(ctx), errSSEHardTimeout) {
+			return state, errSSEHardTimeout
+		}
+		if parent.Err() != nil {
+			return state, parent.Err()
+		}
 		return state, RetryError("sse_transport_failed", "上游生成流连接失败")
 	}
 	defer resp.Body.Close()
@@ -156,16 +176,19 @@ func (s *session) stream(ctx context.Context, payload any, headers map[string]st
 		consume()
 	}
 	if ctx.Err() != nil || scanner.Err() != nil {
-		e := RetryError("sse_stream_timeout", "上游生成流超时或断开")
-		if !errors.Is(ctx.Err(), context.DeadlineExceeded) && ctx.Err() != nil {
-			return state, ctx.Err()
+		if errors.Is(context.Cause(ctx), errSSEHardTimeout) {
+			return state, errSSEHardTimeout
 		}
-		return state, e
+		if parent.Err() != nil {
+			return state, parent.Err()
+		}
+		return state, RetryError("sse_stream_interrupted", "上游生成流读取中断")
 	}
 	return state, nil
 }
 func (s *session) poll(ctx context.Context, state *streamState) error {
-	ctx, cancel := context.WithTimeout(ctx, s.n.c.PollTimeout)
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, s.n.config(ctx).PollTimeout)
 	defer cancel()
 	for {
 		data, err := s.json(ctx, "GET", "/backend-api/conversation/"+state.ConversationID, nil, nil)
@@ -191,7 +214,10 @@ func (s *session) poll(ctx context.Context, state *streamState) error {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return RetryError("image_result_uncertain", "结果补查预算耗尽，未拿到图片标识")
+			if parent.Err() != nil {
+				return parent.Err()
+			}
+			return uncertainImageResult("结果补查预算耗尽，未拿到图片标识")
 		case <-timer.C:
 		}
 	}
@@ -208,9 +234,7 @@ func matchingTaskError(v any, cid string) *APIError {
 					for _, v := range array(content["parts"]) {
 						text += str(v)
 					}
-					if len(text) > 1000 {
-						text = text[:1000]
-					}
+					text = truncateText(text)
 					lower := strings.ToLower(text)
 					if strings.Contains(lower, "content policy") || strings.Contains(lower, "safety") || strings.Contains(lower, "违规") {
 						return Err(400, "content_policy_violation", text)
@@ -234,3 +258,19 @@ func matchingTaskError(v any, cid string) *APIError {
 	return nil
 }
 func array(v any) []any { x, _ := v.([]any); return x }
+
+// 该标记只表示生成流自己的阶段时限先耗尽，不表示请求总预算或调用方时限。
+var errSSEHardTimeout = errors.New("upstream SSE hard timeout")
+
+func uncertainImageResult(message string) *APIError {
+	// 结果未知保持中性结算，避免把生成超时误当成账号不可用。
+	return &APIError{Status: 504, Code: "image_result_uncertain", Message: message, Retry: true}
+}
+
+func truncateText(text string) string {
+	runes := []rune(text)
+	if len(runes) > 1000 {
+		return string(runes[:1000])
+	}
+	return text
+}

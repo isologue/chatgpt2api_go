@@ -20,17 +20,21 @@ import (
 
 type API struct {
 	Engine    *Engine
-	responses chan struct{}
+	responses *limiter
 }
 
 func NewHandler(e *Engine) http.Handler {
-	a := &API{Engine: e, responses: make(chan struct{}, e.Config.ResponseConcurrency)}
+	if e.responses == nil {
+		e.responses = newLimiter(e.Config.ResponseConcurrency)
+	}
+	a := &API{Engine: e, responses: e.responses}
 	m := http.NewServeMux()
 	m.HandleFunc("GET /healthz", a.health)
 	m.HandleFunc("GET /readyz", a.ready)
 	m.HandleFunc("GET /admin/metrics", a.admin(a.metrics))
-	m.HandleFunc("POST /v1/images/generations", a.auth(a.create))
-	m.HandleFunc("GET /v1/images/tasks/{id}", a.auth(a.task))
+	a.registerConsole(m)
+	m.HandleFunc("POST /v1/images/generations", a.auth(a.captureCreate))
+	m.HandleFunc("GET /v1/images/tasks/{id}", a.auth(a.captureTask))
 	m.HandleFunc("GET /images/{name}", a.image)
 	m.HandleFunc("GET /v1/models", a.auth(func(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, 200, map[string]any{"object": "list", "data": []any{map[string]any{"id": "gpt-image-2", "object": "model", "owned_by": "chatgpt2api-go"}}})
@@ -71,6 +75,12 @@ func (a *API) ready(w http.ResponseWriter, r *http.Request) {
 }
 func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
 	snapshot := a.Engine.Snapshot()
+	if a.Engine.resources != nil {
+		l := a.Engine.resources.thumbnails
+		snapshot["thumbnails"] = map[string]any{"active": l.Used(), "waiting": l.Waiting(), "limit": l.Limit()}
+	}
+	snapshot["system"] = systemSnapshot(a.Engine.Config.ImageDir)
+	snapshot["sampled_at"] = time.Now()
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 	snapshot["runtime"] = map[string]any{"goroutines": runtime.NumGoroutine(), "heap_alloc_bytes": mem.HeapAlloc, "heap_inuse_bytes": mem.HeapInuse, "gc_cycles": mem.NumGC}
@@ -92,7 +102,9 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 		sendError(w, Err(400, "invalid_json", "请求只能包含一个 JSON 对象"))
 		return
 	}
-	if err := req.Validate(a.Engine.Config); err != nil {
+	config := a.Engine.CurrentConfig()
+	r = r.WithContext(context.WithValue(r.Context(), configKey{}, config))
+	if err := req.Validate(config); err != nil {
 		sendError(w, AsError(err))
 		return
 	}
@@ -100,6 +112,9 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		sendError(w, AsError(err))
 		return
+	}
+	if capture, ok := r.Context().Value(wireCaptureKey{}).(*wireCapture); ok {
+		capture.id = task.ID
 	}
 	if req.Async {
 		sendJSON(w, 200, map[string]any{"created_at": task.Created.Unix(), "model": req.Model, "status": "queued", "task_id": task.ID})
@@ -128,6 +143,11 @@ func (a *API) task(w http.ResponseWriter, r *http.Request) {
 		sendError(w, Err(503, "database_unavailable", "任务查询失败"))
 		return
 	}
+	if t.Status == "succeeded" || t.Status == "failed" {
+		if capture, ok := r.Context().Value(wireCaptureKey{}).(*wireCapture); ok {
+			capture.id = t.ID
+		}
+	}
 	switch t.Status {
 	case "queued", "processing":
 		progress := "0%"
@@ -148,10 +168,12 @@ func (a *API) task(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func (a *API) writeTaskSuccess(w http.ResponseWriter, r *http.Request, t Task) {
+	unpin := a.pinGeneration(t.Result)
+	defer unpin()
 	if !a.reserveResponse(w, r) {
 		return
 	}
-	defer func() { <-a.responses }()
+	defer func() { a.responses.Release() }()
 	files, err := a.openArtifacts(t.Result)
 	if err != nil {
 		sendError(w, Err(500, "image_missing", "任务图片文件不存在"))
@@ -164,21 +186,26 @@ func (a *API) writeTaskSuccess(w http.ResponseWriter, r *http.Request, t Task) {
 	io.WriteString(w, "}")
 }
 func (a *API) reserveResponse(w http.ResponseWriter, r *http.Request) bool {
-	select {
-	case a.responses <- struct{}{}:
-		return true
-	case <-r.Context().Done():
-		return false
-	case <-a.Engine.root.Done():
-		sendError(w, Err(503, "shutting_down", "服务正在停止"))
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	stop := context.AfterFunc(a.Engine.root, cancel)
+	defer stop()
+	if err := a.responses.Acquire(ctx); err != nil {
+		if a.Engine.root.Err() != nil {
+			sendError(w, Err(503, "shutting_down", "服务正在停止"))
+		}
 		return false
 	}
+	return true
 }
+
 func (a *API) writeGeneration(w http.ResponseWriter, r *http.Request, g *Generation, format string) {
+	unpin := a.pinGeneration(g)
+	defer unpin()
 	if !a.reserveResponse(w, r) {
 		return
 	}
-	defer func() { <-a.responses }()
+	defer func() { a.responses.Release() }()
 	files, err := a.openArtifacts(g)
 	if err != nil {
 		sendError(w, Err(500, "image_missing", "图片文件不存在"))
@@ -253,6 +280,10 @@ func (a *API) image(w http.ResponseWriter, r *http.Request) {
 	if filepath.Base(name) != name || strings.HasPrefix(name, ".") {
 		http.NotFound(w, r)
 		return
+	}
+	if a.Engine.resources != nil {
+		unpin := a.Engine.resources.pin(name)
+		defer unpin()
 	}
 	w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
 	http.ServeFile(w, r, filepath.Join(a.Engine.Config.ImageDir, name))

@@ -31,11 +31,30 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func() {
+		if store != nil {
+			store.Close()
+		}
+	}()
+	if err = store.Migrate(startup); err != nil {
+		return err
+	}
+	initialConnections := c.DBConnections
+	c, err = store.ConfigFromSettings(startup, c)
+	if err != nil {
+		return err
+	}
+	if c.DBConnections != initialConnections {
+		store.Close()
+		store, err = core.OpenPostgres(startup, c.DatabaseURL, c.DBConnections)
+		if err != nil {
+			return err
+		}
+	}
 	if err = store.AcquireInstance(startup); err != nil {
 		return err
 	}
-	if err = store.Migrate(startup); err != nil {
+	if err = store.RecoverAdminJobs(startup); err != nil {
 		return err
 	}
 	if err = store.RecoverTasks(startup); err != nil {
@@ -53,10 +72,11 @@ func run() error {
 	defer native.Close()
 	engine := core.NewEngine(c, pool, store, native)
 	defer engine.Close()
+	engine.StartResourceMaintenance()
 	server := &http.Server{Addr: c.Listen, Handler: core.NewHandler(engine), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 << 10}
 	done := make(chan error, 1)
 	go func() { done <- server.ListenAndServe() }()
-	slog.Info("image_core_ready", "listen", c.Listen, "accounts", len(accounts), "workers", c.Workers, "queue", c.QueueSize, "download_concurrency", c.DownloadConcurrency)
+	slog.Info("image_core_ready", "listen", c.Listen, "accounts", len(accounts), "workers", c.Workers, "queue", c.QueueSize, "download_concurrency", c.DownloadConcurrency, "validation_concurrency", c.ValidationConcurrency)
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	var serverErr error

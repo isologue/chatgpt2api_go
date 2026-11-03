@@ -190,7 +190,7 @@ func TestBoundedAdmissionAndCancellation(t *testing.T) {
 	cancel()
 	<-done
 	e.Close()
-	if len(e.permits) != 0 || e.Pool.Snapshot()["used_slots"] != 0 {
+	if e.permits.Used() != 0 || e.Pool.Snapshot()["used_slots"] != 0 {
 		t.Fatal("shutdown leaked permits")
 	}
 }
@@ -207,7 +207,7 @@ func TestSubmitCloseRace(t *testing.T) {
 		}
 		e.Close()
 		wg.Wait()
-		if len(e.permits) != 0 {
+		if e.permits.Used() != 0 {
 			t.Fatal("late admission leaked permit")
 		}
 	}
@@ -495,8 +495,8 @@ func TestDownloadQueueWaitDoesNotConsumeTransferTimeout(t *testing.T) {
 	c.DownloadConcurrency = 1
 	c.DownloadTimeout = 50 * time.Millisecond
 	n, _, _ := newNativeTest(t, m, c, testAccounts(1))
-	n.downloads <- struct{}{}
-	go func() { time.Sleep(100 * time.Millisecond); <-n.downloads }()
+	n.downloads.TryAcquire()
+	go func() { time.Sleep(100 * time.Millisecond); n.downloads.Release() }()
 	_, err := n.download(context.Background(), m.server.URL+"/cdn.png", map[string]float64{}, nil)
 	if err != nil {
 		t.Fatal(err)

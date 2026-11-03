@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/google/uuid"
 	"golang.org/x/net/html"
 	"golang.org/x/sync/singleflight"
 	"io"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,7 +22,10 @@ type Native struct {
 	pool                                                                             *Pool
 	store                                                                            Store
 	http                                                                             tlsclient.HttpClient
-	verify, downloads, pow, validation                                               chan struct{}
+	verify, downloads, validation                                                    *limiter
+	manualVerify                                                                     *limiter
+	pow                                                                              *limiter
+	settings                                                                         *runtimeConfig
 	flight                                                                           singleflight.Group
 	lifecycle                                                                        sync.Mutex
 	closed                                                                           bool
@@ -30,7 +33,9 @@ type Native struct {
 	root                                                                             context.Context
 	cancel                                                                           context.CancelFunc
 	activeSSE, started, downloadActive, downloadWaiting, downloadBytes, verifyActive atomic.Int64
+	validationActive, validationWaiting, manualVerifyActive                          atomic.Int64
 	turnstileFailures                                                                atomic.Int64
+	sseHardTimeouts, streamRecoveries                                                atomic.Int64
 	stageMu                                                                          sync.Mutex
 	stages                                                                           map[string]*stageHistogram
 }
@@ -52,7 +57,7 @@ func NewNative(c Config, p *Pool, s Store) (*Native, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Native{c: c, pool: p, store: s, http: client, validation: make(chan struct{}, c.ValidationConcurrency), verify: make(chan struct{}, c.VerifyConcurrency), downloads: make(chan struct{}, c.DownloadConcurrency), pow: make(chan struct{}, max(1, runtime.GOMAXPROCS(0)/2)), root: ctx, cancel: cancel, stages: map[string]*stageHistogram{}}, nil
+	return &Native{c: c, pool: p, store: s, http: client, validation: newLimiter(c.ValidationConcurrency), verify: newLimiter(c.VerifyConcurrency), manualVerify: newLimiter(c.VerifyConcurrency), downloads: newLimiter(c.DownloadConcurrency), pow: newLimiter(c.powLimit()), root: ctx, cancel: cancel, stages: map[string]*stageHistogram{}}, nil
 }
 func (n *Native) Close() {
 	n.lifecycle.Lock()
@@ -94,7 +99,7 @@ func (n *Native) Snapshot() map[string]any {
 		hist[k] = map[string]any{"count": h.Count, "mean_ms": h.Sum / float64(h.Count), "max_ms": h.Max, "histogram": h.Buckets, "bucket_upper_ms": stageBounds}
 	}
 	n.stageMu.Unlock()
-	return map[string]any{"turnstile_solver_failures": n.turnstileFailures.Load(), "generation_started": n.started.Load(), "sse_active": n.activeSSE.Load(), "verification_active": n.verifyActive.Load(), "verification_limit": cap(n.verify), "download_active": n.downloadActive.Load(), "download_waiting": n.downloadWaiting.Load(), "download_limit": cap(n.downloads), "download_bytes": n.downloadBytes.Load(), "stages": hist}
+	return map[string]any{"pow_active": n.pow.Used(), "pow_waiting": n.pow.Waiting(), "pow_limit": n.pow.Limit(), "sse_hard_timeouts": n.sseHardTimeouts.Load(), "stream_timeout_recoveries": n.streamRecoveries.Load(), "turnstile_solver_failures": n.turnstileFailures.Load(), "generation_started": n.started.Load(), "sse_active": n.activeSSE.Load(), "verification_active": n.verifyActive.Load(), "verification_limit": n.verify.Limit(), "verification_waiting": n.verify.Waiting(), "manual_verification_active": n.manualVerifyActive.Load(), "manual_verification_limit": n.manualVerify.Limit(), "manual_verification_waiting": n.manualVerify.Waiting(), "download_active": n.downloadActive.Load(), "download_waiting": n.downloadWaiting.Load(), "download_limit": n.downloads.Limit(), "download_bytes": n.downloadBytes.Load(), "validation_active": n.validationActive.Load(), "validation_waiting": n.validationWaiting.Load(), "validation_limit": n.validation.Limit(), "stages": hist}
 }
 func tokenExpiring(token string) bool {
 	parts := strings.Split(token, ".")
@@ -113,11 +118,14 @@ func tokenExpiring(token string) bool {
 	return !ok || time.Unix(int64(exp), 0).Before(time.Now().Add(5*time.Minute))
 }
 func (n *Native) ensureAccount(ctx context.Context, a Account) (Account, error) {
+	return n.checkAccount(ctx, a, false)
+}
+func (n *Native) checkAccount(ctx context.Context, a Account, force bool) (Account, error) {
 	if current, ok := n.pool.Get(a.ID); ok {
 		a = current
 	}
 	fresh := maxTime(a.VerifiedAt, a.SuccessAt)
-	if !tokenExpiring(a.AccessToken) && time.Since(fresh) < n.c.Freshness {
+	if !force && !tokenExpiring(a.AccessToken) && time.Since(fresh) < n.config(ctx).Freshness {
 		return a, nil
 	}
 	ch := n.flight.DoChan(a.ID, func() (any, error) {
@@ -130,20 +138,26 @@ func (n *Native) ensureAccount(ctx context.Context, a Account) (Account, error) 
 		n.lifecycle.Unlock()
 		defer n.flights.Done()
 		a := a
-		ctx, cancel := context.WithTimeout(n.root, 2*n.c.MetadataTimeout)
+		ctx, cancel := context.WithTimeout(context.WithValue(n.root, configKey{}, n.config(ctx)), 2*n.config(ctx).MetadataTimeout)
 		defer cancel()
-		select {
-		case n.verify <- struct{}{}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		gate := n.verify
+		if force {
+			gate = n.manualVerify
 		}
-		defer func() { <-n.verify }()
-		n.verifyActive.Add(1)
-		defer n.verifyActive.Add(-1)
+		if err := gate.Acquire(ctx); err != nil {
+			return nil, err
+		}
+		defer gate.Release()
+		active := &n.verifyActive
+		if force {
+			active = &n.manualVerifyActive
+		}
+		active.Add(1)
+		defer active.Add(-1)
 		if current, ok := n.pool.Get(a.ID); ok {
 			a = current
 		}
-		if !tokenExpiring(a.AccessToken) && time.Since(maxTime(a.VerifiedAt, a.SuccessAt)) < n.c.Freshness {
+		if !force && !tokenExpiring(a.AccessToken) && time.Since(maxTime(a.VerifiedAt, a.SuccessAt)) < n.config(ctx).Freshness {
 			return a, nil
 		}
 		if tokenExpiring(a.AccessToken) {
@@ -159,6 +173,9 @@ func (n *Native) ensureAccount(ctx context.Context, a Account) (Account, error) 
 			}
 			// RT 可能旋转，必须先保存凭据，失败时禁止继续使用无法恢复的刷新结果。
 			a = n.pool.UpdateCredentials(a)
+			if a.ID == "" {
+				return nil, Err(409, "account_removed", "账号已删除")
+			}
 			if err = n.store.SaveAccount(ctx, a); err != nil {
 				return nil, Err(503, "token_persistence_failed", "更新账号令牌后持久化失败")
 			}
@@ -169,6 +186,9 @@ func (n *Native) ensureAccount(ctx context.Context, a Account) (Account, error) 
 		}
 		a.VerifiedAt = time.Now()
 		a = n.pool.UpdateCredentials(a)
+		if a.ID == "" {
+			return nil, Err(409, "account_removed", "账号已删除")
+		}
 		if err := n.store.SaveAccount(ctx, a); err != nil {
 			return nil, Err(503, "account_persistence_failed", "保存账号校验信息失败")
 		}
@@ -191,6 +211,7 @@ func maxTime(a, b time.Time) time.Time {
 	return b
 }
 func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[string]float64) ([]Artifact, error) {
+	ctx = context.WithValue(ctx, configKey{}, n.config(ctx))
 	start := time.Now()
 	a, err := n.ensureAccount(ctx, a)
 	n.measure(stages, "账号校验", start)
@@ -218,15 +239,13 @@ func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[
 	proof := ""
 	if pow := obj(prepared["proofofwork"]); yes(pow["required"]) {
 		start = time.Now()
-		select {
-		case n.pow <- struct{}{}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		if err := n.pow.Acquire(ctx); err != nil {
+			return nil, err
 		}
 		n.measure(stages, "工作量证明排队", start)
 		start = time.Now()
 		proof, err = solveProof(ctx, str(pow["seed"]), str(pow["difficulty"]), powConfig(s.a.UserAgent, script, build))
-		<-n.pow
+		n.pow.Release()
 		n.measure(stages, "工作量证明计算", start)
 		if err != nil {
 			return nil, RetryError("pow_failed", "工作量证明计算失败")
@@ -290,26 +309,47 @@ func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[
 	start = time.Now()
 	state, streamErr := s.stream(ctx, payload, headers)
 	n.measure(stages, "上游生成流", start)
+	hardTimeout := errors.Is(streamErr, errSSEHardTimeout)
+	if hardTimeout {
+		n.sseHardTimeouts.Add(1)
+		var first bool
+		ctx, first = recoverStreamBudget(ctx)
+		if first {
+			n.streamRecoveries.Add(1)
+		}
+	}
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
 	if state.Blocked {
 		return nil, Err(400, "content_policy_violation", "上游安全审核拒绝")
 	}
-	// 有会话标识即可在流异常后补查；补查有独立预算，且仍受请求总预算约束。
+	// 先补查原会话；只有实际生成流硬超时才豁免总预算，阶段时限与取消继续生效。
 	if len(state.Refs) == 0 && state.ConversationID != "" {
 		start = time.Now()
 		err = s.poll(ctx, &state)
 		n.measure(stages, "结果补查", start)
 		if err != nil {
+			// 生成流完整结束但仅返回文字时，补查无图后保留未出图类型和原文。
+			// 已调用工具或流中断时结果仍可能在生成，不能误判为明确未出图。
+			if streamErr == nil && !state.ToolInvoked && state.Text != "" && ctx.Err() == nil && AsError(err).Code == "image_result_uncertain" {
+				return nil, RetryError("no_image_generated", state.Text)
+			}
 			return nil, err
 		}
 	}
 	if len(state.Refs) == 0 {
+		if hardTimeout {
+			return nil, uncertainImageResult("上游生成流硬超时，未取得可补查的图片结果")
+		}
 		if streamErr != nil {
 			return nil, streamErr
 		}
-		return nil, RetryError("no_image_generated", "上游没有返回可用图片")
+		message := state.Text
+		if message == "" {
+			message = "上游没有返回可用图片"
+		}
+		return nil, RetryError("no_image_generated", message)
 	}
 	for _, ref := range state.Refs {
 		start = time.Now()
@@ -341,7 +381,7 @@ func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[
 	return nil, RetryError("image_url_missing", "上游图片缺少下载地址")
 }
 func (s *session) bootstrap(ctx context.Context) (string, string, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.n.c.MetadataTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.n.config(ctx).MetadataTimeout)
 	defer cancel()
 	resp, err := s.request(ctx, "GET", "/", nil, map[string]string{"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none", "Sec-Fetch-User": "?1", "Upgrade-Insecure-Requests": "1"})
 	if err != nil {

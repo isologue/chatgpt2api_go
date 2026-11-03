@@ -6,12 +6,17 @@ import (
 	"fmt"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/singleflight"
+	"sync"
 	"time"
 )
 
 type Postgres struct {
-	db    *pgxpool.Pool
-	lease *pgxpool.Conn
+	db            *pgxpool.Pool
+	lease         *pgxpool.Conn
+	monitorMu     sync.Mutex
+	monitorCache  map[string]monitorCacheEntry
+	monitorFlight singleflight.Group
 }
 
 func OpenPostgres(ctx context.Context, url string, connections int) (*Postgres, error) {
@@ -37,10 +42,33 @@ func OpenPostgres(ctx context.Context, url string, connections int) (*Postgres, 
 
 const schema = `
 CREATE TABLE IF NOT EXISTS core_accounts(id text PRIMARY KEY, access_fingerprint text NOT NULL UNIQUE, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE core_accounts ADD COLUMN IF NOT EXISTS managed_enabled boolean;
+CREATE TABLE IF NOT EXISTS core_settings(id int PRIMARY KEY CHECK(id=1),revision bigint NOT NULL DEFAULT 0,values jsonb NOT NULL DEFAULT '{}'::jsonb,updated_at timestamptz NOT NULL DEFAULT now());
+INSERT INTO core_settings(id) VALUES(1) ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS core_admin_jobs(id text PRIMARY KEY,kind text NOT NULL,status text NOT NULL,data jsonb NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS core_admin_jobs_created ON core_admin_jobs(created_at DESC);
 CREATE TABLE IF NOT EXISTS core_tasks(id text PRIMARY KEY, created_at timestamptz NOT NULL, status text NOT NULL, request jsonb NOT NULL, result jsonb, error jsonb, updated_at timestamptz NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS core_tasks_status ON core_tasks(status) WHERE status IN ('queued','processing');
 CREATE TABLE IF NOT EXISTS core_requests(id text PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT now(), model text NOT NULL, is_async boolean NOT NULL, response_format text NOT NULL, status text NOT NULL, duration_ms bigint NOT NULL, attempts jsonb NOT NULL, error jsonb);
 CREATE INDEX IF NOT EXISTS core_requests_created_at ON core_requests(created_at DESC);
+ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS started_at timestamptz;
+ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS finished_at timestamptz;
+ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS queue_ms bigint;
+ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS switch_count int;
+ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS image_count int;
+CREATE INDEX IF NOT EXISTS core_requests_page ON core_requests(created_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS core_requests_status_page ON core_requests(status,created_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS core_admin_jobs_kind_page ON core_admin_jobs(kind,created_at DESC,id DESC);
+CREATE TABLE IF NOT EXISTS core_images(name text PRIMARY KEY,request_id text NOT NULL DEFAULT '',created_at timestamptz NOT NULL,bytes bigint NOT NULL CHECK(bytes>=0));
+CREATE INDEX IF NOT EXISTS core_images_page ON core_images(created_at DESC,name DESC);
+CREATE INDEX IF NOT EXISTS core_images_request ON core_images(request_id);
+CREATE INDEX IF NOT EXISTS core_tasks_cleanup ON core_tasks(updated_at,id) WHERE status IN ('succeeded','failed');
+CREATE TABLE IF NOT EXISTS core_retention(resource text PRIMARY KEY CHECK(resource IN ('images','logs')),enabled boolean NOT NULL DEFAULT false,retain_hours int NOT NULL DEFAULT 24 CHECK(retain_hours>0),interval_minutes int NOT NULL DEFAULT 60 CHECK(interval_minutes>0),revision bigint NOT NULL DEFAULT 0,next_run_at timestamptz NOT NULL DEFAULT now()+interval '1 hour');
+INSERT INTO core_retention(resource) VALUES('images'),('logs') ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS core_file_gc(namespace text NOT NULL,name text NOT NULL,bytes bigint NOT NULL DEFAULT 0,attempts int NOT NULL DEFAULT 0,next_at timestamptz NOT NULL DEFAULT now(),error text NOT NULL DEFAULT '',PRIMARY KEY(namespace,name));
+CREATE INDEX IF NOT EXISTS core_file_gc_due ON core_file_gc(next_at);
+CREATE TABLE IF NOT EXISTS core_request_payloads(id text NOT NULL,kind text NOT NULL,request_body bytea,response_file text NOT NULL,response_bytes bigint NOT NULL,http_status int NOT NULL,finished_at timestamptz NOT NULL,PRIMARY KEY(id,kind));
+
 `
 
 func (s *Postgres) Migrate(ctx context.Context) error { _, err := s.db.Exec(ctx, schema); return err }
@@ -73,7 +101,7 @@ func (s *Postgres) Close() {
 	}
 }
 func (s *Postgres) LoadAccounts(ctx context.Context) ([]Account, error) {
-	rows, err := s.db.Query(ctx, "SELECT data FROM core_accounts")
+	rows, err := s.db.Query(ctx, "SELECT data || jsonb_build_object('enabled',COALESCE(managed_enabled,(data->>'enabled')::boolean,false)) FROM core_accounts")
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +151,7 @@ func (s *Postgres) ImportAccounts(ctx context.Context, accounts []Account) (int,
 }
 func (s *Postgres) SaveAccount(ctx context.Context, a Account) error {
 	b, _ := json.Marshal(a)
-	_, err := s.db.Exec(ctx, "UPDATE core_accounts SET access_fingerprint=$2,data=$3,updated_at=now() WHERE id=$1 AND COALESCE((data->>'revision')::bigint,0) <= $4", a.ID, Fingerprint(a.AccessToken), b, a.Revision)
+	_, err := s.db.Exec(ctx, "UPDATE core_accounts SET access_fingerprint=$2,data=jsonb_set($3::jsonb,'{enabled}',to_jsonb(COALESCE(managed_enabled,($3::jsonb->>'enabled')::boolean,false))),updated_at=now() WHERE id=$1 AND COALESCE((data->>'revision')::bigint,0) <= $4", a.ID, Fingerprint(a.AccessToken), b, a.Revision)
 	return err
 }
 func (s *Postgres) CreateTask(ctx context.Context, t Task) error {
@@ -171,19 +199,83 @@ func (s *Postgres) RecoverTasks(ctx context.Context) error {
 	_, err := s.db.Exec(ctx, "UPDATE core_tasks SET status='failed',error=$1,updated_at=now() WHERE status IN ('queued','processing')", e)
 	return err
 }
-func (s *Postgres) Log(ctx context.Context, id string, r Request, attempts []Attempt, e *APIError, d time.Duration) error {
-	a, _ := json.Marshal(attempts)
+
+type batchLogStore interface {
+	LogBatch(context.Context, []requestLog) error
+}
+
+const requestLogInsert = "INSERT INTO core_requests(id,created_at,started_at,finished_at,queue_ms,switch_count,image_count,model,is_async,response_format,status,duration_ms,attempts,error) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"
+
+func requestLogValues(l requestLog) (any, error) {
+	a, err := json.Marshal(l.attempts)
+	if err != nil {
+		return nil, err
+	}
 	var eb []byte
 	status := "succeeded"
-	if e != nil {
-		eb, _ = json.Marshal(e)
+	if l.err != nil {
+		eb, err = json.Marshal(l.err)
+		if err != nil {
+			return nil, err
+		}
 		status = "failed"
-		if e.Code == "content_policy_violation" {
+		if l.err.Code == "content_policy_violation" {
 			status = "safety_rejected"
 		}
 	}
-	_, err := s.db.Exec(ctx, "INSERT INTO core_requests(id,model,is_async,response_format,status,duration_ms,attempts,error) VALUES($1,$2,$3,$4,$5,$6,$7,$8)", id, r.Model, r.Async, r.Format, status, d.Milliseconds(), a, eb)
+	timing := l.timing
+	if timing.Finished.IsZero() {
+		timing.Finished = time.Now()
+	}
+	var started *time.Time
+	if !timing.Started.IsZero() {
+		started = &timing.Started
+	}
+	switches := 0
+	for i, at := range l.attempts {
+		if at.Code != "" && i < len(l.attempts)-1 {
+			switches++
+		}
+	}
+	images := 0
+	if l.err == nil {
+		images = l.req.N
+	}
+	return []any{l.id, timing.Finished, started, timing.Finished, timing.QueueMS, switches, images, l.req.Model, l.req.Async, l.req.Format, status, l.duration.Milliseconds(), a, eb}, nil
+}
+
+func (s *Postgres) Log(ctx context.Context, id string, r Request, attempts []Attempt, e *APIError, d time.Duration) error {
+	l := requestLog{id: id, req: r, attempts: attempts, err: e, duration: d}
+	if timing, ok := ctx.Value(logTimingKey{}).(logTiming); ok {
+		l.timing = timing
+	}
+	values, err := requestLogValues(l)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(ctx, requestLogInsert, values.([]any)...)
 	return err
+}
+
+func (s *Postgres) LogBatch(ctx context.Context, logs []requestLog) error {
+	batch := &pgx.Batch{}
+	for _, l := range logs {
+		values, err := requestLogValues(l)
+		if err != nil {
+			return err
+		}
+		batch.Queue(requestLogInsert, values.([]any)...)
+	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	results := tx.SendBatch(ctx, batch)
+	if err := results.Close(); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Postgres) LeaseAlive(ctx context.Context) error {
