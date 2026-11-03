@@ -9,3 +9,5 @@
 /backups/
 
 /.playwright-cli/
+
+__pycache__/

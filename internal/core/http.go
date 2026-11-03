@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -97,19 +96,7 @@ func (a *API) ready(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, 200, map[string]bool{"ready": true})
 }
 func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
-	snapshot := a.Engine.Snapshot()
-	if a.Engine.resources != nil {
-		l := a.Engine.resources.thumbnails
-		snapshot["thumbnails"] = map[string]any{"active": l.Used(), "waiting": l.Waiting(), "limit": l.Limit()}
-	}
-	snapshot["system"] = systemSnapshot(a.Engine.Config.ImageDir)
-	snapshot["sampled_at"] = time.Now()
-	var mem runtime.MemStats
-	runtime.ReadMemStats(&mem)
-	snapshot["runtime"] = map[string]any{"goroutines": runtime.NumGoroutine(), "heap_alloc_bytes": mem.HeapAlloc, "heap_inuse_bytes": mem.HeapInuse, "gc_cycles": mem.NumGC}
-	if n, ok := a.Engine.Generator.(interface{ Snapshot() map[string]any }); ok {
-		snapshot["upstream"] = n.Snapshot()
-	}
+	snapshot := a.Engine.monitorSnapshot()
 	sendJSON(w, 200, snapshot)
 }
 func (a *API) create(w http.ResponseWriter, r *http.Request) {
@@ -229,7 +216,7 @@ func (a *API) writeTaskSuccess(w http.ResponseWriter, r *http.Request, t Task) {
 		return
 	}
 	defer func() { a.responses.Release() }()
-	files, err := a.openArtifacts(t.Result)
+	files, err := a.openArtifacts(t.Result, t.Request.Format)
 	if err != nil {
 		sendError(w, Err(500, "image_missing", "任务图片文件不存在"))
 		return
@@ -261,7 +248,7 @@ func (a *API) writeGeneration(w http.ResponseWriter, r *http.Request, g *Generat
 		return
 	}
 	defer func() { a.responses.Release() }()
-	files, err := a.openArtifacts(g)
+	files, err := a.openArtifacts(g, format)
 	if err != nil {
 		sendError(w, Err(500, "image_missing", "图片文件不存在"))
 		return
@@ -270,12 +257,15 @@ func (a *API) writeGeneration(w http.ResponseWriter, r *http.Request, g *Generat
 	w.Header().Set("Content-Type", "application/json")
 	a.streamGeneration(w, g, format, files, a.imageBaseURL(r))
 }
-func (a *API) openArtifacts(g *Generation) ([]*os.File, error) {
+func (a *API) openArtifacts(g *Generation, format string) ([]*os.File, error) {
 	if g == nil {
 		return nil, fmt.Errorf("missing result")
 	}
-	var out []*os.File
-	for _, image := range g.Images {
+	out := make([]*os.File, len(g.Images))
+	for i, image := range g.Images {
+		if format == "url" && image.RemoteURL != "" {
+			continue
+		}
 		if filepath.Base(image.Name) != image.Name {
 			closeFiles(out)
 			return nil, fmt.Errorf("invalid artifact")
@@ -285,13 +275,15 @@ func (a *API) openArtifacts(g *Generation) ([]*os.File, error) {
 			closeFiles(out)
 			return nil, err
 		}
-		out = append(out, f)
+		out[i] = f
 	}
 	return out, nil
 }
 func closeFiles(files []*os.File) {
 	for _, f := range files {
-		f.Close()
+		if f != nil {
+			f.Close()
+		}
 	}
 }
 
@@ -322,7 +314,11 @@ func (a *API) streamGeneration(w io.Writer, g *Generation, format string, files 
 				return
 			}
 		} else {
-			data, _ := json.Marshal(map[string]string{"url": baseURL + "/images/" + image.Name})
+			link := image.RemoteURL
+			if link == "" {
+				link = baseURL + "/images/" + image.Name
+			}
+			data, _ := json.Marshal(map[string]string{"url": link})
 			if _, err := w.Write(data); err != nil {
 				return
 			}

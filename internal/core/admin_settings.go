@@ -62,6 +62,10 @@ func (a *API) saveConsoleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for k, v := range input.Values {
+		if k == "CORE_WEBDAV" {
+			sendError(w, Err(400, "invalid_settings", "请通过 WebDAV 设置入口保存"))
+			return
+		}
 		saved.Values[k] = v
 	}
 	desired, err := applySettingValues(e.CurrentConfig(), saved.Values)

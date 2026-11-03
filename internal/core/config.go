@@ -10,6 +10,8 @@ import (
 )
 
 type Config struct {
+	MonitorIntervalSeconds, MonitorRetentionHours                                                                                                                          int
+	WebDAV                                                                                                                                                                 webDAVConfig
 	EditMaxMiB, EditMaxImages                                                                                                                                              int
 	PowConcurrency, ThumbnailConcurrency                                                                                                                                   int
 	ValidationConcurrency                                                                                                                                                  int
@@ -24,7 +26,7 @@ type Config struct {
 }
 
 func LoadConfig() (Config, error) {
-	c := Config{OAuthURL: os.Getenv("CORE_OAUTH_URL"), Listen: env("CORE_LISTEN", ":9080"), DatabaseURL: os.Getenv("CORE_DATABASE_URL"), APIKey: os.Getenv("CORE_API_KEY"), AdminKey: os.Getenv("CORE_ADMIN_KEY"), PublicURL: os.Getenv("CORE_PUBLIC_URL"), ImageDir: env("CORE_IMAGE_DIR", "data/images"), ProxyURL: os.Getenv("CORE_PROXY_URL"), UpstreamURL: strings.TrimRight(env("CORE_UPSTREAM_URL", "https://chatgpt.com"), "/"), UpstreamModel: env("CORE_UPSTREAM_MODEL", "gpt-5-5"), TLSProfile: env("CORE_TLS_PROFILE", "chrome_110"), DefaultFormat: env("CORE_RESPONSE_FORMAT", "url"), AllowUserFormat: true}
+	c := Config{WebDAV: webDAVConfig{Concurrency: 16, TimeoutSeconds: 30, Retries: 1}, OAuthURL: os.Getenv("CORE_OAUTH_URL"), Listen: env("CORE_LISTEN", ":9080"), DatabaseURL: os.Getenv("CORE_DATABASE_URL"), APIKey: os.Getenv("CORE_API_KEY"), AdminKey: os.Getenv("CORE_ADMIN_KEY"), PublicURL: os.Getenv("CORE_PUBLIC_URL"), ImageDir: env("CORE_IMAGE_DIR", "data/images"), ProxyURL: os.Getenv("CORE_PROXY_URL"), UpstreamURL: strings.TrimRight(env("CORE_UPSTREAM_URL", "https://chatgpt.com"), "/"), UpstreamModel: env("CORE_UPSTREAM_MODEL", "gpt-5-5"), TLSProfile: env("CORE_TLS_PROFILE", "chrome_110"), DefaultFormat: env("CORE_RESPONSE_FORMAT", "url"), AllowUserFormat: true}
 	var err error
 	c.PublicURL, err = normalizePublicURL(c.PublicURL)
 	if err != nil {
@@ -36,6 +38,7 @@ func LoadConfig() (Config, error) {
 		d    int
 		zero bool
 	}{
+		{"CORE_MONITOR_INTERVAL_SECONDS", &c.MonitorIntervalSeconds, 10, false}, {"CORE_MONITOR_RETENTION_HOURS", &c.MonitorRetentionHours, 168, false},
 		{"CORE_EDIT_MAX_MIB", &c.EditMaxMiB, 32, false}, {"CORE_EDIT_MAX_IMAGES", &c.EditMaxImages, 4, false},
 		{"CORE_POW_CONCURRENCY", &c.PowConcurrency, 0, true}, {"CORE_THUMBNAIL_CONCURRENCY", &c.ThumbnailConcurrency, 1, false},
 		{"CORE_LOG_WRITERS", &c.LogWriters, 2, false}, {"CORE_LOG_QUEUE_SIZE", &c.LogQueueSize, 2048, false}, {"CORE_VALIDATION_CONCURRENCY", &c.ValidationConcurrency, 10, false}, {"CORE_IMAGE_WORKERS", &c.Workers, 1000, false}, {"CORE_IMAGE_QUEUE_SIZE", &c.QueueSize, 1000, true}, {"CORE_DOWNLOAD_CONCURRENCY", &c.DownloadConcurrency, 100, false}, {"CORE_ACCOUNT_SLOTS", &c.AccountSlots, 1, false}, {"CORE_SWITCH_RETRIES", &c.SwitchRetries, 2, true}, {"CORE_DOWNLOAD_RETRIES", &c.DownloadRetries, 1, true}, {"CORE_DB_CONNECTIONS", &c.DBConnections, 32, false}, {"CORE_VERIFY_CONCURRENCY", &c.VerifyConcurrency, 50, false}, {"CORE_RESPONSE_CONCURRENCY", &c.ResponseConcurrency, 32, false}, {"CORE_HOT_POOL_SIZE", &c.HotPoolSize, 500, false}, {"CORE_IMPORT_MAX_MIB", &c.ImportMaxMiB, 128, false},

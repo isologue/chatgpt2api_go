@@ -7,7 +7,7 @@ const bytes = n => n == null ? '—' : n >= 1073741824 ? `${(n / 1073741824).toF
 const date = value => !value || !Number.isFinite(new Date(value).getTime()) || new Date(value).getFullYear() < 2000 ? '—' : new Intl.DateTimeFormat('zh-CN', {timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date(value));
 const duration = ms => ms == null ? '—' : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 const titles = {overview:'运行概览',accounts:'账号池',logs:'调用日志',images:'图片管理',settings:'系统设置'};
-const groups = {concurrency:['图片生成并发','从任务执行、图片下载到解码和返回，分别控制。'],accounts:['账号校验','控制账号校验速度，以及可用性信息的复用时间。'],timeouts:['超时与重试','明确等待边界，兼顾成功率与请求耗时。'],output:['结果与存储','控制结果返回、图片大小和数据库连接占用。'],access:['访问与密钥','保持管理员登录，管理用于图片接口的调用密钥。']};
+const groups = {webdav:['WebDAV 图床','图片生成后上传至 WebDAV，并返回公开访问地址。'],concurrency:['图片生成并发','从任务执行、图片下载到解码和返回，分别控制。'],accounts:['账号校验','控制账号校验速度，以及可用性信息的复用时间。'],timeouts:['超时与重试','明确等待边界，兼顾成功率与请求耗时。'],output:['结果与存储','控制结果返回、图片大小和数据库连接占用。'],access:['访问与密钥','保持管理员登录，管理用于图片接口的调用密钥。']};
 const state = {page:'overview',group:'concurrency',demo:false,connected:false,sessionVersion:0,metrics:null,settings:[],limits:[],draft:{},saved:'',samples:[],fetching:false,timer:null,toastTimer:null,lists:{accounts:{cursors:[''],page:0,next:'',items:[],version:0},logs:{cursors:[''],page:0,next:'',items:[],version:0}}};
 
 
@@ -69,7 +69,7 @@ function metricSnapshot() {
   return {succeeded:2496,failed:4,safety_rejected:18,active_requests:328+Math.round(Math.sin(tick)*22),queued_requests:16,worker_limit:1000,queue_limit:1000,persistence_errors:0,account_pool:{total_accounts:1269,enabled_accounts:1246,disabled_accounts:23,used_slots:328,available_slots:918,total_slots:1246},runtime:{heap_alloc_bytes:457179136,goroutines:1832},log_active:1,log_queue_waiting:6,log_queue_limit:2048,log_queue_full:0,log_writers:2,thumbnails:{active:1,waiting:3,limit:1},upstream:{pow_active:2,pow_waiting:4,pow_limit:4,download_active:73,download_waiting:24,download_limit:100,validation_active:6,validation_waiting:2,validation_limit:10,verification_active:8,verification_limit:50,download_bytes:6786048328}};
 }
 function renderMetrics(m) {
-  const p=m.account_pool||{},u=m.upstream||{},r=m.runtime||{},t=m.thumbnails||{};
+  const p=m.account_pool||{},u=m.upstream||{},r=m.runtime||{},t=m.thumbnails||{},d=m.webdav||{};
 
   const total=Number(m.succeeded||0)+Number(m.failed||0),rate=total ? (100*m.succeeded/total).toFixed(2) : '—';
 
@@ -79,8 +79,8 @@ function renderMetrics(m) {
   [['pool-enabled',p.enabled_accounts],['pool-disabled',p.disabled_accounts],['pool-used',p.used_slots],['pool-free',p.available_slots]].forEach(([id,value])=>setText(id,count(value)));
   setText('runtime-heap',bytes(r.heap_alloc_bytes));setText('runtime-go',count(r.goroutines));setText('runtime-download',bytes(u.download_bytes));setText('runtime-errors',count((m.persistence_errors||0)+(u.account_persistence_errors||0)));
   setText('footer-workers',`任务 ${count(m.active_requests)} / ${count(m.worker_limit)}`);setText('footer-download',`下载 ${count(u.download_active)} / ${count(u.download_limit)}`);setText('footer-decode',`解码 ${count(u.validation_active)} / ${count(u.validation_limit)}`);
-  const waits=[m.queued_requests,u.download_waiting,u.validation_waiting,u.verification_waiting,u.manual_verification_waiting,u.replenishment_waiting,u.hot_maintenance_waiting,u.cold_maintenance_waiting,m.response_waiting,u.pow_waiting,t.waiting,m.log_queue_waiting];
-  const caps=[['任务执行',m.active_requests,m.worker_limit,'var(--coral)'],['图片下载',u.download_active,u.download_limit,'var(--purple)'],['图片解码',u.validation_active,u.validation_limit,'var(--mint)'],['前台校验',u.verification_active,u.verification_limit,'var(--amber)'],['手动校验',u.manual_verification_active,u.manual_verification_limit,'var(--mint)'],['热池补充',u.replenishment_active,u.replenishment_limit,'var(--coral)'],['热池维护',u.hot_maintenance_active,u.hot_maintenance_limit,'var(--amber)'],['冷池维护',u.cold_maintenance_active,u.cold_maintenance_limit,'var(--purple)'],['结果返回',m.response_active,m.response_limit,'var(--purple)'],['PoW 计算',u.pow_active,u.pow_limit,'var(--amber)'],['缩略图生成',t.active,t.limit,'var(--mint)'],['日志写入',m.log_active,m.log_writers,'var(--coral)']];
+  const waits=[m.queued_requests,u.download_waiting,u.validation_waiting,u.verification_waiting,u.manual_verification_waiting,u.replenishment_waiting,u.hot_maintenance_waiting,u.cold_maintenance_waiting,m.response_waiting,u.pow_waiting,t.waiting,m.log_queue_waiting,d.waiting];
+  const caps=[['任务执行',m.active_requests,m.worker_limit,'var(--coral)'],['图片下载',u.download_active,u.download_limit,'var(--purple)'],['图片解码',u.validation_active,u.validation_limit,'var(--mint)'],['前台校验',u.verification_active,u.verification_limit,'var(--amber)'],['手动校验',u.manual_verification_active,u.manual_verification_limit,'var(--mint)'],['热池补充',u.replenishment_active,u.replenishment_limit,'var(--coral)'],['热池维护',u.hot_maintenance_active,u.hot_maintenance_limit,'var(--amber)'],['冷池维护',u.cold_maintenance_active,u.cold_maintenance_limit,'var(--purple)'],['结果返回',m.response_active,m.response_limit,'var(--purple)'],['PoW 计算',u.pow_active,u.pow_limit,'var(--amber)'],['缩略图生成',t.active,t.limit,'var(--mint)'],['日志写入',m.log_active,m.log_writers,'var(--coral)'],['WebDAV 上传',d.active,d.limit,'var(--mint)']];
   $('#capacity-list').innerHTML=caps.map(([label,active,limit],i)=>`<div class="capacity-item"><div class="capacity-caption"><span>${label} <small>等待 ${count(waits[i])}</small></span><strong>${count(active)} <small>/ ${count(limit)}</small></strong></div><div class="capacity-track"><div class="capacity-fill" data-bar="${i}"></div></div></div>`).join('');
   caps.forEach(([,active,limit,color],i)=>{const bar=$(`[data-bar="${i}"]`);bar.style.width=`${Math.min(100,Math.max(0,100*(active||0)/(limit||1)))}%`;bar.style.background=color;});
   $('#account-summary').innerHTML=`<span class="summary-chip">账号总数 <strong>${count(p.total_accounts)}</strong></span><span class="summary-chip"><i class="status-dot"></i>已启用 <strong>${count(p.enabled_accounts)}</strong></span><span class="summary-chip">已停用 <strong>${count(p.disabled_accounts)}</strong></span><span class="summary-chip">热池 <strong>${count(p.hot_accounts)}</strong></span><span class="summary-chip">冷池 <strong>${count(p.cold_accounts)}</strong></span><span class="summary-chip">刷新成功 / 失败 <strong>${count(u.account_refresh_succeeded)} / ${count(u.account_refresh_failed)}</strong></span><span class="summary-chip">空闲槽位 <strong>${count(p.available_slots)}</strong></span>`;
@@ -88,15 +88,18 @@ function renderMetrics(m) {
 }
 function drawChart() {
   const samples=state.samples;
-  const w=720,h=190,left=34,right=8,top=9,bottom=26,plotH=h-top-bottom,plotW=w-left-right;
+  const w=720,h=190,left=62,right=8,top=9,bottom=26,plotH=h-top-bottom,plotW=w-left-right;
+  const metric=state.demo?'active_requests':$('#history-metric').value;
+  const axis=value=>metric.includes('bytes')?bytes(value):metric==='system.cpu_percent'?value.toFixed(0)+'%':Math.round(value).toLocaleString('zh-CN');
   const max=Math.max(10,...samples.map(p=>Math.max(p.active,p.waiting)))*1.18;
-  const x=i=>left+(samples.length>1 ? i/(samples.length-1) : 0)*plotW;
+  const first=samples[0]?.time||0,span=(samples.at(-1)?.time||0)-first;
+  const x=i=>left+(span>0?(samples[i].time-first)/span:0)*plotW;
   const y=value=>top+plotH-value/max*plotH;
-  const grid=Array.from({length:4},(_,i)=>{const value=max*(3-i)/3,yy=y(value);return `<line x1="${left}" y1="${yy}" x2="${w-right}" y2="${yy}" stroke="#eeeee7" stroke-dasharray="3 5"/><text x="0" y="${yy+3}">${Math.round(value)}</text>`;}).join('');
+  const grid=Array.from({length:4},(_,i)=>{const value=max*(3-i)/3,yy=y(value);return `<line x1="${left}" y1="${yy}" x2="${w-right}" y2="${yy}" stroke="#eeeee7" stroke-dasharray="3 5"/><text x="0" y="${yy+3}">${axis(value)}</text>`;}).join('');
   const line=key=>samples.map((p,i)=>`${i?'L':'M'} ${x(i).toFixed(2)} ${y(p[key]).toFixed(2)}`).join(' ');
   const area=samples.length ? `${line('active')} L ${x(samples.length-1)} ${h-bottom} L ${left} ${h-bottom} Z` : '';
   const labels=samples.length ? [0,Math.floor((samples.length-1)/2),samples.length-1].map((i,j)=>`<text x="${x(i)}" y="${h-3}" text-anchor="${j===0?'start':j===2?'end':'middle'}">${new Date(samples[i].time).toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})}</text>`).join('') : '';
-  $('#concurrency-chart').innerHTML=`<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="实时并发趋势"><defs><linearGradient id="chart-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#e96b56" stop-opacity=".13"/><stop offset="100%" stop-color="#e96b56" stop-opacity="0"/></linearGradient></defs>${grid}<path d="${area}" fill="url(#chart-fill)"/><path d="${line('active')}" fill="none" stroke="#e96b56" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/><path d="${line('waiting')}" fill="none" stroke="#a28acf" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>${labels}</svg>${samples.length<2?'<div class="chart-empty">采样后在这里显示实时趋势</div>':''}`;
+  $('#concurrency-chart').innerHTML=`<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="监控历史趋势"><defs><linearGradient id="chart-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#e96b56" stop-opacity=".13"/><stop offset="100%" stop-color="#e96b56" stop-opacity="0"/></linearGradient></defs>${grid}<path d="${area}" fill="url(#chart-fill)"/><path d="${line('active')}" fill="none" stroke="#e96b56" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/><path d="${line('waiting')}" fill="none" stroke="#a28acf" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>${labels}</svg>${samples.length<2?'<div class="chart-empty">采样后在这里显示实时趋势</div>':''}`;
   if(samples.length) setText('last-sample',`最近采样 ${new Date(samples.at(-1).time).toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false})}`);
 }
 async function refreshMetrics() {
@@ -104,7 +107,7 @@ async function refreshMetrics() {
   state.fetching=true;$('#refresh-button').classList.add('loading');
   try {
     const m=state.demo?metricSnapshot():await api('/admin/metrics');
-    state.metrics=m;state.samples.push({time:Date.now(),active:m.active_requests||0,waiting:m.upstream?.download_waiting||0});if(state.samples.length>60)state.samples.shift();
+    state.metrics=m;if(state.demo){state.samples.push({time:Date.now(),active:m.active_requests||0,waiting:m.upstream?.download_waiting||0});if(state.samples.length>60)state.samples.shift();}else{await refreshMonitorHistory();}
     renderMetrics(m);renderExtraMetrics(m);updateConnectionUI();refreshResults();
   } catch(error){updateConnectionUI(error.message);}finally{state.fetching=false;$('#refresh-button').classList.remove('loading');}
 }
@@ -152,7 +155,7 @@ function selectGroup(group){if(!groups[group])return;state.group=group;renderSet
 function renderSettings(){
   const [title,description]=groups[state.group];setText('settings-group-title',title);setText('settings-group-description',description);
   $$('[data-group]').forEach(el=>{el.classList.toggle('active',el.dataset.group===state.group);const total=state.settings.filter(s=>s.group===el.dataset.group).length;if(total)$('span',el).textContent=String(total).padStart(2,'0');});
-  const access=state.group==='access';$('.settings-panel').classList.toggle('hidden',access);$('.fixed-limits').classList.toggle('hidden',access);$('.settings-savebar').classList.toggle('hidden',access);$('#access-panel').classList.toggle('hidden',!access);if(access){renderAccess();return;}
+  const access=state.group==='access',webdav=state.group==='webdav',custom=access||webdav;$('.settings-panel').classList.toggle('hidden',custom);$('.fixed-limits').classList.toggle('hidden',custom);$('.settings-savebar').classList.toggle('hidden',custom);$('#access-panel').classList.toggle('hidden',!access);$('#webdav-panel').classList.toggle('hidden',!webdav);$('#reset-settings').classList.toggle('hidden',custom);if(access){renderAccess();return;}if(webdav){renderWebDAV();return;}
   if(!state.settings.length){$('#settings-fields').innerHTML='<div class="empty-cell">连接服务或打开界面演示后查看配置。</div>';return;}
   const labels=Object.fromEntries(state.settings.map(s=>[s.key,s.label]));
   $('#settings-fields').innerHTML=state.settings.filter(s=>s.group===state.group).map(s=>{
@@ -205,7 +208,7 @@ async function requestDetail(id){
     else row=await api(`/admin/requests/${encodeURIComponent(id)}`);
     if(!$('#detail-dialog').open)return;
     const knownStages={pow_solve:'PoW 计算',sse:'上游生成流',download:'图片下载',account_verify:'账号校验',download_wait:'下载排队',validation_wait:'解码排队'};
-    showDetail(`<h2>日志详情</h2><p class="mono">${escapeHTML(row.id)}</p><p class="small muted">调用 Key：${escapeHTML(row.api_key_name||'历史未记录')} <span class="mono">${escapeHTML(row.api_key_id||'')}</span></p><div class="detail-meta">${statusBadge(row.status)}<span class="badge neutral">${row.is_async?'异步':'同步'}</span><span class="badge neutral">${escapeHTML(row.response_format)}</span><span class="badge neutral">${duration(row.duration_ms)}</span></div><p class="small muted">开始 ${escapeHTML(date(row.started_at))} · 生成完成 ${escapeHTML(date(row.finished_at||row.created_at))} · 排队 ${duration(row.queue_ms)}</p>${row.error?`<div class="detail-error">${escapeHTML(row.error.message)}<div class="mono">${escapeHTML(row.error.code)}</div></div>`:''}<h3>账号尝试过程</h3><p class="small muted">${(row.attempts||[]).length} 次尝试 · 切号 ${(row.attempts||[]).filter((a,i,all)=>a.code&&i<all.length-1).length} 次</p><div class="attempt-timeline">${(row.attempts||[]).map((a,i)=>`<article class="attempt"><h3>${i+1}. ${escapeHTML(a.email||a.account_id)}</h3><p>${escapeHTML(date(a.started_at))} · 使用 ${duration(a.duration_ms)}</p>${a.code?`<span class="badge ${a.code==='content_policy_violation'?'safety':'failed'}">${escapeHTML(a.code)}</span>`:'<span class="badge success">生成成功</span>'}<div class="stages-grid">${Object.entries(a.stages_ms||{}).map(([key,value])=>`<div><span>${escapeHTML(knownStages[key]||key)}</span><span>${duration(value)}</span></div>`).join('')}</div></article>`).join('')||'<p>当前日志未记录账号尝试。</p>'}</div>${bodySections(row)}`,'REQUEST DETAILS');
+    showDetail(`<h2>日志详情</h2><p class="mono">${escapeHTML(row.id)}</p><p class="small muted">调用 Key：${escapeHTML(row.api_key_name||'历史未记录')} <span class="mono">${escapeHTML(row.api_key_id||'')}</span></p><div class="detail-meta">${statusBadge(row.status)}<span class="badge neutral">${row.is_async?'异步':'同步'}</span><span class="badge neutral">${escapeHTML(row.response_format)}</span><span class="badge neutral">${duration(row.duration_ms)}</span></div><p class="small muted">开始 ${escapeHTML(date(row.started_at))} · 生成完成 ${escapeHTML(date(row.finished_at||row.created_at))} · 排队 ${duration(row.queue_ms)}</p>${row.error?`<div class="detail-error">${escapeHTML(row.error.message)}<div class="mono">${escapeHTML(row.error.code)}</div></div>`:''}<h3>账号尝试过程</h3><p class="small muted">${(row.attempts||[]).length} 次尝试 · 切号 ${(row.attempts||[]).filter((a,i,all)=>a.code&&i<all.length-1).length} 次</p><div class="attempt-timeline">${(row.attempts||[]).map((a,i)=>`<article class="attempt"><h3>${i+1}. ${escapeHTML(a.email||a.account_id)}</h3><p>${escapeHTML(date(a.started_at))} · 使用 ${duration(a.duration_ms)}</p>${a.warning?`<div class="detail-error">${escapeHTML(a.warning.message)}<div class="mono">${escapeHTML(a.warning.code)}</div></div>`:''}${a.code?`<span class="badge ${a.code==='content_policy_violation'?'safety':'failed'}">${escapeHTML(a.code)}</span>`:'<span class="badge success">生成成功</span>'}<div class="stages-grid">${Object.entries(a.stages_ms||{}).map(([key,value])=>`<div><span>${escapeHTML(knownStages[key]||key)}</span><span>${duration(value)}</span></div>`).join('')}</div></article>`).join('')||'<p>当前日志未记录账号尝试。</p>'}</div>${bodySections(row)}`,'REQUEST DETAILS');
     installBodySections(id);
   }catch(error){if($('#detail-dialog').open)showDetail(`<h2>读取失败</h2><p>${escapeHTML(error.message)}</p>`,'REQUEST DETAILS');}
 }
@@ -360,7 +363,7 @@ function renderExtraMetrics(m){
  setText('runtime-cpu',s.cpu_percent==null?'—':Number(s.cpu_percent).toFixed(1)+'%');setText('runtime-memory',bytes(s.memory_used_bytes)+(s.memory_limit_bytes?' / '+bytes(s.memory_limit_bytes):''));setText('runtime-disk',bytes(s.disk_available_bytes));setText('sse-active','活跃生成流 '+count(u.sse_active));
  $('#stage-body').innerHTML=Object.entries(u.stages||{}).sort((a,b)=>Number(b[1].mean_ms)-Number(a[1].mean_ms)).map(([key,v])=>'<tr><td>'+escapeHTML(stageName(key))+'</td><td>'+count(v.count)+'</td><td>'+duration(v.mean_ms)+'</td><td>'+duration(v.max_ms)+'</td></tr>').join('')||'<tr><td colspan="4" class="empty-cell">有生成任务后显示阶段采样</td></tr>';
 }
-function stageName(key){return ({pow_solve:'PoW 计算',sse:'上游生成流',download:'图片下载',account_verify:'账号校验',download_wait:'下载排队',validation_wait:'解码排队'})[key]||key;}
+function stageName(key){return ({webdav_upload:'WebDAV 上传',webdav_wait:'WebDAV 排队',pow_solve:'PoW 计算',sse:'上游生成流',download:'图片下载',account_verify:'账号校验',download_wait:'下载排队',validation_wait:'解码排队'})[key]||key;}
 function bodySections(row){return '<h3>实际调用报文</h3><p class="small muted">保留调用方原始字段；长字符串点击后加载。异步创建响应与任务查询响应分别展示。升级前的日志可能没有原始报文。</p>'+[['request','请求体'],['response',row.is_async?'创建响应体':'响应体'],...(row.is_async?[['task_response','任务查询响应体（最近一次终态）']]:[])].map(([kind,label])=>'<details class="body-section" data-body-kind="'+kind+'"><summary>'+label+'</summary><div class="body-status">展开后读取</div><div class="json-tree hidden"></div><button type="button" class="raw-body-button">查看完整原文（按需加载）</button><pre class="raw-body hidden"></pre></details>').join('');}
 function renderJSONNode(n,path,host){
  if(n.kind==='object'||n.kind==='array'){
@@ -426,9 +429,9 @@ $('#images-gallery').addEventListener('click',event=>{const button=event.target.
 
 
 function expireSession(message='已退出登录。'){
- accessVersion++;state.sessionVersion++;state.connected=false;state.demo=false;state.metrics=null;state.samples=[];state.settings=[];state.limits=[];state.draft={};state.saved='';
+ historyData=null;historyVersion++;webdavVersion++;webdavDirty=false;accessVersion++;state.sessionVersion++;state.connected=false;state.demo=false;state.metrics=null;state.samples=[];state.settings=[];state.limits=[];state.draft={};state.saved='';
  clearInterval(state.timer);clearTimeout(state.jobsTimer);clearTimeout(storageState.timer);resetLists();resultsVersion++;resultsAt=0;resultsKey='';
- $('#detail-dialog').close();$('#detail-content').replaceChildren();$('#access-panel').replaceChildren();$('#images-gallery').replaceChildren();$('#admin-jobs').replaceChildren();$('#settings-fields').replaceChildren();
+ $('#detail-dialog').close();$('#detail-content').replaceChildren();$('#access-panel').replaceChildren();$('#webdav-panel').replaceChildren();$('#images-gallery').replaceChildren();$('#admin-jobs').replaceChildren();$('#settings-fields').replaceChildren();
  for(const kind of ['accounts','logs'])renderEmpty(kind,'登录后查看记录。');updateConnectionUI();showConnection();$('#connect-error').textContent=message;
 }
 async function connectSession(){
@@ -486,4 +489,65 @@ async function showKeyStats(item){
  }catch(e){if(target.isConnected)target.textContent=e.message;}};
  $('#key-stats-period').onchange=update;await update();
 }
+
+let webdavVersion=0,webdavDirty=false;
+async function renderWebDAV(){
+ const target=$('#webdav-panel'),version=++webdavVersion,session=state.sessionVersion;
+ target.innerHTML='<article class="panel"><div class="panel-heading"><h2>WebDAV 图床</h2></div><p class="empty-cell">正在读取配置…</p></article>';
+ try{
+  const data=state.demo?{config:{enabled:false,url:'',public_url:'',root:'',username:'',concurrency:16,timeout_seconds:30,retries:1},revision:0,has_password:false}:await api('/admin/webdav');
+  if(version!==webdavVersion||session!==state.sessionVersion||state.group!=='webdav')return;
+  const c=data.config;webdavDirty=false;
+  const text=(key,label,help,password=false)=>'<div class="setting-row setting-text-row"><div><label class="setting-label" for="dav-'+key+'">'+label+'</label><p class="setting-description">'+help+'</p></div><div class="setting-control"><input id="dav-'+key+'" name="'+key+'" type="'+(password?'password':'text')+'" value="'+escapeHTML(c[key]||'')+'" '+(password?'autocomplete="new-password" placeholder="'+(data.has_password?'已配置，留空保留原密码':'未配置')+'"':'spellcheck="false" placeholder="默认留空"')+'></div></div>';
+  const number=(key,label,help,min)=>'<div class="setting-row"><div><label class="setting-label" for="dav-'+key+'">'+label+'</label><p class="setting-description">'+help+'</p></div><div class="setting-control"><input id="dav-'+key+'" name="'+key+'" type="number" step="1" min="'+min+'" value="'+c[key]+'" required></div></div>';
+  target.innerHTML='<form id="webdav-form" class="panel"><div class="panel-heading"><div><h2>WebDAV 图床</h2><p>配置默认留空。保存后对新请求立即生效。</p></div><span class="badge neutral">'+(c.enabled?'已启用':'未启用')+'</span></div><div class="setting-row"><div><label class="setting-label" for="dav-enabled">启用 WebDAV 上传</label><p class="setting-description">启用后先保存本地图片，再上传到 WebDAV。URL 响应返回图床地址；Base64 仍返回图片内容。图片管理使用本地缩略图。</p></div><label class="toggle"><input id="dav-enabled" name="enabled" type="checkbox" '+(c.enabled?'checked':'')+'><span class="toggle-track"></span></label></div>'+
+  text('url','WebDAV URL','WebDAV 写入入口，填写完整 HTTP(S) 地址。上传使用直连，不经过生图代理。')+
+  text('public_url','WebDAV 公开访问前缀','公开前缀需映射到根路径目录；返回地址为此前缀加日期和文件名，不再追加根路径。')+
+  text('username','用户名','WebDAV Basic Auth 用户名。')+
+  text('password','密码','留空保留已保存密码。密码不会出现在普通设置或配置导出中。',true)+
+  '<div class="dav-clear"><label><input type="checkbox" name="clear_password"> 保存时清除已配置密码</label></div>'+
+  text('root','WebDAV 根路径','相对于 WebDAV URL 的存储目录，例如 project/images；不能包含 .. 或以 / 开头。日期子目录自动创建。')+
+  number('concurrency','WebDAV 上传并发','同时上传的图片数，独立于图片下载并发；名额占满时等待，等待消耗图片总预算。默认 16。',1)+
+  number('timeout_seconds','单次上传超时（秒）','每次尝试包含目录创建和上传，默认 30 秒，也受图片请求总预算限制。',1)+
+  number('retries','上传失败重试次数','同一图片额外上传的次数，不会重复生图。认证失败不重试；重试耗尽记录告警，并返回本地 URL 或 Base64；不重复生图，账号不扣分。',0)+
+  '<div class="dav-actions"><button class="button primary" type="submit">保存 WebDAV 配置</button><button class="button" type="button" id="dav-test">测试已保存配置</button><button class="text-button" type="button" id="dav-reload">重新加载</button><span id="dav-status" class="small muted" role="status"></span></div><div id="dav-test-result" class="dav-test-result" role="status"></div><p class="small muted dav-footnote">手动或定时清理图片只清理本地副本，WebDAV 文件由图床服务管理。测试会创建一张小图，核对公开访问后删除测试文件。</p></form>';
+  const form=$('#webdav-form');
+  form.addEventListener('input',()=>{webdavDirty=true;setText('dav-status','有尚未保存的修改');});
+  form.onsubmit=async event=>{event.preventDefault();if(state.demo){toast('演示模式不保存配置。');return;}
+   const fields=new FormData(form),config={enabled:fields.has('enabled')};for(const key of ['url','public_url','root','username','password'])config[key]=fields.get(key);for(const key of ['concurrency','timeout_seconds','retries'])config[key]=Number(fields.get(key));
+   const button=form.querySelector('[type="submit"]');button.disabled=true;
+   try{const saved=await api('/admin/webdav',{method:'PUT',body:JSON.stringify({revision:data.revision,config,clear_password:fields.has('clear_password')})});if(session!==state.sessionVersion)return;state.revision=saved.revision;webdavDirty=false;toast('WebDAV 配置已保存并生效。');await renderWebDAV();}catch(e){if(session===state.sessionVersion)setText('dav-status',e.message);}finally{if(button.isConnected)button.disabled=false;}
+  };
+  $('#dav-reload').onclick=()=>renderWebDAV();
+  $('#dav-test').onclick=async()=>{if(state.demo){toast('演示模式不连接图床。');return;}if(webdavDirty){toast('请先保存配置后再测试。');return;}
+   const button=$('#dav-test'),result=$('#dav-test-result');button.disabled=true;result.textContent='正在测试上传、公开访问与删除…';
+   try{const test=await api('/admin/webdav/test',{method:'POST',body:'{}',timeout:130000});if(session!==state.sessionVersion||!result.isConnected)return;result.replaceChildren();for(const [key,label] of [['upload','上传'],['public_access','公开访问'],['delete','删除测试文件']]){const row=document.createElement('p');row.textContent=label+'：'+(test[key].success?'成功':test[key].error||'失败');row.className=test[key].success?'success-text':'form-error';result.append(row);}}catch(e){if(result.isConnected)result.textContent=e.message;}finally{if(button.isConnected)button.disabled=false;}
+  };
+ }catch(e){if(version===webdavVersion&&session===state.sessionVersion)target.textContent=e.message;}
+}
+window.addEventListener('beforeunload',event=>{if(webdavDirty){event.preventDefault();event.returnValue='';}});
+
+
+
+
+let historyData=null,historyVersion=0;
+function displayMonitorHistory(){
+ if(!historyData)return;
+ const metric=$('#history-metric').value;
+ state.samples=historyData.items.map(p=>({time:Date.parse(p.time),active:p.values[metric]||0,waiting:metric==='active_requests'?(p.values['upstream.download_waiting']||0):0}));
+ drawChart();
+ const peak=historyData.peaks[metric];
+ const formatted=peak?(metric.includes('bytes')?bytes(peak.value):metric==='system.cpu_percent'?peak.value.toFixed(1)+'%':count(peak.value)):'—';
+ setText('history-peak',peak?'峰值 '+formatted+' · '+date(peak.at):'暂无历史采样');
+ setText('history-status','每桶 '+historyData.bucket_seconds+' 秒，显示桶内最大值；仅代表采样时刻，可能遗漏采样间的短暂尖峰。');
+ const legend=$('.chart-legend');if(legend)legend.innerHTML='<span><i class="legend-dot coral-bg"></i>'+escapeHTML($('#history-metric').selectedOptions[0].text)+'</span>'+(metric==='active_requests'?'<span><i class="legend-dot purple-bg"></i>下载等待</span>':'');
+}
+async function refreshMonitorHistory(){
+ const session=state.sessionVersion,version=++historyVersion,hours=$('#history-hours').value;
+ try{const data=await api('/admin/monitor/history?hours='+hours);if(session!==state.sessionVersion||version!==historyVersion)return;historyData=data;displayMonitorHistory();}
+ catch(e){if(session===state.sessionVersion&&version===historyVersion)setText('history-status',e.message);}
+}
+$('#history-hours').addEventListener('change',()=>{if(state.connected&&!state.demo)refreshMonitorHistory();});
+$('#history-metric').addEventListener('change',displayMonitorHistory);
+
 if(new URLSearchParams(location.search).get('demo')==='1')activateDemo();else restoreSession();

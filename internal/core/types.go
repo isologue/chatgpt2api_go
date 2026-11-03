@@ -127,14 +127,16 @@ type Account struct {
 	LastErrorCode    string                     `json:"last_error_code,omitempty"`
 }
 type Artifact struct {
-	Name  string `json:"name"`
-	Bytes int64  `json:"bytes"`
+	RemoteURL string `json:"remote_url,omitempty"`
+	Name      string `json:"name"`
+	Bytes     int64  `json:"bytes"`
 }
 type Generation struct {
 	Created int64      `json:"created"`
 	Images  []Artifact `json:"images"`
 }
 type Attempt struct {
+	Warning                 *APIError          `json:"warning,omitempty"`
 	TotalBudgetExemptReason string             `json:"total_budget_exempt_reason,omitempty"`
 	AccountID               string             `json:"account_id"`
 	Email                   string             `json:"email"`

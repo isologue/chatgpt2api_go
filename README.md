@@ -187,7 +187,7 @@ go build -o burst ./cmd/burst
 管理接口：`POST/GET/DELETE /admin/session` 用于登录、恢复和退出，`PUT /admin/access/admin-key` 修改管理员密钥，`GET/POST /admin/api-keys` 和 `PUT/DELETE /admin/api-keys/{id}` 管理调用 Key。浏览器写请求要求同源 Origin；原有 Bearer 管理接口仍支持当前管理员密钥。登录连续失败 5 次后等待 30 秒。密钥修改接口要求 16～256 字节。
 
 
-- **运行概览**：按北京时间筛选历史图片结果、成功请求 P50/P95、实时任务并发、各通道使用量与等待数、账号槽位及容器资源数据。趋势仅保留当前浏览会话的最近 60 次采样，后台标签页暂停刷新。
+- **运行概览**：按北京时间筛选历史图片结果、成功请求 P50/P95、实时任务并发、各通道使用量与等待数、账号槽位及容器资源数据。趋势由服务端持续采样并写入 PostgreSQL，默认保留 7 天；页面暂停刷新或服务重启后仍可查询已保存的历史。
 - **账号池 / 调用日志**：数据库游标分页，每页默认 20 条、最多 100 条；列表不返回完整 AT/RT 或完整日志尝试过程，日志详情按需读取。搜索与筛选会重置分页。
 - **系统设置**：公开参数保存到 PostgreSQL，点击“保存并生效”后立即调整任务执行、等待队列、下载、解码、返回、账号槽位与校验容量。调低并发不会取消在途任务；已接纳请求保留其超时、重试和返回格式快照。数据库连接池、日志写入线程和日志等待队列显示“重启生效”，重启后按保存值重建对应资源。日志等待队列由主队列和溢出队列组成；只有两级队列都满时才进入同步落库兜底。
 - 设置页列出已开放参数；PoW 和缩略图生成并发支持在线调整。单次图片数量、请求体大小等协议限制在“其他当前限制”中展示。
@@ -255,3 +255,26 @@ pwsh -File .\scripts\restore.ps1 -Source G:\Backups\chatgpt2api-go-20261103 -Pro
 CPA / Sub2API 实际文件、账号推送、十万条导入基线及真实上游限制见 [导入与推送验收记录](docs/import-and-push-validation-2026-11-03.md)。
 
 图片编辑（含 mask）、Key 并发/统计、持久化幂等和管理员离线恢复说明见 [图片编辑与调用控制](docs/image-edits-key-controls.md)。
+
+
+## WebDAV 图床
+
+设置页「WebDAV 图床」支持开关、WebDAV 地址、公开访问前缀、根路径及认证信息。连接配置默认全部留空且关闭；上传并发默认 16，单次超时 30 秒，失败重试 1 次。这些设置保存后立即生效并持久化到 PostgreSQL，密码留空保留已有值，也可以明确清除。
+
+启用后，生图结果先保存本地，再流式上传 WebDAV。同步和异步的 URL 返回公开图床地址；Base64 返回图片内容，同时保留远端副本。本地图片继续用于管理预览、缩略图及 Base64 读取。上传重试耗尽后回退本地 URL 或 Base64，请求保持成功；调用日志保存 `webdav_upload_failed` 告警，不扣账号分、不重复生图。上传排队受请求总预算控制，单次上传另受 WebDAV 超时限制。
+
+WebDAV 上传路径为「地址/根路径/年/月/日/文件名」，公开地址为「公开访问前缀/年/月/日/文件名」；公开前缀应直接映射根路径，不能再重复拼接根路径。连接测试会上传一张小图、核对公开访问内容并删除测试文件；正常出图上传成功后不额外下载验图。手动和自动清理图片仅删除本地副本，远端文件由图床管理。`/admin/metrics` 的 `webdav` 提供上传执行数、等待数、上限、成功/失败计数和上传字节数。
+
+## 监控历史与 Linux 备份
+
+服务端默认每 10 秒保存一条数值监控到 PostgreSQL，保留 168 小时，不依赖页面是否打开。设置页可调整 CORE_MONITOR_INTERVAL_SECONDS 和 CORE_MONITOR_RETENTION_HOURS。历史图支持近 1/6/24 小时和 7 天，查看执行/排队、下载、WebDAV、CPU 和内存；每桶显示采样最大值，峰值标注实际采样时间。采样间隔内的短暂尖峰可能未被记录；进程累计计数重启后从零开始。历史查询最多返回约 720 个桶，过期数据每小时分批清理。
+
+Linux 服务器使用 Python 3 标准库和现有 Docker，无需额外安装 Python 依赖：
+
+```bash
+python3 scripts/backup.py backup --directory /your/backup/path/new-backup
+python3 scripts/backup.py verify --directory /your/backup/path/new-backup
+python3 scripts/backup.py restore --directory /your/backup/path/new-backup --project recovery-test --compose-file /your/recovery/compose.yml --env-file /your/recovery/.env --no-start
+```
+
+备份短暂停止 core，完成或失败后恢复其原运行状态，保存数据库、图片及原始报文卷、Compose 和环境文件。备份目录应在持久化磁盘上并限制访问；包含完整账号凭据与密钥。恢复先校验 SHA256 与压缩包路径，默认拒绝非空目标；不会覆盖当前 Compose 或环境文件。独立恢复演练建议使用独立项目/数据卷，--no-start 保持 core 停止，便于检查数据库和图片，避免克隆账号触发后台远程刷新。WebDAV 远端数据由图床服务单独备份。

@@ -45,6 +45,19 @@ func applySettingValues(base Config, values map[string]json.RawMessage) (Config,
 	for key, raw := range values {
 		var number float64
 		switch key {
+		case "CORE_WEBDAV":
+			if string(raw) == "null" {
+				return c, fmt.Errorf("WebDAV 配置无效")
+			}
+			var dav webDAVConfig
+			if err := json.Unmarshal(raw, &dav); err != nil {
+				return c, fmt.Errorf("WebDAV 配置无效")
+			}
+			if err := dav.validate(); err != nil {
+				return c, err
+			}
+			c.WebDAV = dav.normalized()
+			continue
 		case "CORE_ALLOW_USER_RESPONSE_FORMAT":
 			if err := json.Unmarshal(raw, &c.AllowUserFormat); err != nil || string(raw) == "null" {
 				return c, fmt.Errorf("%s 必须为布尔值", key)
@@ -82,6 +95,16 @@ func applySettingValues(base Config, values map[string]json.RawMessage) (Config,
 		}
 		d := time.Duration(v) * time.Second
 		switch key {
+		case "CORE_MONITOR_INTERVAL_SECONDS":
+			if v > 86400 {
+				return c, fmt.Errorf("监控采样间隔不能超过 86400 秒")
+			}
+			c.MonitorIntervalSeconds = v
+		case "CORE_MONITOR_RETENTION_HOURS":
+			if v > 87600 {
+				return c, fmt.Errorf("监控保留时间不能超过 87600 小时")
+			}
+			c.MonitorRetentionHours = v
 		case "CORE_POW_CONCURRENCY":
 			c.PowConcurrency = v
 		case "CORE_LOG_WRITERS":
@@ -189,6 +212,9 @@ func (e *Engine) applyConfig(c Config) {
 	}
 	if e.resources != nil {
 		e.resources.thumbnails.Resize(c.thumbnailLimit())
+	}
+	if e.webdav != nil {
+		e.webdav.slots.Resize(c.WebDAV.normalized().Concurrency)
 	}
 	e.settings.value.Store(&c)
 }

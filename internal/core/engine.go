@@ -45,10 +45,12 @@ type job struct {
 }
 type Metrics struct{ Accepted, Rejected, Completed, Failed, Safety, Active, Queued, PersistenceErrors atomic.Int64 }
 type Engine struct {
+	webdav          *webDAVStorage
 	keyMu           sync.Mutex
 	keyActive       map[string]int
 	idemLocks       [256]sync.Mutex
 	access          *accessManager
+	monitorOnce     sync.Once
 	maintenanceOnce sync.Once
 	resources       *resourceManager
 	Config          Config
@@ -79,7 +81,7 @@ type Engine struct {
 
 func NewEngine(c Config, p *Pool, s Store, g Generator) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &Engine{access: newAccessManager(c), Config: c, Pool: p, Store: s, Generator: g, root: ctx, cancel: cancel, permits: newLimiter(c.Workers + c.QueueSize), execution: newLimiter(c.Workers), responses: newLimiter(c.ResponseConcurrency), settings: newRuntimeConfig(c), logQueue: make(chan requestLog, max(1, c.LogQueueSize)), logOverflow: make(chan requestLog, max(1, c.LogQueueSize))}
+	e := &Engine{webdav: newWebDAVStorage(c.WebDAV), access: newAccessManager(c), Config: c, Pool: p, Store: s, Generator: g, root: ctx, cancel: cancel, permits: newLimiter(c.Workers + c.QueueSize), execution: newLimiter(c.Workers), responses: newLimiter(c.ResponseConcurrency), settings: newRuntimeConfig(c), logQueue: make(chan requestLog, max(1, c.LogQueueSize)), logOverflow: make(chan requestLog, max(1, c.LogQueueSize))}
 	if db, ok := s.(*Postgres); ok {
 		e.resources = &resourceManager{e: e, s: db, pins: map[string]int{}, busy: map[string]bool{}, thumbnails: newLimiter(c.thumbnailLimit())}
 	}
@@ -426,7 +428,21 @@ func (e *Engine) generate(ctx context.Context, r Request) (*Generation, []Attemp
 				slog.Error("account_state_write_failed", "account_id", a.ID)
 			}
 			if ae == nil {
-				g.Images = append(g.Images, images[0])
+				im := images[0]
+				if config := configIn(ctx, e.CurrentConfig()); config.WebDAV.Enabled {
+					uploadStart := time.Now()
+					remote, uploadErr := e.webdav.uploadFile(ctx, config, im.Name, stages)
+					attempts[len(attempts)-1].DurationMS += time.Since(uploadStart).Milliseconds()
+					if uploadErr != nil {
+						warning := AsError(uploadErr)
+						attempts[len(attempts)-1].Warning = Err(warning.Status, "webdav_upload_failed", warning.Message+"；已返回本地结果")
+						id, _ := ctx.Value(imageRequestIDKey{}).(string)
+						slog.Warn("webdav_upload_fallback", "task_id", id, "image", im.Name, "reason", warning.Message)
+					} else {
+						im.RemoteURL = remote
+					}
+				}
+				g.Images = append(g.Images, im)
 				last = nil
 				break
 			}
@@ -454,10 +470,13 @@ func (e *Engine) Close() {
 	close(e.logQueue)
 	close(e.logOverflow)
 	e.logWG.Wait()
+	if e.webdav != nil {
+		e.webdav.client.CloseIdleConnections()
+	}
 }
 
 func (e *Engine) Snapshot() map[string]any {
-	return map[string]any{"accepted": e.Stats.Accepted.Load(), "rejected": e.Stats.Rejected.Load(), "succeeded": e.Stats.Completed.Load(), "failed": e.Stats.Failed.Load(), "safety_rejected": e.Stats.Safety.Load(), "active_requests": e.Stats.Active.Load(), "queued_requests": e.Stats.Queued.Load(), "worker_limit": e.CurrentConfig().Workers, "queue_limit": e.CurrentConfig().QueueSize, "persistence_errors": e.Stats.PersistenceErrors.Load(), "log_active": e.logActive.Load(), "log_queue_waiting": len(e.logQueue) + len(e.logOverflow), "log_queue_limit": cap(e.logQueue) + cap(e.logOverflow), "log_queue_primary_waiting": len(e.logQueue), "log_queue_overflow_waiting": len(e.logOverflow), "log_queue_primary_limit": cap(e.logQueue), "log_queue_overflow_limit": cap(e.logOverflow), "log_queue_full": e.logQueueFull.Load(), "log_writers": max(1, e.CurrentConfig().LogWriters), "response_active": e.responses.Used(), "response_waiting": e.responses.Waiting(), "response_limit": e.responses.Limit(), "account_pool": e.Pool.Snapshot()}
+	return map[string]any{"accepted": e.Stats.Accepted.Load(), "rejected": e.Stats.Rejected.Load(), "succeeded": e.Stats.Completed.Load(), "failed": e.Stats.Failed.Load(), "safety_rejected": e.Stats.Safety.Load(), "active_requests": e.Stats.Active.Load(), "queued_requests": e.Stats.Queued.Load(), "worker_limit": e.CurrentConfig().Workers, "queue_limit": e.CurrentConfig().QueueSize, "persistence_errors": e.Stats.PersistenceErrors.Load(), "webdav": e.webdav.snapshot(), "log_active": e.logActive.Load(), "log_queue_waiting": len(e.logQueue) + len(e.logOverflow), "log_queue_limit": cap(e.logQueue) + cap(e.logOverflow), "log_queue_primary_waiting": len(e.logQueue), "log_queue_overflow_waiting": len(e.logOverflow), "log_queue_primary_limit": cap(e.logQueue), "log_queue_overflow_limit": cap(e.logOverflow), "log_queue_full": e.logQueueFull.Load(), "log_writers": max(1, e.CurrentConfig().LogWriters), "response_active": e.responses.Used(), "response_waiting": e.responses.Waiting(), "response_limit": e.responses.Limit(), "account_pool": e.Pool.Snapshot()}
 }
 
 func (e *Engine) safeGenerate(ctx context.Context, a Account, r Request, s map[string]float64) (images []Artifact, err error) {

@@ -86,6 +86,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	engine.StartMonitorHistory()
 	engine.StartResourceMaintenance()
 	engine.StartAccountMaintenance()
 	server := &http.Server{Addr: c.Listen, Handler: core.NewHandler(engine), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 << 10}

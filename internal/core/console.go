@@ -34,6 +34,8 @@ func (a *API) registerConsole(m *http.ServeMux) {
 	m.HandleFunc("PUT /admin/config", a.admin(a.saveConsoleConfig))
 	a.registerAccountManagement(m)
 	a.registerResources(m)
+	a.registerWebDAV(m)
+	m.HandleFunc("GET /admin/monitor/history", a.admin(a.monitorHistory))
 	m.HandleFunc("GET /admin/accounts", a.admin(a.consoleAccounts))
 	m.HandleFunc("GET /admin/requests", a.admin(a.consoleRequests))
 	m.HandleFunc("GET /admin/requests/{id}", a.admin(a.consoleRequest))
@@ -59,6 +61,8 @@ type consoleSetting struct {
 
 func settingsFor(c Config) []consoleSetting {
 	items := []consoleSetting{
+		{Key: "CORE_MONITOR_INTERVAL_SECONDS", Label: "监控持久化采样间隔", Group: "output", Value: c.monitorIntervalSeconds(), Default: 10, Unit: "秒", Description: "服务端独立采集并写入 PostgreSQL，关闭页面后仍采样。越小越精细，数据库写入和存储越多；短于采样间隔的尖峰可能未被记录。", Related: []string{"CORE_MONITOR_RETENTION_HOURS"}},
+		{Key: "CORE_MONITOR_RETENTION_HOURS", Label: "监控历史保留时间", Group: "output", Value: c.monitorRetentionHours(), Default: 168, Unit: "小时", Description: "仅清理过期监控采样，不删除调用日志、任务或图片。默认保留 7 天，每小时分批清理。", Related: []string{"CORE_MONITOR_INTERVAL_SECONDS"}},
 		{Key: "CORE_EDIT_MAX_MIB", Label: "图片编辑请求大小", Group: "output", Value: c.editMaxMiB(), Default: 32, Unit: "MiB", Description: "图生图 multipart 请求总大小，含全部输入图片及表单。上传先落私有临时磁盘；过大返回 413。提高后临时磁盘和上传带宽增加。", Related: []string{"CORE_EDIT_MAX_IMAGES", "CORE_METADATA_TIMEOUT"}},
 		{Key: "CORE_EDIT_MAX_IMAGES", Label: "图片编辑输入张数", Group: "output", Value: c.editMaxImages(), Default: 4, Description: "单次图生图允许上传的参考图片数量；与输出张数 n 独立。每次切号需重新上传全部参考图。", Related: []string{"CORE_EDIT_MAX_MIB", "CORE_SWITCH_RETRIES"}},
 		{Key: "CORE_IMPORT_MAX_MIB", Label: "账号导入大小上限", Group: "output", Value: int(c.importLimit() >> 20), Default: 128, Unit: "MiB", Description: "管理页与推送入口共享的单次文件上限。文件先写临时磁盘，再逐条解析、每批 100 条入库；提高上限会增加临时磁盘和处理时间。", Related: []string{}},
