@@ -142,6 +142,17 @@ func TestPostgresManagementSettingsAndJobs(t *testing.T) {
 	if job.Succeeded != 1 || job.Total != 1 || m.me.Load() != 1 {
 		t.Fatal("manual verification did not dedup/force refresh", job, m.me.Load())
 	}
+	w = requestJSON(t, h, "POST", "/admin/accounts/verify", `{"all_matching":true,"q":"`+ids[1]+`","status":"enabled"}`, c.AdminKey)
+	if w.Code != 202 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if err = json.Unmarshal(w.Body.Bytes(), &job); err != nil {
+		t.Fatal(err)
+	}
+	job = wait(job.ID)
+	if job.Status != "completed" || job.Total != 1 || job.Succeeded != 1 || m.me.Load() != 2 {
+		t.Fatal("filtered verification did not target the matching account", job, m.me.Load())
+	}
 	w = requestJSON(t, h, "DELETE", "/admin/accounts/"+id, "", c.AdminKey)
 	if w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())
@@ -155,6 +166,25 @@ func TestPostgresManagementSettingsAndJobs(t *testing.T) {
 	total, err := s.AccountCount(ctx)
 	if err != nil || total != 204 {
 		t.Fatal("deleted account resurrected", total, err)
+	}
+	// 全部筛选结果使用服务端游标扫描，并同步清理内存选号池。
+	w = requestJSON(t, h, "POST", "/admin/accounts/delete", `{"all_matching":true,"q":"`+ids[1]+`","status":"enabled"}`, c.AdminKey)
+	if w.Code != 202 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if err = json.Unmarshal(w.Body.Bytes(), &job); err != nil {
+		t.Fatal(err)
+	}
+	job = wait(job.ID)
+	if job.Status != "completed" || job.Total != 1 || job.Succeeded != 1 || job.Failed != 0 {
+		t.Fatal("filtered batch delete did not complete", job)
+	}
+	if _, ok := p.Get(ids[1]); ok {
+		t.Fatal("batch-deleted account remains selectable")
+	}
+	total, err = s.AccountCount(ctx)
+	if err != nil || total != 203 {
+		t.Fatal("filtered batch delete changed the wrong number of rows", total, err)
 	}
 	interrupted := newAdminJob("import")
 	interrupted.Processed = 10

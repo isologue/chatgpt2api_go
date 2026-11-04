@@ -77,6 +77,7 @@ type Engine struct {
 	logActive       atomic.Int64
 	importBusy      atomic.Bool
 	verifyBusy      atomic.Bool
+	deleteBusy      atomic.Bool
 	wg              sync.WaitGroup
 	closing         atomic.Bool
 	admission       sync.RWMutex

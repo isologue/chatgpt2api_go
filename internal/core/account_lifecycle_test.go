@@ -241,6 +241,73 @@ func TestIndependentRefreshLanesShareOnlySameAccount(t *testing.T) {
 		t.Fatal("account quota and activity not saved")
 	}
 }
+
+func TestMetadataUnauthorizedRefreshesAndPersistsRotatedTokens(t *testing.T) {
+	oldAT := fixtureIdentityToken("user-1", "old")
+	newAT := fixtureIdentityToken("user-1", "new")
+	var refreshCalls, oldTokenCalls, newTokenCalls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/token":
+			refreshCalls.Add(1)
+			if err := r.ParseForm(); err != nil || r.Form.Get("refresh_token") != "old-rt" {
+				t.Errorf("refresh used unexpected RT: %v", err)
+			}
+			sendJSON(w, 200, map[string]any{"access_token": newAT, "refresh_token": "rotated-rt"})
+		case "/backend-api/me":
+			switch strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			case oldAT:
+				oldTokenCalls.Add(1)
+				sendJSON(w, 401, map[string]any{"error": map[string]any{"code": "token_expired"}})
+			case newAT:
+				newTokenCalls.Add(1)
+				sendJSON(w, 200, map[string]any{"email": "fixture@example.invalid"})
+			default:
+				t.Errorf("unexpected access token")
+				sendJSON(w, 401, map[string]any{})
+			}
+		case "/backend-api/conversation/init":
+			sendJSON(w, 200, map[string]any{"limits_progress": []any{map[string]any{"feature_name": "image_gen", "remaining": 8}}})
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	c := testConfig(t)
+	c.UpstreamURL = upstream.URL
+	c.OAuthURL = upstream.URL + "/oauth/token"
+	a := testAccounts(1)[0]
+	a.AccessToken = oldAT
+	a.RefreshToken = "old-rt"
+	a.VerifiedAt = time.Time{}
+	a.SuccessAt = time.Time{}
+	store := newMemoryStore()
+	store.SaveAccount(context.Background(), a)
+	p := NewPool([]Account{a}, 1)
+	n, err := NewNative(c, p, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+
+	got, err := n.checkAccount(context.Background(), a, true)
+	if err != nil {
+		t.Fatalf("check account after refresh: %v", err)
+	}
+	if got.AccessToken != newAT || got.RefreshToken != "rotated-rt" || got.Status != "available" {
+		t.Fatalf("refreshed credentials/state not returned: status=%q", got.Status)
+	}
+	if refreshCalls.Load() != 1 || oldTokenCalls.Load() != 1 || newTokenCalls.Load() != 1 {
+		t.Fatalf("unexpected retry counts: refresh=%d old=%d new=%d", refreshCalls.Load(), oldTokenCalls.Load(), newTokenCalls.Load())
+	}
+	persisted, ok := store.accounts[a.ID]
+	if !ok || persisted.AccessToken != newAT || persisted.RefreshToken != "rotated-rt" {
+		t.Fatal("rotated credentials were not persisted")
+	}
+}
+
 func fixtureIdentityToken(user, nonce string) string {
 	b, _ := json.Marshal(map[string]any{"sub": user, "nonce": nonce, "exp": time.Now().Add(time.Hour).Unix()})
 	return "fixture." + base64.RawURLEncoding.EncodeToString(b) + ".fixture"

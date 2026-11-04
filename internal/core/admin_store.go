@@ -115,6 +115,57 @@ func (s *Postgres) AccountIDs(ctx context.Context, after string, limit int) ([]s
 	}
 	return ids, rows.Err()
 }
+func (s *Postgres) AccountIDsMatching(ctx context.Context, after string, limit int, search, status string) ([]string, error) {
+	rows, err := s.db.Query(ctx, `SELECT id FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%') AND ($3='' OR COALESCE(managed_enabled,(data->>'enabled')::boolean,false)=($3='enabled')) ORDER BY id LIMIT $4`, after, search, status, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+func (s *Postgres) AccountCountMatching(ctx context.Context, search, status string) (int, error) {
+	var count int
+	err := s.db.QueryRow(ctx, `SELECT count(*) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%') AND ($2='' OR COALESCE(managed_enabled,(data->>'enabled')::boolean,false)=($2='enabled'))`, search, status).Scan(&count)
+	return count, err
+}
+func (s *Postgres) DeleteManagedAccounts(ctx context.Context, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return []string{}, nil
+	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, "DELETE FROM core_accounts WHERE id=ANY($1) RETURNING id", ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	deleted := make([]string, 0, len(ids))
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		deleted = append(deleted, id)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return deleted, nil
+}
 func (s *Postgres) AccountCount(ctx context.Context) (int, error) {
 	var count int
 	err := s.db.QueryRow(ctx, "SELECT count(*) FROM core_accounts").Scan(&count)
@@ -142,7 +193,7 @@ func (s *Postgres) ListAdminJobs(ctx context.Context) ([]adminJob, error) {
 	return s.listAdminJobs(ctx, "SELECT data FROM core_admin_jobs ORDER BY created_at DESC,id DESC LIMIT 20")
 }
 func (s *Postgres) ListAccountJobs(ctx context.Context) ([]adminJob, error) {
-	return s.listAdminJobs(ctx, "SELECT data FROM core_admin_jobs WHERE kind IN ('import','push','verify') ORDER BY created_at DESC,id DESC LIMIT 20")
+	return s.listAdminJobs(ctx, "SELECT data FROM core_admin_jobs WHERE kind IN ('import','push','verify','delete') ORDER BY created_at DESC,id DESC LIMIT 20")
 }
 func (s *Postgres) latestCleanupJobs(ctx context.Context) ([]adminJob, error) {
 	return s.listAdminJobs(ctx, "SELECT DISTINCT ON (kind) data FROM core_admin_jobs WHERE kind IN ('cleanup_images','cleanup_logs') ORDER BY kind,created_at DESC,id DESC")

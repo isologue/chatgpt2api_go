@@ -51,12 +51,18 @@ type accountManager interface {
 	GetAdminJob(context.Context, string) (adminJob, error)
 	ListAdminJobs(context.Context) ([]adminJob, error)
 }
+type filteredAccountManager interface {
+	AccountIDsMatching(context.Context, string, int, string, string) ([]string, error)
+	AccountCountMatching(context.Context, string, string) (int, error)
+	DeleteManagedAccounts(context.Context, []string) ([]string, error)
+}
 
 func (a *API) registerAccountManagement(m *http.ServeMux) {
 	m.HandleFunc("POST /admin/accounts/import", a.admin(a.importAccounts))
 	a.registerAccountPush(m)
 	m.HandleFunc("GET /admin/accounts/export", a.admin(a.exportAccounts))
 	m.HandleFunc("POST /admin/accounts/verify", a.admin(a.verifyAccounts))
+	m.HandleFunc("POST /admin/accounts/delete", a.admin(a.deleteAccounts))
 	m.HandleFunc("PATCH /admin/accounts/{id}", a.admin(a.setAccountEnabled))
 	m.HandleFunc("DELETE /admin/accounts/{id}", a.admin(a.deleteAccount))
 	m.HandleFunc("GET /admin/jobs", a.admin(a.listAdminJobs))
@@ -119,6 +125,164 @@ func (a *API) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	a.Engine.Pool.Remove(id)
 	sendJSON(w, 200, map[string]any{"id": id, "deleted": true})
+}
+
+func validAccountSelection(search, status string) bool {
+	return len(search) <= 256 && (status == "" || status == "enabled" || status == "disabled")
+}
+
+func (a *API) deleteAccounts(w http.ResponseWriter, r *http.Request) {
+	s, ok := a.manager(w)
+	if !ok {
+		return
+	}
+	store, ok := a.Engine.Store.(filteredAccountManager)
+	if !ok {
+		sendError(w, Err(503, "management_unavailable", "存储不支持批量账号管理"))
+		return
+	}
+	var input struct {
+		IDs         []string `json:"ids"`
+		AllMatching bool     `json:"all_matching"`
+		Search      string   `json:"q"`
+		Status      string   `json:"status"`
+	}
+	if !decodeAdmin(w, r, &input, 4<<20) {
+		return
+	}
+	if input.AllMatching == (len(input.IDs) > 0) || len(input.IDs) > 10000 || !validAccountSelection(input.Search, input.Status) {
+		sendError(w, Err(400, "invalid_selection", "请选择账号，或指定 all_matching:true 及有效筛选条件"))
+		return
+	}
+	for _, id := range input.IDs {
+		if id == "" || len(id) > 256 {
+			sendError(w, Err(400, "invalid_account_id", "账号 ID 无效"))
+			return
+		}
+	}
+	if !a.Engine.deleteBusy.CompareAndSwap(false, true) {
+		sendError(w, Err(429, "deletion_busy", "已有批量删除任务正在执行"))
+		return
+	}
+	if a.Engine.verifyBusy.Load() {
+		a.Engine.deleteBusy.Store(false)
+		sendError(w, Err(429, "account_operation_busy", "账号校验任务正在执行，请稍后再删除"))
+		return
+	}
+	handed := false
+	defer func() {
+		if !handed {
+			a.Engine.deleteBusy.Store(false)
+		}
+	}()
+	ids := uniqueAccountIDs(input.IDs)
+	j := newAdminJob("delete")
+	j.Total = len(ids)
+	if input.AllMatching {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		total, err := store.AccountCountMatching(ctx, input.Search, input.Status)
+		cancel()
+		if err != nil {
+			managementError(w, err)
+			return
+		}
+		j.Total = total
+	}
+	handed = a.startAdminJob(w, r, s, j, func(j *adminJob) {
+		defer a.Engine.deleteBusy.Store(false)
+		cursor := ""
+		process := func(page []string) bool {
+			if len(page) == 0 {
+				return true
+			}
+			a.Engine.accountOps.Lock()
+			ctx, cancel := context.WithTimeout(a.Engine.root, 15*time.Second)
+			deleted, err := store.DeleteManagedAccounts(ctx, page)
+			cancel()
+			if err == nil {
+				for _, id := range deleted {
+					a.Engine.Pool.Remove(id)
+				}
+			}
+			a.Engine.accountOps.Unlock()
+			if err != nil {
+				for _, id := range page {
+					jobFailure(j, id, "", "删除账号失败")
+					j.Processed++
+				}
+				return false
+			}
+			j.Processed += len(page)
+			j.Succeeded += len(deleted)
+			deletedSet := make(map[string]struct{}, len(deleted))
+			for _, id := range deleted {
+				deletedSet[id] = struct{}{}
+			}
+			for _, id := range page {
+				if _, ok := deletedSet[id]; !ok {
+					jobFailure(j, id, "", "账号已不存在")
+				}
+			}
+			if j.Processed%100 == 0 && !a.saveJob(s, j) {
+				return false
+			}
+			return true
+		}
+		if !input.AllMatching {
+			for start := 0; start < len(ids); start += 100 {
+				end := min(start+100, len(ids))
+				if a.Engine.root.Err() != nil || !process(ids[start:end]) {
+					j.Status = "failed"
+					j.Message = "批量删除中断，已完成批次保留"
+					a.saveJob(s, j)
+					return
+				}
+			}
+		} else {
+			for {
+				ctx, cancel := context.WithTimeout(a.Engine.root, 5*time.Second)
+				page, err := store.AccountIDsMatching(ctx, cursor, 100, input.Search, input.Status)
+				cancel()
+				if err != nil {
+					j.Status = "failed"
+					j.Message = "读取筛选账号失败，已完成批次保留"
+					a.saveJob(s, j)
+					return
+				}
+				if len(page) == 0 {
+					break
+				}
+				cursor = page[len(page)-1]
+				if a.Engine.root.Err() != nil || !process(page) {
+					j.Status = "failed"
+					j.Message = "批量删除中断，已完成批次保留"
+					a.saveJob(s, j)
+					return
+				}
+			}
+		}
+		j.Status = "completed"
+		if j.Processed > j.Total {
+			j.Total = j.Processed
+		}
+		a.saveJob(s, j)
+	})
+}
+
+func uniqueAccountIDs(input []string) []string {
+	ids := make([]string, 0, len(input))
+	seen := make(map[string]struct{}, len(input))
+	for _, id := range input {
+		if id == "" || len(id) > 256 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
 }
 func (a *API) startAdminJob(w http.ResponseWriter, r *http.Request, s accountManager, j adminJob, run func(*adminJob)) bool {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -294,14 +458,22 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		IDs []string `json:"ids"`
-		All bool     `json:"all"`
+		IDs         []string `json:"ids"`
+		All         bool     `json:"all"`
+		AllMatching bool     `json:"all_matching"`
+		Search      string   `json:"q"`
+		Status      string   `json:"status"`
 	}
-	if !decodeAdmin(w, r, &input, 1<<20) {
+	if !decodeAdmin(w, r, &input, 4<<20) {
 		return
 	}
-	if input.All && len(input.IDs) > 0 || !input.All && len(input.IDs) == 0 {
-		sendError(w, Err(400, "invalid_selection", "请选择账号或指定 all:true"))
+	if input.All && (len(input.IDs) > 0 || input.AllMatching) || input.AllMatching && len(input.IDs) > 0 || !input.All && !input.AllMatching && len(input.IDs) == 0 || !validAccountSelection(input.Search, input.Status) || len(input.IDs) > 10000 {
+		sendError(w, Err(400, "invalid_selection", "请选择账号，或指定 all:true / all_matching:true 及有效筛选条件"))
+		return
+	}
+	store, ok := a.Engine.Store.(filteredAccountManager)
+	if (input.All || input.AllMatching) && !ok {
+		sendError(w, Err(503, "management_unavailable", "存储不支持账号筛选操作"))
 		return
 	}
 	n, ok := a.Engine.Generator.(*Native)
@@ -313,29 +485,39 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 		sendError(w, Err(429, "verification_busy", "已有手动校验任务正在执行"))
 		return
 	}
+	if a.Engine.deleteBusy.Load() {
+		a.Engine.verifyBusy.Store(false)
+		sendError(w, Err(429, "account_operation_busy", "批量删除任务正在执行，请稍后再校验"))
+		return
+	}
 	handed := false
 	defer func() {
 		if !handed {
 			a.Engine.verifyBusy.Store(false)
 		}
 	}()
-	ids := []string{}
-	seen := map[string]bool{}
 	for _, id := range input.IDs {
 		if id == "" || len(id) > 256 {
 			sendError(w, Err(400, "invalid_account_id", "账号 ID 无效"))
 			return
 		}
-		if !seen[id] {
-			seen[id] = true
-			ids = append(ids, id)
-		}
+	}
+	ids := uniqueAccountIDs(input.IDs)
+	if len(input.IDs) > 0 && len(ids) == 0 {
+		sendError(w, Err(400, "invalid_account_id", "账号 ID 无效"))
+		return
 	}
 	j := newAdminJob("verify")
 	j.Total = len(ids)
-	if input.All {
+	if input.All || input.AllMatching {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		total, err := s.AccountCount(ctx)
+		var total int
+		var err error
+		if input.All {
+			total, err = s.AccountCount(ctx)
+		} else {
+			total, err = store.AccountCountMatching(ctx, input.Search, input.Status)
+		}
 		cancel()
 		if err != nil {
 			managementError(w, err)
@@ -380,7 +562,7 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			defer close(tasks)
 			cursor := ""
-			if !input.All {
+			if !input.All && !input.AllMatching {
 				for _, id := range ids {
 					select {
 					case tasks <- id:
@@ -394,7 +576,13 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 			for {
 				ctx, cancel := context.WithTimeout(a.Engine.root, 5*time.Second)
-				page, err := s.AccountIDs(ctx, cursor, 100)
+				var page []string
+				var err error
+				if input.All {
+					page, err = s.AccountIDs(ctx, cursor, 100)
+				} else {
+					page, err = store.AccountIDsMatching(ctx, cursor, 100, input.Search, input.Status)
+				}
 				cancel()
 				if err != nil {
 					producerErr <- err

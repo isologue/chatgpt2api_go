@@ -216,13 +216,13 @@ func (n *Native) checkAccountWithGate(ctx context.Context, a Account, force bool
 			}
 		}
 		s := n.session(a)
-		defer s.close()
-		me, err := s.json(ctx, "GET", "/backend-api/me", nil, nil)
+		defer func() { s.close() }()
+		me, err := n.accountMetadataJSON(ctx, &a, &s, "GET", "/backend-api/me", nil)
 		if err != nil {
 			return nil, err
 		}
 		a = applyAccountInfo(a, me)
-		init, initErr := s.json(ctx, "POST", "/backend-api/conversation/init", map[string]any{"gizmo_id": nil, "requested_default_model": nil, "conversation_id": nil, "timezone_offset_min": -480}, nil)
+		init, initErr := n.accountMetadataJSON(ctx, &a, &s, "POST", "/backend-api/conversation/init", map[string]any{"gizmo_id": nil, "requested_default_model": nil, "conversation_id": nil, "timezone_offset_min": -480})
 		if initErr != nil {
 			code := AsError(initErr).Code
 			if code != "upstream_http_404" && code != "upstream_http_405" {
@@ -261,6 +261,35 @@ func (n *Native) checkAccountWithGate(ctx context.Context, a Account, force bool
 		return r.Val.(Account), nil
 	}
 }
+
+// accountMetadataJSON repairs one rejected access token with its refresh token, persists any
+// rotated credentials, then retries the original metadata request exactly once.
+func (n *Native) accountMetadataJSON(ctx context.Context, a *Account, s **session, method, path string, payload any) (map[string]any, error) {
+	data, err := (*s).json(ctx, method, path, payload, nil)
+	if AsError(err).Code != "account_token_invalid" {
+		return data, err
+	}
+	(*s).close()
+
+	refreshed, refreshErr := n.refreshToken(ctx, *a)
+	if refreshErr != nil {
+		return nil, refreshErr
+	}
+	if refreshed.AccessToken == a.AccessToken {
+		return nil, err
+	}
+	refreshed = n.pool.UpdateCredentials(refreshed)
+	if refreshed.ID == "" {
+		return nil, Err(409, "account_removed", "账号已删除")
+	}
+	if err := n.store.SaveAccount(ctx, refreshed); err != nil {
+		return nil, Err(503, "token_persistence_failed", "更新账号令牌后持久化失败")
+	}
+	*a = refreshed
+	*s = n.session(refreshed)
+	return (*s).json(ctx, method, path, payload, nil)
+}
+
 func maxTime(a, b time.Time) time.Time {
 	if a.After(b) {
 		return a
