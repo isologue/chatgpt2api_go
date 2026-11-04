@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/base64"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -27,7 +28,25 @@ func (a *Account) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
-var accountKeys = []string{"revision", "id", "identity_id", "email", "access_token", "refresh_token", "client_id", "device_id", "user_agent", "score", "enabled", "verified_at", "success_at", "available_at", "last_used_at", "last_refresh_at", "last_refresh_error", "hot", "hot_since", "quota", "quota_reset_at", "status", "last_error_code", "next_refresh_at", "refresh_failures"}
+var accountKeys = []string{"revision", "id", "identity_id", "email", "access_token", "refresh_token", "id_token", "client_id", "device_id", "user_agent", "score", "enabled", "verified_at", "success_at", "available_at", "last_used_at", "last_refresh_at", "last_refresh_error", "last_token_refresh_at", "last_token_refresh_error", "last_token_refresh_error_at", "hot", "hot_since", "quota", "quota_reset_at", "status", "last_error_code", "next_refresh_at", "refresh_failures"}
+var terminalRefreshErrorPattern = regexp.MustCompile(`\brefresh[\s_-]*token\b.{0,24}\b(?:is|has\s+been|was)?\s*(?:expired|revoked|invalid|reused)\b|\b(?:expired|revoked|invalid|reused)\s+refresh[\s_-]*token\b`)
+
+func refreshTokenStatus(hasToken bool, lastSuccess time.Time, lastError string, lastErrorAt time.Time) string {
+	if !hasToken {
+		return "missing"
+	}
+	if strings.TrimSpace(lastError) != "" && (lastSuccess.IsZero() || lastErrorAt.IsZero() || lastErrorAt.After(lastSuccess)) {
+		errorCode := strings.ToLower(lastError)
+		if strings.Contains(errorCode, "invalid_grant") || strings.Contains(errorCode, "invalid_refresh_token") || strings.Contains(errorCode, "refresh_token_reused") || strings.Contains(errorCode, "refresh_token_expired") || strings.Contains(errorCode, "refresh_token_revoked") || strings.Contains(errorCode, "refresh_token_invalid") || terminalRefreshErrorPattern.MatchString(errorCode) {
+			return "invalid"
+		}
+		return "pending"
+	}
+	if !lastSuccess.IsZero() {
+		return "valid"
+	}
+	return "unverified"
+}
 
 func (a Account) MarshalJSON() ([]byte, error) {
 	type plain Account
@@ -84,9 +103,61 @@ func applyAccountInfo(a Account, me map[string]any) Account {
 	if identity := accountIdentity(a.AccessToken); identity != "" {
 		a.IdentityID = identity
 	}
+	setAccountExtra(&a, "user_id", me["id"])
 	return a
 }
+
+// applyDefaultAccountInfo mirrors the legacy account check response while
+// keeping the fields in Extra so imports and exports remain forward-compatible.
+func applyDefaultAccountInfo(a Account, payload map[string]any) Account {
+	accounts := obj(payload["accounts"])
+	defaultAccount := obj(accounts["default"])
+	details := obj(defaultAccount["account"])
+	plan := str(details["plan_type"])
+	if plan == "" {
+		plan = "free"
+	}
+	for _, key := range []string{"plan_type", "type", "account_type", "chatgpt_plan_type"} {
+		setAccountExtra(&a, key, plan)
+	}
+	for _, key := range []string{"account_id", "account_user_role", "is_deactivated"} {
+		setAccountExtra(&a, key, details[key])
+	}
+	setAccountExtra(&a, "entitlement", defaultAccount["entitlement"])
+	return a
+}
+
+func setAccountExtra(a *Account, key string, value any) {
+	if a.Extra == nil {
+		a.Extra = map[string]json.RawMessage{}
+	}
+	if value == nil {
+		a.Extra[key] = json.RawMessage("null")
+		return
+	}
+	raw, err := json.Marshal(value)
+	if err == nil {
+		a.Extra[key] = raw
+	}
+}
+
+func cloneAccountExtra(extra map[string]json.RawMessage) map[string]json.RawMessage {
+	if extra == nil {
+		return nil
+	}
+	copy := make(map[string]json.RawMessage, len(extra))
+	for key, value := range extra {
+		copy[key] = append(json.RawMessage(nil), value...)
+	}
+	return copy
+}
+
 func applyQuotaInfo(a Account, init map[string]any) Account {
+	// A successful check with no usable image_gen entry must never retain an
+	// older quota snapshot. Treat missing or malformed quota as exhausted.
+	zero := float64(0)
+	a.Quota = &zero
+	a.QuotaResetAt = time.Time{}
 	limits, _ := init["limits_progress"].([]any)
 	for _, v := range limits {
 		item := obj(v)
@@ -95,7 +166,7 @@ func applyQuotaInfo(a Account, init map[string]any) Account {
 		}
 		remaining, ok := item["remaining"].(float64)
 		if !ok || remaining < 0 {
-			continue
+			return a
 		}
 		a.Quota = &remaining
 		a.QuotaResetAt = time.Time{}

@@ -245,7 +245,7 @@ func TestIndependentRefreshLanesShareOnlySameAccount(t *testing.T) {
 func TestMetadataUnauthorizedRefreshesAndPersistsRotatedTokens(t *testing.T) {
 	oldAT := fixtureIdentityToken("user-1", "old")
 	newAT := fixtureIdentityToken("user-1", "new")
-	var refreshCalls, oldTokenCalls, newTokenCalls atomic.Int64
+	var refreshCalls, oldTokenCalls, newTokenCalls, accountInfoCalls atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/oauth/token":
@@ -253,7 +253,7 @@ func TestMetadataUnauthorizedRefreshesAndPersistsRotatedTokens(t *testing.T) {
 			if err := r.ParseForm(); err != nil || r.Form.Get("refresh_token") != "old-rt" {
 				t.Errorf("refresh used unexpected RT: %v", err)
 			}
-			sendJSON(w, 200, map[string]any{"access_token": newAT, "refresh_token": "rotated-rt"})
+			sendJSON(w, 200, map[string]any{"access_token": newAT, "refresh_token": "rotated-rt", "id_token": "rotated-id-token"})
 		case "/backend-api/me":
 			switch strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") {
 			case oldAT:
@@ -268,6 +268,9 @@ func TestMetadataUnauthorizedRefreshesAndPersistsRotatedTokens(t *testing.T) {
 			}
 		case "/backend-api/conversation/init":
 			sendJSON(w, 200, map[string]any{"limits_progress": []any{map[string]any{"feature_name": "image_gen", "remaining": 8}}})
+		case "/backend-api/accounts/check/v4-2023-04-27":
+			accountInfoCalls.Add(1)
+			sendJSON(w, 200, map[string]any{"accounts": map[string]any{"default": map[string]any{"account": map[string]any{"plan_type": "plus", "account_id": "acct-1", "account_user_role": "owner", "is_deactivated": false}, "entitlement": map[string]any{"has_active_subscription": true}}}})
 		default:
 			t.Errorf("unexpected path %q", r.URL.Path)
 			http.NotFound(w, r)
@@ -281,6 +284,7 @@ func TestMetadataUnauthorizedRefreshesAndPersistsRotatedTokens(t *testing.T) {
 	a := testAccounts(1)[0]
 	a.AccessToken = oldAT
 	a.RefreshToken = "old-rt"
+	a.IDToken = "old-id-token"
 	a.VerifiedAt = time.Time{}
 	a.SuccessAt = time.Time{}
 	store := newMemoryStore()
@@ -296,15 +300,69 @@ func TestMetadataUnauthorizedRefreshesAndPersistsRotatedTokens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("check account after refresh: %v", err)
 	}
-	if got.AccessToken != newAT || got.RefreshToken != "rotated-rt" || got.Status != "available" {
+	if got.AccessToken != newAT || got.RefreshToken != "rotated-rt" || got.IDToken != "rotated-id-token" || got.Status != "available" || got.LastTokenRefreshAt.IsZero() || got.LastTokenRefreshError != "" {
 		t.Fatalf("refreshed credentials/state not returned: status=%q", got.Status)
 	}
-	if refreshCalls.Load() != 1 || oldTokenCalls.Load() != 1 || newTokenCalls.Load() != 1 {
-		t.Fatalf("unexpected retry counts: refresh=%d old=%d new=%d", refreshCalls.Load(), oldTokenCalls.Load(), newTokenCalls.Load())
+	if refreshCalls.Load() != 1 || oldTokenCalls.Load() != 1 || newTokenCalls.Load() != 1 || accountInfoCalls.Load() != 1 {
+		t.Fatalf("unexpected retry counts: refresh=%d old=%d new=%d account_info=%d", refreshCalls.Load(), oldTokenCalls.Load(), newTokenCalls.Load(), accountInfoCalls.Load())
+	}
+	if got.Extra["plan_type"] == nil || string(got.Extra["plan_type"]) != `"plus"` || string(got.Extra["account_id"]) != `"acct-1"` {
+		t.Fatalf("account check details were not saved: %#v", got.Extra)
+	}
+	metrics := n.Snapshot()
+	if metrics["access_token_refresh_succeeded"] != int64(1) || metrics["access_token_refresh_failed"] != int64(0) || metrics["access_token_refresh_active"] != int64(0) {
+		t.Fatalf("unexpected AT refresh metrics: %#v", metrics)
+	}
+	if metrics["account_info_refresh_active"] != int64(0) {
+		t.Fatalf("account info refresh remained active: %#v", metrics)
 	}
 	persisted, ok := store.accounts[a.ID]
-	if !ok || persisted.AccessToken != newAT || persisted.RefreshToken != "rotated-rt" {
+	if !ok || persisted.AccessToken != newAT || persisted.RefreshToken != "rotated-rt" || persisted.IDToken != "rotated-id-token" {
 		t.Fatal("rotated credentials were not persisted")
+	}
+}
+
+func TestApplyQuotaInfoClearsStaleQuotaWhenImageLimitMissing(t *testing.T) {
+	old := 17.0
+	a := testAccounts(1)[0]
+	a.Quota = &old
+	a.QuotaResetAt = time.Now().Add(time.Hour)
+	a = applyQuotaInfo(a, map[string]any{"limits_progress": []any{map[string]any{"feature_name": "message", "remaining": 99.0}}})
+	if a.Quota == nil || *a.Quota != 0 || !a.QuotaResetAt.IsZero() {
+		t.Fatalf("stale quota was retained: quota=%v reset=%v", a.Quota, a.QuotaResetAt)
+	}
+
+	bad := 23.0
+	a.Quota = &bad
+	a.QuotaResetAt = time.Now().Add(time.Hour)
+	a = applyQuotaInfo(a, map[string]any{"limits_progress": []any{map[string]any{"feature_name": "image_gen", "remaining": "not-a-number"}}})
+	if a.Quota == nil || *a.Quota != 0 || !a.QuotaResetAt.IsZero() {
+		t.Fatalf("malformed quota was retained: quota=%v reset=%v", a.Quota, a.QuotaResetAt)
+	}
+}
+
+func TestRefreshTokenStatusMatchesLegacyRules(t *testing.T) {
+	now := time.Now().UTC()
+	tests := []struct {
+		name      string
+		hasToken  bool
+		lastOK    time.Time
+		lastError string
+		errorAt   time.Time
+		want      string
+	}{
+		{name: "missing", want: "missing"},
+		{name: "unverified", hasToken: true, want: "unverified"},
+		{name: "valid after refresh", hasToken: true, lastOK: now, lastError: "invalid_grant", errorAt: now.Add(-time.Minute), want: "valid"},
+		{name: "transient refresh failure", hasToken: true, lastOK: now.Add(-time.Hour), lastError: "upstream_timeout", errorAt: now, want: "pending"},
+		{name: "terminal refresh failure", hasToken: true, lastError: "invalid_grant", errorAt: now, want: "invalid"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := refreshTokenStatus(test.hasToken, test.lastOK, test.lastError, test.errorAt); got != test.want {
+				t.Fatalf("refreshTokenStatus() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

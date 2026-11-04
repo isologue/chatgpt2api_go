@@ -421,6 +421,8 @@ func (e *Engine) generate(ctx context.Context, r Request) (*Generation, []Attemp
 			at := Attempt{AccountID: a.ID, Email: a.Email, Started: start, DurationMS: time.Since(start).Milliseconds(), Stages: stages, TotalBudgetExemptReason: imageBudgetExemptReason(ctx)}
 			if ae != nil {
 				at.Code = ae.Code
+				at.RawResponse = string(ae.rawResponse)
+				at.RawResponseTruncated = ae.rawResponseTruncated
 			}
 			attempts = append(attempts, at)
 			snapshot := e.Pool.Release(a.ID, ae)

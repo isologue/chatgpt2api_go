@@ -77,16 +77,23 @@ func (e *Engine) accountMaintenanceLoop(n *Native, lane string) {
 	defer ticker.Stop()
 	cursor := 0
 	var page []Account
+	source := map[string]string{"hot": "hot_maintenance", "cold": "cold_maintenance", "replenish": "replenishment"}[lane]
+	cycle := false
+	scanDone := false
 	for {
 		if e.root.Err() != nil {
 			return
 		}
 		cfg := e.CurrentConfig()
 		if len(pending) < cfg.VerifyConcurrency {
-			if len(page) == 0 {
+			if len(page) == 0 && !scanDone {
 				var next int
-				page, next, _ = e.Pool.MaintenancePage(cursor, 512)
+				var done bool
+				page, next, done = e.Pool.MaintenancePage(cursor, 512)
 				cursor = next
+				if done {
+					scanDone = true
+				}
 			}
 			for len(page) > 0 && len(pending) < cfg.VerifyConcurrency {
 				a := page[0]
@@ -100,12 +107,17 @@ func (e *Engine) accountMaintenanceLoop(n *Native, lane string) {
 				if pending[a.ID] || !maintenanceDue(a, cfg, lane, time.Now()) {
 					continue
 				}
+				if !cycle {
+					n.refreshRuns.begin(source, "account_info", 0)
+					cycle = true
+				}
 				pending[a.ID] = true
 				workers.Add(1)
 				go func(a Account) {
 					defer workers.Done()
 					ctx, cancel := context.WithTimeout(e.root, 3*cfg.MetadataTimeout)
 					defer cancel()
+					ctx = context.WithValue(ctx, refreshSourceContextKey{}, source)
 					_, _ = n.checkAccountWithGate(ctx, a, true, gate, nil, lane)
 					select {
 					case done <- a.ID:
@@ -120,6 +132,13 @@ func (e *Engine) accountMaintenanceLoop(n *Native, lane string) {
 		case id := <-done:
 			delete(pending, id)
 		case <-ticker.C:
+		}
+		if scanDone && len(page) == 0 && len(pending) == 0 {
+			if cycle {
+				n.endRefreshRun(source, "completed")
+				cycle = false
+			}
+			scanDone = false
 		}
 	}
 }

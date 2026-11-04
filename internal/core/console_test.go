@@ -72,7 +72,7 @@ func TestConsoleRoutesAndConfiguration(t *testing.T) {
 			t.Errorf("invalid query accepted: %s status=%d", path, w.Code)
 		}
 	}
-	for _, path := range []string{"/admin/", "/admin/app.css", "/admin/app.js"} {
+ for _, path := range []string{"/admin/", "/admin/app.css", "/admin/app.js", "/admin/auth.css"} {
 		req := httptest.NewRequest("GET", path, nil)
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, req)

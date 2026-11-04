@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -17,7 +18,7 @@ func (s *Postgres) ConsoleAccounts(ctx context.Context, q consoleQuery) (map[str
 			return nil, err
 		}
 	}
-	rows, err := s.db.Query(ctx, `SELECT id, COALESCE(data->>'email',''), COALESCE((data->>'score')::int,0), COALESCE(managed_enabled,(data->>'enabled')::boolean,false), right(COALESCE(data->>'access_token',''),6), COALESCE(data->>'refresh_token','')<>'', data->>'verified_at', data->>'success_at', data->>'available_at',jsonb_build_object('hot',COALESCE((data->>'hot')::boolean,false),'quota',data->'quota','quota_reset_at',data->'quota_reset_at','status',data->'status','last_refresh_at',data->'last_refresh_at','last_refresh_error',data->'last_refresh_error','next_refresh_at',data->'next_refresh_at') FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%') AND ($3='' OR COALESCE(managed_enabled,(data->>'enabled')::boolean,false)=($3='enabled')) ORDER BY id LIMIT $4`, cursor, q.Search, q.Status, q.Limit+1)
+	rows, err := s.db.Query(ctx, `SELECT id, COALESCE(data->>'email',''), COALESCE((data->>'score')::int,0), COALESCE(managed_enabled,(data->>'enabled')::boolean,false), right(COALESCE(data->>'access_token',''),6), COALESCE(data->>'refresh_token','')<>'', data->>'verified_at', data->>'success_at', data->>'available_at',jsonb_build_object('hot',COALESCE((data->>'hot')::boolean,false),'quota',data->'quota','quota_reset_at',data->'quota_reset_at','status',data->'status','last_refresh_at',data->'last_refresh_at','last_refresh_error',data->'last_refresh_error','next_refresh_at',data->'next_refresh_at','last_token_refresh_at',data->'last_token_refresh_at','last_token_refresh_error',data->'last_token_refresh_error','last_token_refresh_error_at',data->'last_token_refresh_error_at') FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%') AND ($3='' OR COALESCE(managed_enabled,(data->>'enabled')::boolean,false)=($3='enabled')) ORDER BY id LIMIT $4`, cursor, q.Search, q.Status, q.Limit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -45,12 +46,25 @@ func (s *Postgres) ConsoleAccounts(ctx context.Context, q consoleQuery) (map[str
 		for k, v := range fields {
 			item[k] = v
 		}
+		item["refresh_token_status"] = refreshTokenStatus(rt, consoleAccountTime(fields["last_token_refresh_at"]), str(fields["last_token_refresh_error"]), consoleAccountTime(fields["last_token_refresh_error_at"]))
 		items = append(items, item)
 	}
 	if rows.Err() != nil {
 		return nil, rows.Err()
 	}
 	return map[string]any{"items": items, "next_cursor": next}, nil
+}
+
+func consoleAccountTime(value any) time.Time {
+	text, ok := value.(string)
+	if !ok || strings.TrimSpace(text) == "" {
+		return time.Time{}
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, text)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
 }
 
 type requestCursor struct {

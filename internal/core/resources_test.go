@@ -423,16 +423,23 @@ func TestPostgresResourceJobScopesAndActiveImages(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	refreshAT := newAdminJob("refresh_at")
+	if err := s.SaveAdminJob(ctx, refreshAT); err != nil {
+		t.Fatal(err)
+	}
 	accountJobs, err := s.ListAccountJobs(ctx)
 	if err != nil || len(accountJobs) != 20 {
 		t.Fatal("account jobs", len(accountJobs), err)
+	}
+	if accountJobs[0].ID != refreshAT.ID || accountJobs[0].Kind != "refresh_at" {
+		t.Fatal("AT refresh job missing from account job polling", accountJobs[0])
 	}
 	latest, err := s.latestCleanupJobs(ctx)
 	if err != nil || len(latest) != 1 || latest[0].ID != cleanup.ID {
 		t.Fatal("cleanup hidden by account jobs", latest, err)
 	}
 	w := requestJSON(t, NewHandler(e), "GET", "/admin/jobs?scope=accounts", "", e.Config.AdminKey)
-	if w.Code != 200 || strings.Contains(w.Body.String(), "cleanup_images") {
+	if w.Code != 200 || strings.Contains(w.Body.String(), "cleanup_images") || !strings.Contains(w.Body.String(), refreshAT.ID) {
 		t.Fatal("job scope", w.Code, w.Body.String())
 	}
 	old := time.Now().Add(-48 * time.Hour)

@@ -8,8 +8,11 @@ const date = value => !value || !Number.isFinite(new Date(value).getTime()) || n
 const duration = ms => ms == null ? '—' : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 const titles = {overview:'运行概览',accounts:'账号池',logs:'调用日志',images:'图片管理',settings:'系统设置'};
 const groups = {proxy:['代理设置','统一配置上游连接方式，支持批量代理与连通测试。'],textfiles:['聊天与文件生成','独立并发与预算，共享账号槽位及下载资源。'],webdav:['WebDAV 图床','图片生成后上传至 WebDAV，并返回公开访问地址。'],concurrency:['图片生成并发','从任务执行、图片下载到解码和返回，分别控制。'],accounts:['账号校验','控制账号校验速度，以及可用性信息的复用时间。'],timeouts:['超时与重试','明确等待边界，兼顾成功率与请求耗时。'],output:['结果与存储','控制结果返回、图片大小和数据库连接占用。'],access:['访问与密钥','保持管理员登录，管理用于图片接口的调用密钥。']};
-const state = {page:'overview',group:'concurrency',demo:false,connected:false,sessionVersion:0,metrics:null,settings:[],limits:[],draft:{},saved:'',samples:[],fetching:false,timer:null,toastTimer:null,lists:{accounts:{cursors:[''],page:0,next:'',items:[],version:0,filters:null},logs:{cursors:[''],page:0,next:'',items:[],version:0}}};
+const notificationStorageKey='core-admin-notifications-v1';
+const savedNotifications=(()=>{try{return JSON.parse(localStorage.getItem(notificationStorageKey)||'{}');}catch{return {};}})();
+const state = {page:'overview',group:'concurrency',demo:false,connected:false,sessionVersion:0,metrics:null,settings:[],limits:[],draft:{},saved:'',samples:[],fetching:false,timer:null,toastTimer:null,jobs:[],notificationRead:new Set(savedNotifications.read||[]),notificationStatuses:savedNotifications.statuses||{},lists:{accounts:{cursors:[''],page:0,next:'',items:[],version:0,filters:null},logs:{cursors:[''],page:0,next:'',items:[],version:0}}};
 const accountSelection={ids:new Set(),allMatching:false,query:null};
+let activeRequestDetail=null;
 
 
 const storageState={version:0,busy:false,policies:{},jobs:{},timer:null};
@@ -37,12 +40,12 @@ function toast(message) {
 function setText(id,text) { $(`#${id}`).textContent = text; }
 function showConnection(){
  if(state.connected){showDetail('<h2>管理员已登录</h2><p>刷新页面会保持登录。在其他浏览器登录后，此处的会话会失效。</p><button class="button" id="manage-access">访问与密钥</button><button class="button" id="session-logout">退出登录</button>','ADMIN SESSION');$('#manage-access').onclick=()=>{$('#detail-dialog').close();navigate('settings');selectGroup('access');};$('#session-logout').onclick=logoutAdmin;return;}
+ document.body.classList.add('auth-required');
  $('#connect-error').textContent='';if(!$('#connect-dialog').open)$('#connect-dialog').showModal();
 }
 function updateConnectionUI(error = '') {
   const active = Boolean(state.connected || state.demo);
   document.body.classList.toggle('connected',active && !error);
-  $('#demo-notice').classList.toggle('hidden',!state.demo);
   $('#mode-badge').textContent = error ? '连接异常' : state.demo ? '界面演示' : state.connected ? '实时连接' : '尚未连接';
   $('#mode-badge').className = `badge ${error ? 'failed' : state.demo ? 'safety' : state.connected ? 'success' : 'neutral'}`;
   setText('service-state',error ? '连接中断 · 正在显示上次数据' : state.demo ? '界面演示 · 示例数据' : state.connected ? '服务已连接' : '等待连接服务');
@@ -50,6 +53,7 @@ function updateConnectionUI(error = '') {
   $('#footer-dot').style.background = error ? 'var(--coral)' : active ? 'var(--mint)' : '#acafa5';
   $('#connection-error').classList.toggle('hidden',!error);
   $('#connection-error').textContent=error;
+  $('#notification-area').classList.toggle('hidden',!state.connected);
 }
 function navigate(page, updateURL = true) {
   if (!titles[page]) page = 'overview';
@@ -63,7 +67,6 @@ function navigate(page, updateURL = true) {
   if(page === 'settings') renderSettings();
  if(page==='images')loadImages();
  clearTimeout(storageState.timer);if(page==='images'||page==='logs')loadStorage(true);
- if(page==='accounts')refreshJobs();
 }
 function metricSnapshot() {
   const tick=Math.floor(Date.now()/5000);
@@ -84,8 +87,22 @@ function renderMetrics(m) {
   const caps=[['任务执行',m.active_requests,m.worker_limit,'var(--coral)'],['图片下载',u.download_active,u.download_limit,'var(--purple)'],['图片解码',u.validation_active,u.validation_limit,'var(--mint)'],['前台校验',u.verification_active,u.verification_limit,'var(--amber)'],['手动校验',u.manual_verification_active,u.manual_verification_limit,'var(--mint)'],['热池补充',u.replenishment_active,u.replenishment_limit,'var(--coral)'],['热池维护',u.hot_maintenance_active,u.hot_maintenance_limit,'var(--amber)'],['冷池维护',u.cold_maintenance_active,u.cold_maintenance_limit,'var(--purple)'],['结果返回',m.response_active,m.response_limit,'var(--purple)'],['PoW 计算',u.pow_active,u.pow_limit,'var(--amber)'],['缩略图生成',t.active,t.limit,'var(--mint)'],['日志写入',m.log_active,m.log_writers,'var(--coral)'],['WebDAV 上传',d.active,d.limit,'var(--mint)']];
   $('#capacity-list').innerHTML=caps.map(([label,active,limit],i)=>`<div class="capacity-item"><div class="capacity-caption"><span>${label} <small>等待 ${count(waits[i])}</small></span><strong>${count(active)} <small>/ ${count(limit)}</small></strong></div><div class="capacity-track"><div class="capacity-fill" data-bar="${i}"></div></div></div>`).join('');
   caps.forEach(([,active,limit,color],i)=>{const bar=$(`[data-bar="${i}"]`);bar.style.width=`${Math.min(100,Math.max(0,100*(active||0)/(limit||1)))}%`;bar.style.background=color;});
-  $('#account-summary').innerHTML=`<span class="summary-chip">账号总数 <strong>${count(p.total_accounts)}</strong></span><span class="summary-chip"><i class="status-dot"></i>已启用 <strong>${count(p.enabled_accounts)}</strong></span><span class="summary-chip">已停用 <strong>${count(p.disabled_accounts)}</strong></span><span class="summary-chip">热池 <strong>${count(p.hot_accounts)}</strong></span><span class="summary-chip">冷池 <strong>${count(p.cold_accounts)}</strong></span><span class="summary-chip">刷新成功 / 失败 <strong>${count(u.account_refresh_succeeded)} / ${count(u.account_refresh_failed)}</strong></span><span class="summary-chip">空闲槽位 <strong>${count(p.available_slots)}</strong></span>`;
+  $('#account-summary').innerHTML=`<span class="summary-chip">账号总数 <strong>${count(p.total_accounts)}</strong></span><span class="summary-chip"><i class="status-dot"></i>已启用 <strong>${count(p.enabled_accounts)}</strong></span><span class="summary-chip">已停用 <strong>${count(p.disabled_accounts)}</strong></span><span class="summary-chip">热池 <strong>${count(p.hot_accounts)}</strong></span><span class="summary-chip">冷池 <strong>${count(p.cold_accounts)}</strong></span><span class="summary-chip">额度刷新 成功 / 失败 / 进行中 <strong>${count(u.account_info_refresh_succeeded??u.account_refresh_succeeded)} / ${count(u.account_info_refresh_failed??u.account_refresh_failed)} / ${count(u.account_info_refresh_active)}</strong></span><span class="summary-chip">AT 刷新 成功 / 失败 / 进行中 <strong>${count(u.access_token_refresh_succeeded)} / ${count(u.access_token_refresh_failed)} / ${count(u.access_token_refresh_active)}</strong></span><span class="summary-chip">空闲槽位 <strong>${count(p.available_slots)}</strong></span>`;
   drawChart();
+  renderAccountRefreshRuns(m.account_refresh_runs||[]);
+  $$("#account-summary .summary-chip").forEach((chip,index)=>{if(index===5||index===6)chip.remove();});
+}
+function renderAccountRefreshRuns(runs){
+ const host=$("#account-refresh-runs");if(!host)return;
+ const labels={hot_maintenance:"热池维护",cold_maintenance:"冷池维护",replenishment:"热池补充",manual_quota:"手动刷新额度",manual_at:"手动刷新 AT"};
+ const status={running:"进行中",completed:"已完成",interrupted:"已中断",never:"尚无记录"};
+ host.innerHTML=(runs||[]).map(run=>{
+  const live=run.status==='running',hasRun=run.status!=='never';
+  const when=hasRun?date(run.started_at)+(live?' · 已运行 '+duration(Date.now()-new Date(run.started_at).getTime()):' → '+date(run.finished_at)):'尚无刷新记录';
+  const progress=run.total?Math.min(100,Math.round(100*run.processed/run.total)):0;
+  const errors=(run.errors||[]).length?'<details class="refresh-errors"><summary>失败明细 '+count(run.failed)+'（最多展示 100 条）</summary>'+run.errors.map(item=>'<div class="job-error-item"><strong>'+escapeHTML(item.email||item.account_id||'账号')+'</strong><br>'+escapeHTML(item.message)+'</div>').join('')+'</details>':'';
+  return '<div class="refresh-run '+(live?'is-running':'')+'"><div class="refresh-run-heading"><strong>'+escapeHTML(labels[run.source]||run.source_label||run.source)+'</strong><span class="badge '+(live?'success':run.status==='interrupted'?'failed':'neutral')+'">'+escapeHTML(status[run.status]||run.status)+'</span></div><div class="refresh-run-meta">'+escapeHTML(when)+' · '+escapeHTML(run.kind_label||'额度刷新')+'</div><div class="refresh-run-stats"><span>目标 <b>'+(hasRun?count(run.total):'—')+'</b></span><span>已处理 <b>'+(hasRun?count(run.processed):'—')+'</b></span><span>成功 <b>'+(hasRun?count(run.succeeded):'—')+'</b></span><span>失败 <b>'+(hasRun?count(run.failed):'—')+'</b></span><span>执行中 <b>'+(hasRun?count(run.active):'—')+'</b></span><span>热池账号 <b>'+(hasRun?count(run.hot_accounts):'—')+'</b></span><span>冷池账号 <b>'+(hasRun?count(run.cold_accounts):'—')+'</b></span></div>'+(live?'<progress max="100" value="'+progress+'" aria-label="刷新进度"></progress>':'')+'<div class="refresh-token-stats">RT 刷新：成功 '+(hasRun?count(run.token_refresh_succeeded):'—')+' · 失败 '+(hasRun?count(run.token_refresh_failed):'—')+'</div>'+errors+'</div>';
+ }).join('')||'<div class="empty-cell">尚无账号刷新记录</div>';
 }
 function drawChart() {
   const samples=state.samples;
@@ -157,7 +174,7 @@ function renderSettings(){
   const [title,description]=groups[state.group];setText('settings-group-title',title);setText('settings-group-description',description);
   $$('[data-group]').forEach(el=>{el.classList.toggle('active',el.dataset.group===state.group);const total=state.settings.filter(s=>s.group===el.dataset.group).length;if(total)$('span',el).textContent=String(total).padStart(2,'0');});
   const access=state.group==='access',webdav=state.group==='webdav',proxy=state.group==='proxy',custom=access||webdav||proxy;$('#proxy-panel').classList.toggle('hidden',!proxy);$('.settings-panel').classList.toggle('hidden',custom);$('.fixed-limits').classList.toggle('hidden',custom);$('.settings-savebar').classList.toggle('hidden',custom);$('#access-panel').classList.toggle('hidden',!access);$('#webdav-panel').classList.toggle('hidden',!webdav);$('#reset-settings').classList.toggle('hidden',custom);if(access){renderAccess();return;}if(webdav){renderWebDAV();return;}if(proxy){renderProxy();return;}
-  if(!state.settings.length){$('#settings-fields').innerHTML='<div class="empty-cell">连接服务或打开界面演示后查看配置。</div>';return;}
+  if(!state.settings.length){$('#settings-fields').innerHTML='<div class="empty-cell">登录后查看配置。</div>';return;}
   const labels=Object.fromEntries(state.settings.map(s=>[s.key,s.label]));
   $('#settings-fields').innerHTML=state.settings.filter(s=>s.group===state.group).map(s=>{
     const value=state.draft[s.key];
@@ -168,20 +185,15 @@ function renderSettings(){
   updateDraftStatus();
 }
 function envText(){return ['# Image Core 配置导出','# 将这些项合并到现有 .env；保留原有数据库地址和密钥。','# 服务端保存的同名设置优先于环境变量。','',...state.settings.flatMap(s=>[`# ${s.label}：${s.description}`,`${s.key}=${state.draft[s.key]}${s.unit==='秒'?'s':''}`,''])].join('\n');}
-function activateDemo(){
- clearTimeout(state.jobsTimer);
-  state.connected=false;state.demo=true;state.samples=Array.from({length:40},(_,i)=>({time:Date.now()-(39-i)*5000,active:210+Math.round(50*Math.sin(i*.19)+27*Math.sin(i*.63))+i*2,waiting:Math.max(0,16+Math.round(10*Math.sin(i*.41)))}));
-  $('#admin-key').value='';$('#connect-dialog').close();installSettings(demoSettings());resetLists();updateConnectionUI();refreshMetrics();navigate(state.page);resetTimer();
-}
 function resetLists(){resetAccountSelection();storageState.version++;storageState.busy=false;storageState.policies={};storageState.jobs={};imageState.version++;imageState.cursors=[''];imageState.page=0;imageState.next='';for(const kind of ['images','logs'])delete $('#'+kind+'-retention-form').dataset.dirty;for(const list of Object.values(state.lists)){list.cursors=[''];list.page=0;list.next='';list.items=[];list.version++;}}
-function demoAccount(i){return {id:`acc_${String(i+1).padStart(5,'0')}`,email:`studio.${['willow','atlas','olive','amber','nova','luna','cedar','moss'][i%8]}${i+1}@example.com`,score:Math.max(25,100-(i*7)%76),enabled:i%9!==8,token_tail:['Hk9mQ2','8vR3nP','d6BxW1','4zL7aE'][i%4],has_refresh_token:i%4!==0,verified_at:new Date(Date.now()-(i+1)*76000).toISOString(),success_at:new Date(Date.now()-(i+1)*121000).toISOString()};}
+function demoAccount(i){return {id:`acc_${String(i+1).padStart(5,'0')}`,email:`studio.${['willow','atlas','olive','amber','nova','luna','cedar','moss'][i%8]}${i+1}@example.com`,score:Math.max(25,100-(i*7)%76),enabled:i%9!==8,token_tail:['Hk9mQ2','8vR3nP','d6BxW1','4zL7aE'][i%4],has_refresh_token:i%4!==0,refresh_token_status:i%4===0?'missing':i%4===1?'valid':i%4===2?'unverified':'invalid',verified_at:new Date(Date.now()-(i+1)*76000).toISOString(),success_at:new Date(Date.now()-(i+1)*121000).toISOString()};}
 function demoRequest(i){return {id:`task_${['a4f90c','b3e78d','c6a21f','d9b42e'][i%4]}${String(1042+i)}7b82`,created_at:new Date(Date.now()-(i+1)*117000).toISOString(),model:'gpt-image-2',is_async:i%3===1,response_format:i%5===3?'b64_json':'url',status:i%17===9?'failed':i%13===6?'safety_rejected':'succeeded',duration_ms:Math.round((25+17*Math.abs(Math.sin(i*1.9)))*1000),switch_count:i%7===4?1:0};}
 function listParams(kind){return {search:$(`#${kind}-search`).value.trim(),status:$(`#${kind}-status`).value,...(kind==='logs'?{api_key_id:$('#logs-key').value,async:$('#logs-async').value,response_format:$('#logs-format').value,from:$('#logs-from').value,to:$('#logs-to').value}:{})};}
 function demoList(kind){const l=state.lists[kind],{search,status,...filters}=listParams(kind);let all=Array.from({length:kind==='accounts'?48:65},(_,i)=>kind==='accounts'?demoAccount(i):demoRequest(i));all=all.filter(row=>(!search||(row.email||row.id).toLowerCase().includes(search.toLowerCase())||row.id.includes(search))&&(!status||(kind==='accounts'?(status==='enabled')===row.enabled:row.status===status)));if(kind==='logs')all=all.filter(row=>(!filters.async||String(row.is_async)===filters.async)&&(!filters.response_format||row.response_format===filters.response_format)&&(!filters.from||new Date(row.created_at)>=new Date(filters.from+'T00:00:00+08:00'))&&(!filters.to||new Date(row.created_at)<new Date(new Date(filters.to+'T00:00:00+08:00').getTime()+86400000)));return {items:all.slice(l.page*20,l.page*20+20),next_cursor:all.length>(l.page+1)*20?`demo-${l.page+1}`:''};}
 async function loadList(kind,reset=false){
   const list=state.lists[kind];if(reset){list.cursors=[''];list.page=0;list.next='';}
   const version=++list.version;
-  if(!state.demo&&!state.connected){renderEmpty(kind,'连接服务后查看真实记录，或打开界面演示。');return;}
+  if(!state.demo&&!state.connected){renderEmpty(kind,'登录后查看记录。');return;}
   $(`#${kind}-body`).innerHTML=`<tr><td colspan="8" class="empty-cell">正在读取…</td></tr>`;
   try {
     const activeFilters=listParams(kind),{search,...filters}=activeFilters,params=new URLSearchParams({limit:'20',q:search,...filters,cursor:list.cursors[list.page]||''});
@@ -191,10 +203,11 @@ async function loadList(kind,reset=false){
 }
 function renderEmpty(kind,message){$(`#${kind}-body`).innerHTML=`<tr><td colspan="8" class="empty-cell">${icon(kind==='accounts'?'users':'log')}${escapeHTML(message)}</td></tr>`;if(kind==='accounts')updateAccountSelectionUI();updatePagination(kind);}
 function statusBadge(status){const cls=status==='succeeded'?'success':status==='safety_rejected'?'safety':'failed';const label=status==='succeeded'?'生成成功':status==='safety_rejected'?'安全审核拒绝':'生成失败';return `<span class="badge ${cls}">${status==='succeeded'?icon('check'):''}${label}</span>`;}
+function refreshTokenBadge(status){const states={valid:['success','RT 可用'],invalid:['failed','RT 失效'],pending:['safety','待确认'],unverified:['neutral','未验证'],missing:['neutral','未配置']};const [kind,label]=states[status]||states.unverified;return `<span class="badge ${kind}">${label}</span>`;}
 function renderList(kind){
   const list=state.lists[kind];if(!list.items.length){renderEmpty(kind,'没有符合筛选条件的记录。');return;}
   const colors=['mint','purple','amber','coral'];
-  $(`#${kind}-body`).innerHTML=list.items.map((row,i)=>kind==='accounts'?`<tr><td><div class="account-cell"><input class="account-row-check" type="checkbox" data-account-select="${escapeHTML(row.id)}" aria-label="选择 ${escapeHTML(row.email||row.id)}" ${(accountSelection.allMatching||accountSelection.ids.has(row.id))?'checked':''}><span class="account-avatar ${colors[i%4]}">${escapeHTML((row.email||row.id).slice(0,2).toUpperCase())}</span><span><span class="table-primary">${escapeHTML(row.email||'未填写邮箱')}</span><span class="table-subtitle mono">${escapeHTML(row.id)}</span></span></div></td><td><span class="badge ${row.enabled?'success':'neutral'}">${row.enabled?'已启用':'已停用'}</span><span class="table-subtitle">${row.hot?'热池':'冷池'} · 额度 ${row.quota==null?'未知':count(row.quota)}</span></td><td><span class="score-cell"><strong>${count(row.score)}</strong><span class="capacity-track"><span class="capacity-fill mint-score" data-score="${i}"></span></span></span></td><td class="mono">··· ${escapeHTML(row.token_tail)}</td><td><span class="badge ${row.has_refresh_token?'success':'neutral'}">${row.has_refresh_token?'已配置':'未配置'}</span></td><td>${escapeHTML(date(row.verified_at))}</td><td><button class="text-button" data-account="${i}">详情 ${icon('chevron')}</button></td></tr>`:`<tr><td><span class="table-primary">${escapeHTML(row.model)}</span><span class="table-subtitle mono">${escapeHTML(row.id)}</span></td><td class="time-cell"><span>${escapeHTML(date(row.started_at))}</span><br><span class="muted">${escapeHTML(date(row.finished_at||row.created_at))}</span></td><td><span class="table-primary">${escapeHTML(row.api_key_name||'历史未记录')}</span><span class="badge ${row.is_async?'coral-badge':'neutral'}">${row.is_async?'异步':'同步'}</span></td><td class="mono">${escapeHTML(row.response_format==='b64_json'?'Base64':(row.response_format||'—').toUpperCase())}</td><td>${statusBadge(row.status)}</td><td class="mono">${duration(row.duration_ms)}<span class="table-subtitle">排队 ${duration(row.queue_ms)}</span></td><td>${count(row.switch_count)} 次</td><td><button class="text-button" data-request="${escapeHTML(row.id)}">详情 ${icon('chevron')}</button></td></tr>`).join('');
+  $(`#${kind}-body`).innerHTML=list.items.map((row,i)=>kind==='accounts'?`<tr><td><div class="account-cell"><input class="account-row-check" type="checkbox" data-account-select="${escapeHTML(row.id)}" aria-label="选择 ${escapeHTML(row.email||row.id)}" ${(accountSelection.allMatching||accountSelection.ids.has(row.id))?'checked':''}><span class="account-avatar ${colors[i%4]}">${escapeHTML((row.email||row.id).slice(0,2).toUpperCase())}</span><span><span class="table-primary">${escapeHTML(row.email||'未填写邮箱')}</span><span class="table-subtitle mono">${escapeHTML(row.id)}</span></span></div></td><td><span class="badge ${row.enabled?'success':'neutral'}">${row.enabled?'已启用':'已停用'}</span><span class="table-subtitle">${row.hot?'热池':'冷池'} · 额度 ${row.quota==null?'未知':count(row.quota)}</span></td><td><span class="score-cell"><strong>${count(row.score)}</strong><span class="capacity-track"><span class="capacity-fill mint-score" data-score="${i}"></span></span></span></td><td class="mono">··· ${escapeHTML(row.token_tail)}</td><td>${refreshTokenBadge(row.refresh_token_status)}</td><td>${escapeHTML(date(row.verified_at))}</td><td><button class="text-button" data-account="${i}">详情 ${icon('chevron')}</button></td></tr>`:`<tr><td><span class="table-primary">${escapeHTML(row.model)}</span><span class="table-subtitle mono">${escapeHTML(row.id)}</span></td><td class="time-cell"><span>${escapeHTML(date(row.started_at))}</span><br><span class="muted">${escapeHTML(date(row.finished_at||row.created_at))}</span></td><td><span class="table-primary">${escapeHTML(row.api_key_name||'历史未记录')}</span><span class="badge ${row.is_async?'coral-badge':'neutral'}">${row.is_async?'异步':'同步'}</span></td><td class="mono">${escapeHTML(row.response_format==='b64_json'?'Base64':(row.response_format||'—').toUpperCase())}</td><td>${statusBadge(row.status)}</td><td class="mono">${duration(row.duration_ms)}<span class="table-subtitle">排队 ${duration(row.queue_ms)}</span></td><td>${count(row.switch_count)} 次</td><td><button class="text-button" data-request="${escapeHTML(row.id)}">详情 ${icon('chevron')}</button></td></tr>`).join('');
   if(kind==='accounts') $$('[data-score]').forEach(el=>{el.style.width=`${Math.min(100,Math.max(0,list.items[Number(el.dataset.score)].score))}%`;el.style.background='var(--mint)';el.style.display='block';});
   if(kind==='accounts')updateAccountSelectionUI();
   updatePagination(kind);
@@ -210,6 +223,7 @@ function updateAccountSelectionUI(){
  $('#accounts-select-page-head').checked=$('#accounts-select-page').checked;
  $('#accounts-select-page').disabled=accountSelection.allMatching||!state.lists.accounts.items.length;
  $('#account-selection-verify').disabled=(!accountSelection.allMatching&&!accountSelection.ids.size)||state.demo||!state.connected;
+ $('#account-selection-refresh-at').disabled=(!accountSelection.allMatching&&!accountSelection.ids.size)||state.demo||!state.connected;
  $('#account-selection-delete').disabled=(!accountSelection.allMatching&&!accountSelection.ids.size)||state.demo||!state.connected;
  $('#account-selection-clear').disabled=!accountSelection.allMatching&&!accountSelection.ids.size;
  for(const checkbox of $$('[data-account-select]'))checkbox.disabled=accountSelection.allMatching;
@@ -218,7 +232,7 @@ function accountSelectionPayload(){return accountSelection.allMatching?{all_matc
 function initAccountSelectionUI(){
  const toolbar=$('#accounts-import')?.parentElement;
  if(!toolbar||$('#account-selection-bar'))return;
- toolbar.insertAdjacentHTML('afterend','<div class="account-selection-bar" id="account-selection-bar"><label class="account-select-page"><input type="checkbox" id="accounts-select-page">选择本页</label><span id="account-selection-count">未选择账号</span><button class="text-button" id="accounts-select-matching">选择全部筛选结果</button><div class="account-selection-actions"><button class="button small-button" id="account-selection-verify" disabled>校验所选</button><button class="button small-button danger-button" id="account-selection-delete" disabled>删除所选</button><button class="text-button" id="account-selection-clear" disabled>清除选择</button></div></div>');
+ toolbar.insertAdjacentHTML('afterend','<div class="account-selection-bar" id="account-selection-bar"><label class="account-select-page"><input type="checkbox" id="accounts-select-page">选择本页</label><span id="account-selection-count">未选择账号</span><button class="text-button" id="accounts-select-matching">选择全部筛选结果</button><div class="account-selection-actions"><button class="button small-button" id="account-selection-verify" disabled>刷新所选额度</button><button class="button small-button" id="account-selection-refresh-at" disabled>刷新所选 AT</button><button class="button small-button danger-button" id="account-selection-delete" disabled>删除所选</button><button class="text-button" id="account-selection-clear" disabled>清除选择</button></div></div>');
  const first=$('#page-accounts thead th');
  if(first)first.insertAdjacentHTML('afterbegin','<label class="account-head-check"><input type="checkbox" id="accounts-select-page-head" aria-label="选择本页账号"></label>');
  $('#accounts-select-page-head').addEventListener('change',event=>{$('#accounts-select-page').checked=event.target.checked;$('#accounts-select-page').dispatchEvent(new Event('change'));});
@@ -245,6 +259,7 @@ function initAccountSelectionUI(){
  });
  $('#account-selection-clear').addEventListener('click',resetAccountSelection);
  $('#account-selection-verify').addEventListener('click',()=>confirmAccountSelection('verify'));
+ $('#account-selection-refresh-at').addEventListener('click',()=>confirmAccountSelection('refresh_at'));
  $('#account-selection-delete').addEventListener('click',()=>confirmAccountSelection('delete'));
  updateAccountSelectionUI();
 }
@@ -253,8 +268,14 @@ function confirmAccountSelection(action){
  const total=accountSelection.allMatching?'当前筛选结果中的全部账号':`${count(accountSelection.ids.size)} 个已选账号`;
  if(action==='verify'){
   const payload=accountSelectionPayload();
-  showDetail(`<h2>校验${escapeHTML(total)}</h2><p>校验会强制查询上游的账号信息接口（/backend-api/me、/backend-api/conversation/init），并不是单独测试 RT。AT 已过期或临近过期时，系统可能先用 RT 刷新 AT；RT 轮换后的新值会按现有流程保存。</p><p>任务使用独立的手动校验并发设置，在后台运行。重复校验同一账号会合并。</p><button class="button primary" id="confirm-selected-verify">开始校验</button>`,'ACCOUNT VERIFICATION');
+  showDetail(`<h2>刷新额度：${escapeHTML(total)}</h2><p>使用当前 AT 查询上游账号信息并更新额度。若 AT 已过期或被上游拒绝，系统可能自动用 RT 刷新 AT 后重试；这一步不等同于主动刷新 AT。</p><p>任务在后台运行，使用账号校验并发。</p><button class="button primary" id="confirm-selected-verify">开始刷新额度</button>`,'REFRESH ACCOUNT INFO');
   $('#confirm-selected-verify').onclick=async event=>{event.target.disabled=true;try{await startVerification(payload);resetAccountSelection();}catch(error){toast(error.message);if(event.target.isConnected)event.target.disabled=false;}};
+  return;
+ }
+ if(action==='refresh_at'){
+  const payload=accountSelectionPayload();
+  showDetail(`<h2>刷新 AT：${escapeHTML(total)}</h2><p>使用每个账号的 RT 向上游换取新的 AT；如果上游轮换返回 RT，也会一起保存。没有 RT 或 RT 已失效的账号会记录为失败。</p><p>任务在后台运行，并受账号校验并发限制。</p><button class="button primary" id="confirm-selected-refresh-at">开始刷新 AT</button>`,'REFRESH ACCESS TOKEN');
+  $('#confirm-selected-refresh-at').onclick=async event=>{event.target.disabled=true;try{await startTokenRefresh(payload);resetAccountSelection();}catch(error){toast(error.message);if(event.target.isConnected)event.target.disabled=false;}};
   return;
  }
  const payload=accountSelectionPayload();
@@ -262,7 +283,7 @@ function confirmAccountSelection(action){
  $('#confirm-selected-delete').onclick=async event=>{event.target.disabled=true;try{const job=await api('/admin/accounts/delete',{method:'POST',body:JSON.stringify(payload)});showJob(job);resetAccountSelection();refreshJobs();}catch(error){toast(error.message);if(event.target.isConnected)event.target.disabled=false;}};
 }
 function showDetail(html,eyebrow){delete $('#detail-content').dataset.jobId;setText('detail-eyebrow',eyebrow);$('#detail-content').innerHTML=html;if(!$('#detail-dialog').open)$('#detail-dialog').showModal();}
-function accountDetail(i){const a=state.lists.accounts.items[i];if(!a)return;showDetail(`<h2>账号详情</h2><p>${escapeHTML(a.email||a.id)}</p><div class="detail-grid">${[['状态',a.enabled?'已启用':'已停用'],['热池状态',a.hot?'热池':'冷池'],['图片额度',a.quota==null?'未知':count(a.quota)],['额度恢复时间',date(a.quota_reset_at)],['账号评分',a.score],['Token 尾号',`··· ${a.token_tail}`],['Refresh Token',a.has_refresh_token?'已配置':'未配置'],['最近校验成功',date(a.verified_at)],['最近远程刷新',date(a.last_refresh_at)],['最近刷新错误',a.last_refresh_error||'无'],['刷新退避至',date(a.next_refresh_at)],['最近生图成功',date(a.success_at)],['冷却至',date(a.available_at)],['账号 ID',a.id]].map(([label,value])=>`<div class="detail-item"><span>${label}</span><strong>${escapeHTML(value)}</strong></div>`).join('')}</div><p>使用「完整导出」下载全部凭据、扩展元数据和归并记录。</p><div class="account-actions"><button class="button" data-manage="verify" data-id="${escapeHTML(a.id)}">立即校验</button><button class="button" data-manage="toggle" data-id="${escapeHTML(a.id)}" data-enabled="${a.enabled?'false':'true'}">${a.enabled?'停用账号':'启用账号'}</button><button class="button danger-button" data-manage="delete" data-id="${escapeHTML(a.id)}">删除账号</button></div>`,'ACCOUNT DETAILS');}
+function accountDetail(i){const a=state.lists.accounts.items[i];if(!a)return;showDetail(`<h2>账号详情</h2><p>${escapeHTML(a.email||a.id)}</p><div class="detail-grid">${[['状态',a.enabled?'已启用':'已停用'],['热池状态',a.hot?'热池':'冷池'],['图片额度',a.quota==null?'未知':count(a.quota)],['额度恢复时间',date(a.quota_reset_at)],['账号评分',a.score],['Token 尾号',`··· ${a.token_tail}`],['Refresh Token 状态',({'valid':'RT 可用','invalid':'RT 失效','pending':'待确认','unverified':'未验证','missing':'未配置'}[a.refresh_token_status]||'未验证')],['最近 RT 续期成功',date(a.last_token_refresh_at)],['最近 RT 续期错误',a.last_token_refresh_error||'无'],['最近校验成功',date(a.verified_at)],['最近账号信息刷新',date(a.last_refresh_at)],['最近刷新错误',a.last_refresh_error||'无'],['刷新退避至',date(a.next_refresh_at)],['最近生图成功',date(a.success_at)],['冷却至',date(a.available_at)],['账号 ID',a.id]].map(([label,value])=>`<div class="detail-item"><span>${label}</span><strong>${escapeHTML(value)}</strong></div>`).join('')}</div><p>使用「完整导出」下载全部凭据、扩展元数据和归并记录。</p><div class="account-actions"><button class="button" data-manage="verify" data-id="${escapeHTML(a.id)}">刷新额度</button><button class="button" data-manage="refresh_at" data-id="${escapeHTML(a.id)}">刷新 AT</button><button class="button" data-manage="toggle" data-id="${escapeHTML(a.id)}" data-enabled="${a.enabled?'false':'true'}">${a.enabled?'停用账号':'启用账号'}</button><button class="button danger-button" data-manage="delete" data-id="${escapeHTML(a.id)}">删除账号</button></div>`,'ACCOUNT DETAILS');}
 async function requestDetail(id){
   showDetail('<h2>日志详情</h2><p>正在读取切号过程…</p>','REQUEST DETAILS');
   try {
@@ -271,7 +292,8 @@ async function requestDetail(id){
     else row=await api(`/admin/requests/${encodeURIComponent(id)}`);
     if(!$('#detail-dialog').open)return;
     const knownStages={pow_solve:'PoW 计算',sse:'上游生成流',download:'图片下载',account_verify:'账号校验',download_wait:'下载排队',validation_wait:'解码排队'};
-    showDetail(`<h2>日志详情</h2><p class="mono">${escapeHTML(row.id)}</p><p class="small muted">调用 Key：${escapeHTML(row.api_key_name||'历史未记录')} <span class="mono">${escapeHTML(row.api_key_id||'')}</span></p><div class="detail-meta">${statusBadge(row.status)}<span class="badge neutral">${row.is_async?'异步':'同步'}</span><span class="badge neutral">${escapeHTML(row.response_format)}</span><span class="badge neutral">${duration(row.duration_ms)}</span></div><p class="small muted">开始 ${escapeHTML(date(row.started_at))} · 生成完成 ${escapeHTML(date(row.finished_at||row.created_at))} · 排队 ${duration(row.queue_ms)}</p>${row.error?`<div class="detail-error">${escapeHTML(row.error.message)}<div class="mono">${escapeHTML(row.error.code)}</div></div>`:''}<h3>账号尝试过程</h3><p class="small muted">${(row.attempts||[]).length} 次尝试 · 切号 ${(row.attempts||[]).filter((a,i,all)=>a.code&&i<all.length-1).length} 次</p><div class="attempt-timeline">${(row.attempts||[]).map((a,i)=>`<article class="attempt"><h3>${i+1}. ${escapeHTML(a.email||a.account_id)}</h3><p>${escapeHTML(date(a.started_at))} · 使用 ${duration(a.duration_ms)}</p>${a.warning?`<div class="detail-error">${escapeHTML(a.warning.message)}<div class="mono">${escapeHTML(a.warning.code)}</div></div>`:''}${a.code?`<span class="badge ${a.code==='content_policy_violation'?'safety':'failed'}">${escapeHTML(a.code)}</span>`:'<span class="badge success">生成成功</span>'}<div class="stages-grid">${Object.entries(a.stages_ms||{}).map(([key,value])=>`<div><span>${escapeHTML(knownStages[key]||key)}</span><span>${duration(value)}</span></div>`).join('')}</div></article>`).join('')||'<p>当前日志未记录账号尝试。</p>'}</div>${bodySections(row)}`,'REQUEST DETAILS');
+    activeRequestDetail=row;
+    showDetail(`<h2>日志详情</h2><p class="mono">${escapeHTML(row.id)}</p><p class="small muted">调用 Key：${escapeHTML(row.api_key_name||'历史未记录')} <span class="mono">${escapeHTML(row.api_key_id||'')}</span></p><div class="detail-meta">${statusBadge(row.status)}<span class="badge neutral">${row.is_async?'异步':'同步'}</span><span class="badge neutral">${escapeHTML(row.response_format)}</span><span class="badge neutral">${duration(row.duration_ms)}</span></div><p class="small muted">开始 ${escapeHTML(date(row.started_at))} · 生成完成 ${escapeHTML(date(row.finished_at||row.created_at))} · 排队 ${duration(row.queue_ms)}</p>${row.error?`<div class="detail-error">${escapeHTML(row.error.message)}<div class="mono">${escapeHTML(row.error.code)}</div></div>`:''}<h3>账号尝试过程</h3><p class="small muted">${(row.attempts||[]).length} 次尝试 · 切号 ${(row.attempts||[]).filter((a,i,all)=>a.code&&i<all.length-1).length} 次</p><div class="attempt-timeline">${(row.attempts||[]).map((a,i)=>`<article class="attempt"><h3>${i+1}. ${escapeHTML(a.email||a.account_id)}</h3><p>${escapeHTML(date(a.started_at))} · 使用 ${duration(a.duration_ms)}</p>${a.warning?`<div class="detail-error">${escapeHTML(a.warning.message)}<div class="mono">${escapeHTML(a.warning.code)}</div></div>`:''}${a.code?`<button type="button" class="badge ${a.code==='content_policy_violation'?'safety':'failed'} raw-response-trigger" data-attempt-response="${i}" title="查看上游原始响应">${escapeHTML(a.code)}</button>`:'<span class="badge success">生成成功</span>'}<div class="stages-grid">${Object.entries(a.stages_ms||{}).map(([key,value])=>`<div><span>${escapeHTML(knownStages[key]||key)}</span><span>${duration(value)}</span></div>`).join('')}</div></article>`).join('')||'<p>当前日志未记录账号尝试。</p>'}</div>${bodySections(row)}`,'REQUEST DETAILS');
     installBodySections(id);
   }catch(error){if($('#detail-dialog').open)showDetail(`<h2>读取失败</h2><p>${escapeHTML(error.message)}</p>`,'REQUEST DETAILS');}
 }
@@ -281,6 +303,7 @@ window.addEventListener('hashchange',()=>navigate(location.hash.slice(1),false))
 document.addEventListener('click',event=>{
   const go=event.target.closest('[data-go]');if(go)navigate(go.dataset.go);
   const close=event.target.closest('[data-close]');if(close)$(`#${close.dataset.close}`).close();
+  const rawButton=event.target.closest('[data-attempt-response]');if(rawButton){const attempt=activeRequestDetail?.attempts?.[Number(rawButton.dataset.attemptResponse)];$('#raw-response-code').textContent=attempt?.code||'错误响应';$('#raw-response-content').textContent=attempt?.raw_response||'该条日志没有采集到上游原始响应（可能是旧日志，或错误发生在收到上游响应之前）。';$('#raw-response-truncated').classList.toggle('hidden',!attempt?.raw_response_truncated);$('#raw-response-dialog').showModal();}
   const account=event.target.closest('[data-account]');if(account)accountDetail(Number(account.dataset.account));
   const request=event.target.closest('[data-request]');if(request)requestDetail(request.dataset.request);
   const related=event.target.closest('[data-related]');if(related){const setting=state.settings.find(s=>s.key===related.dataset.related);if(setting){selectGroup(setting.group);const row=$(`#row-${setting.key}`);row.scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth',block:'center'});$(`[data-setting="${setting.key}"]`).focus({preventScroll:true});}}
@@ -300,10 +323,10 @@ $('#save-draft').addEventListener('click',async()=>{
 });
 $('#copy-settings').addEventListener('click',async()=>{if(!state.settings.length||!settingsValid())return;try{await navigator.clipboard.writeText(envText());toast('配置已复制，请合并到现有 .env。');}catch{showDetail('<h2>配置内容</h2><p>浏览器未允许访问剪贴板，可手动复制以下内容。</p><div class="detail-json"><pre></pre></div>','CONFIGURATION');$('#detail-content pre').textContent=envText();}});
 $('#export-settings').addEventListener('click',()=>{if(!state.settings.length||!settingsValid())return;const url=URL.createObjectURL(new Blob([envText()],{type:'text/plain;charset=utf-8'}));const link=document.createElement('a');link.href=url;link.download='image-core-settings.env';link.click();setTimeout(()=>URL.revokeObjectURL(url),5000);toast('配置已导出。服务端已保存的设置优先于环境变量。');});
-$('#connection-button').addEventListener('click',showConnection);$('#profile-button').addEventListener('click',showConnection);$('#connect-from-demo').addEventListener('click',showConnection);$('#demo-button').addEventListener('click',activateDemo);
+$('#connection-button').addEventListener('click',showConnection);$('#profile-button').addEventListener('click',showConnection);
 $('#connect-form').addEventListener('submit',async event=>{
  event.preventDefault();const button=$('button[type="submit"]',event.target);button.disabled=true;$('#connect-error').textContent='';
- try{await api('/admin/session',{method:'POST',body:JSON.stringify({key:$('#admin-key').value})});$('#admin-key').value='';await connectSession();$('#connect-dialog').close();toast('登录成功，刷新页面会保持登录。');}
+ try{await api('/admin/session',{method:'POST',body:JSON.stringify({key:$('#admin-key').value})});$('#admin-key').value='';await connectSession();toast('登录成功，刷新页面会保持登录。');}
  catch(error){$('#connect-error').textContent=error.message;}finally{button.disabled=false;}
 });
 $('#refresh-button').addEventListener('click',()=>{if(!state.demo&&!state.connected)showConnection();else refreshMetrics();});$('#refresh-interval').addEventListener('change',resetTimer);
@@ -324,35 +347,58 @@ POST /v1/messages
 POST /v1/ppt/generations
 POST /v1/psd/generations
 GET /v1/editable-file-tasks/{id}</pre></div><p>聊天/Responses 仅支持文本，支持 stream:true SSE；/v1/search 传 prompt，返回 answer 和 sources。PPT/PSD 使用付费账号，传 prompt、可选 client_task_id 和 base64_images 数组（PSD 必填参考图）。文件任务状态为 queued/running/success/error，成功 result 包含 primary_url、zip_url；按任务 ID 轮询，下载链接持有者可直接访问。文件工具和搜索已完成真实上游基础验证；不保证文件最终可编辑质量。</p><p>聊天与文件的并发/预算在「设置 → 聊天与文件生成」调整。独立执行名额仍共享账号槽位、下载、PoW 等资源。代理在「设置 → 代理设置」配置，支持全部直连或全部走代理，可批量填写并测试；同一会话保持所选代理，代理商仍需配置粘性出口。详情见项目 docs/chat-search-files-proxy.md。</p><p>管理员首次登录使用 CORE_ADMIN_KEY；后续可在「设置 → 访问与密钥」修改。图片调用 Key 也在该处管理，首次启动会导入 CORE_API_KEY。管理界面的可在线调整项可直接保存；数据库连接池更改在重启后生效。</p>`,'API REFERENCE');});
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshMetrics();});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){refreshMetrics();refreshJobs();}});
 window.addEventListener('beforeunload',event=>{if(JSON.stringify(state.draft)!==state.saved&&state.settings.length){event.preventDefault();event.returnValue='';}});
 setText('current-date',new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',month:'long',day:'numeric',weekday:'long'}).format(new Date()));
 drawChart();navigate(location.hash.slice(1)||'overview',false);updateConnectionUI();
 
 async function refreshJobs(){
  clearTimeout(state.jobsTimer);
- if(state.demo||!state.connected||state.page!=='accounts'||document.hidden)return;
+ if(state.demo||!state.connected||document.hidden)return;
  try{
   const data=await api('/admin/jobs?scope=accounts');
   if(state.demo||!state.connected)return;
-  const wasRunning=new Set((state.jobs||[]).filter(j=>j.status==='running').map(j=>j.id));
-  state.jobs=(data.items||[]).filter(j=>j.kind==='import'||j.kind==='push'||j.kind==='verify'||j.kind==='delete');
-  if(state.jobs.some(j=>j.status!=='running'&&wasRunning.has(j.id))){loadList('accounts',true);refreshMetrics();}
-  $('#admin-jobs').innerHTML=state.jobs.slice(0,4).map(j=>{
-   const label=j.kind==='push'?'账号推送':j.kind==='import'?'账号导入':j.kind==='delete'?'批量删除账号':'手动账号校验';
-   const status=j.status==='running'?'进行中':j.status==='completed'?'已完成':'已中断';
-   const pct=j.total?Math.min(100,Math.round(j.processed/j.total*100)):j.status==='completed'?100:0;
-   const outcome=j.kind==='verify'?`校验成功 ${count(j.succeeded)}`:j.kind==='delete'?`已删除 ${count(j.succeeded)}`:`新增 ${count(j.imported)} · 重复 ${count(j.duplicates)}`;
-   return `<div class="admin-job"><div class="job-heading"><strong>${label} · ${status}</strong><button class="text-button" data-job="${escapeHTML(j.id)}">查看详情 ${icon('chevron')}</button></div><div class="job-meta">${count(j.processed)} / ${count(j.total)} 条 · ${outcome} · 失败 ${count(j.failed)} · ${escapeHTML(date(j.updated_at))}</div><progress class="job-progress" max="100" value="${pct}" aria-label="${label}进度"></progress></div>`;
-  }).join('');
+  const previousJobs=new Map((state.jobs||[]).map(job=>[job.id,job.status]));
+  state.jobs=(data.items||[]).filter(j=>['import','push','verify','refresh_at','delete'].includes(j.kind));
+  for(const job of state.jobs){
+   const previous=state.notificationStatuses[job.id]??previousJobs.get(job.id);
+   if(job.status!=='running'&&(previous===undefined||previous==='running'))state.notificationRead.delete(job.id);
+   state.notificationStatuses[job.id]=job.status;
+  }
+  const statusKeys=Object.keys(state.notificationStatuses);
+  for(const id of statusKeys.slice(0,Math.max(0,statusKeys.length-100)))delete state.notificationStatuses[id];
+  saveNotificationState();renderNotifications();
+  if(state.jobs.some(j=>j.status!=='running'&&previousJobs.get(j.id)==='running')){if(state.page==='accounts')loadList('accounts',true);refreshMetrics();}
   const openJob=$('#detail-dialog').open&&state.jobs.find(j=>j.id===$('#detail-content').dataset.jobId);
   if(openJob)showJob(openJob);
-  if(state.jobs.some(j=>j.status==='running'))state.jobsTimer=setTimeout(refreshJobs,2000);
- }catch(error){$('#admin-jobs').textContent=error.message;if(!state.demo&&state.connected)state.jobsTimer=setTimeout(refreshJobs,5000);}
+  state.jobsTimer=setTimeout(refreshJobs,state.jobs.some(j=>j.status==='running')?2000:10000);
+ }catch(error){
+  renderNotifications(error.message);
+  if(!state.demo&&state.connected)state.jobsTimer=setTimeout(refreshJobs,10000);
+ }
 }
+function saveNotificationState(){
+ const readIds=[...state.notificationRead];
+ if(readIds.length>200)state.notificationRead=new Set(readIds.slice(-200));
+ try{localStorage.setItem(notificationStorageKey,JSON.stringify({read:[...state.notificationRead],statuses:state.notificationStatuses}));}catch{}
+}
+function markNotificationRead(id){state.notificationRead.add(id);saveNotificationState();renderNotifications();}
+function renderNotifications(error=''){
+ const jobs=state.jobs||[];
+ const unread=jobs.filter(job=>job.status!=='running'&&!state.notificationRead.has(job.id)).length;
+ $('#notification-dot').classList.toggle('hidden',unread===0);
+ $('#notification-unread-count').textContent=unread?`${count(unread)} 条未读`:'暂无未读';
+ $('#notifications-read-all').disabled=unread===0;
+ const label=job=>job.kind==='push'?'账号推送':job.kind==='import'?'账号导入':job.kind==='delete'?'批量删除账号':job.kind==='refresh_at'?'刷新 AT':'刷新额度';
+ const status=job=>job.status==='running'?'进行中':job.status==='completed'?'已完成':'已中断';
+ const summary=job=>job.kind==='verify'?`额度刷新成功 ${count(job.succeeded)} · 失败 ${count(job.failed)}`:job.kind==='refresh_at'?`AT 刷新成功 ${count(job.succeeded)} · 失败 ${count(job.failed)}`:job.kind==='delete'?`已删除 ${count(job.succeeded)} · 失败 ${count(job.failed)}`:`新增 ${count(job.imported)} · 重复 ${count(job.duplicates)} · 失败 ${count(job.failed)}`;
+ $('#notification-list').innerHTML=error?`<div class="notification-empty">通知暂时无法加载：${escapeHTML(error)}</div>`:jobs.map(job=>`<article class="notification-item ${job.status!=='running'&&!state.notificationRead.has(job.id)?'is-unread':''}"><div class="notification-copy"><strong>${label(job)} · ${status(job)}</strong><span>${count(job.processed)} / ${count(job.total)} 条 · ${summary(job)}</span><time>${escapeHTML(date(job.updated_at))}</time></div><button class="text-button" data-notification-job="${escapeHTML(job.id)}">查看 ${icon('chevron')}</button></article>`).join('')||'<div class="notification-empty">暂无任务通知</div>';
+}
+function markAllNotificationsRead(){for(const job of state.jobs||[])if(job.status!=='running')state.notificationRead.add(job.id);saveNotificationState();renderNotifications();}
 function showJob(j){
- const fields=[['状态',j.status==='running'?'进行中':j.status==='completed'?'已完成':'已中断'],['已处理',`${j.processed} / ${j.total}`],...(j.kind==='verify'?[['校验成功',j.succeeded]]:j.kind==='delete'?[['已删除',j.succeeded]]:[['新增',j.imported],['重复',j.duplicates]]),['失败',j.failed]];
- const title=j.kind==='push'?'账号推送':j.kind==='import'?'账号导入':j.kind==='delete'?'批量删除账号':'手动账号校验';
+ state.notificationStatuses[j.id]=j.status;state.notificationRead.add(j.id);saveNotificationState();renderNotifications();
+ const fields=[['状态',j.status==='running'?'进行中':j.status==='completed'?'已完成':'已中断'],['已处理',`${j.processed} / ${j.total}`],...(j.kind==='verify'?[['额度刷新成功',j.succeeded]]:j.kind==='refresh_at'?[['AT 刷新成功',j.succeeded]]:j.kind==='delete'?[['已删除',j.succeeded]]:[['新增',j.imported],['重复',j.duplicates]]),['失败',j.failed]];
+ const title=j.kind==='push'?'账号推送':j.kind==='import'?'账号导入':j.kind==='delete'?'批量删除账号':j.kind==='refresh_at'?'刷新 AT':'刷新额度';
  showDetail(`<h2>${title}进度</h2><p>关闭弹窗后任务继续运行，可从账号池页面查看进度。</p><div class="detail-grid">${fields.map(([label,value])=>`<div class="detail-item"><span>${label}</span><strong>${typeof value==='string'?escapeHTML(value):count(value)}</strong></div>`).join('')}</div>${j.message?`<p class="detail-error">${escapeHTML(j.message)}</p>`:''}<h3>失败明细</h3><p class="small muted">最多保留前 100 条失败原因。</p><div class="job-errors">${(j.errors||[]).map(e=>`<div class="job-error-item"><strong>${escapeHTML(e.email||e.account_id||'账号格式错误')}</strong><br>${escapeHTML(e.message)}</div>`).join('')||'<p>暂未记录失败。</p>'}</div><button class="button" data-job="${escapeHTML(j.id)}">刷新详情</button>${j.status==='running'?'':'<button class="button" id="job-refresh-list">刷新账号列表</button>'}`,'BACKGROUND TASK');
  $('#detail-content').dataset.jobId=j.id;
  $('#job-refresh-list')?.addEventListener('click',()=>{$('#detail-dialog').close();loadList('accounts',true);refreshMetrics();});
@@ -381,6 +427,11 @@ async function startVerification(ids,all=false){
  const payload=ids&&!Array.isArray(ids)&&typeof ids==='object'?ids:all?{all:true}:{ids};
  const job=await api('/admin/accounts/verify',{method:'POST',body:JSON.stringify(payload)});showJob(job);refreshJobs();
 }
+async function startTokenRefresh(selection,all=false){
+ if(state.demo||!state.connected){toast('请先连接真实服务再刷新 AT。');return;}
+ const payload=selection&&!Array.isArray(selection)&&typeof selection==='object'?selection:all?{all:true}:{ids:selection};
+ const job=await api('/admin/accounts/refresh-token',{method:'POST',body:JSON.stringify(payload)});showJob(job);refreshJobs();
+}
 $('#accounts-export').addEventListener('click',async()=>{
  if(state.demo){toast('演示模式不导出账号。');return;}if(!state.connected){showConnection();return;}
  const button=$('#accounts-export');button.disabled=true;button.textContent='正在导出…';
@@ -395,10 +446,21 @@ $('#accounts-export').addEventListener('click',async()=>{
 $('#accounts-import').addEventListener('click',showImport);
 $('#accounts-verify-all').addEventListener('click',()=>{
  if(state.demo||!state.connected){toast('请先连接真实服务再校验账号。');return;}
- showDetail('<h2>校验全部账号</h2><p>将强制查询上游账号信息接口（/backend-api/me、/backend-api/conversation/init），当前校验成功的账号也会重新检查。这不是单独测试 RT；AT 已过期或临近过期时，才可能先用 RT 刷新 AT，旋转后的 RT 按现有流程保存。</p><p>手动校验使用独立的「账号校验并发」名额，在后台执行；同一账号的重复校验会合并。</p><button class="button primary" id="confirm-verify-all">开始校验全部账号</button>','ACCOUNT VERIFICATION');
+ showDetail('<h2>刷新全部账号额度</h2><p>使用当前 AT 查询上游账号信息并更新额度。若 AT 过期或被拒绝，系统可能自动使用 RT 刷新 AT 后重试。</p><p>任务在后台按账号校验并发执行。</p><button class="button primary" id="confirm-verify-all">开始刷新额度</button>','REFRESH ACCOUNT INFO');
  $('#confirm-verify-all').onclick=async event=>{event.target.disabled=true;try{await startVerification([],true);}catch(error){toast(error.message);if(event.target.isConnected)event.target.disabled=false;}};
 });
+$('#accounts-refresh-at-all').addEventListener('click',()=>{
+ if(state.demo||!state.connected){toast('请先连接真实服务再刷新 AT。');return;}
+ showDetail('<h2>刷新全部账号 AT</h2><p>使用每个账号的 RT 向上游换取新的 AT；若上游同时返回轮换后的 RT，也会保存。没有 RT 或 RT 已失效的账号会记为失败。</p><p>该操作会对全部账号发起远程续期，请按需使用。任务在后台按账号校验并发执行。</p><button class="button primary" id="confirm-refresh-at-all">开始刷新 AT</button>','REFRESH ACCESS TOKEN');
+ $('#confirm-refresh-at-all').onclick=async event=>{event.target.disabled=true;try{await startTokenRefresh([],true);}catch(error){toast(error.message);if(event.target.isConnected)event.target.disabled=false;}};
+});
 document.addEventListener('click',async event=>{
+ const notificationButton=event.target.closest('#notifications-button');
+ if(notificationButton){const panel=$('#notifications-panel'),opening=panel.classList.contains('hidden');panel.classList.toggle('hidden',!opening);notificationButton.setAttribute('aria-expanded',String(opening));return;}
+ if(!event.target.closest('#notification-area')){$('#notifications-panel').classList.add('hidden');$('#notifications-button').setAttribute('aria-expanded','false');}
+ if(event.target.closest('#notifications-read-all')){markAllNotificationsRead();return;}
+ const notificationJob=event.target.closest('[data-notification-job]');
+ if(notificationJob){const id=notificationJob.dataset.notificationJob;markNotificationRead(id);$('#notifications-panel').classList.add('hidden');$('#notifications-button').setAttribute('aria-expanded','false');notificationJob.disabled=true;try{showJob(await api('/admin/jobs/'+encodeURIComponent(id)));}catch(error){toast(error.message);}return;}
  const jobButton=event.target.closest('[data-job]');
  if(jobButton){jobButton.disabled=true;try{showJob(await api('/admin/jobs/'+encodeURIComponent(jobButton.dataset.job)));}catch(error){toast(error.message);}finally{jobButton.disabled=false;}return;}
  const button=event.target.closest('[data-manage]');if(!button)return;
@@ -410,12 +472,12 @@ document.addEventListener('click',async event=>{
  button.disabled=true;
  try{
   if(action==='verify'){await startVerification([id]);return;}
+  if(action==='refresh_at'){await startTokenRefresh([id]);return;}
   if(action==='toggle')await api('/admin/accounts/'+encodeURIComponent(id),{method:'PATCH',body:JSON.stringify({enabled:button.dataset.enabled==='true'})});
   if(action==='confirm-delete')await api('/admin/accounts/'+encodeURIComponent(id),{method:'DELETE'});
   $('#detail-dialog').close();await loadList('accounts',true);refreshMetrics();toast(action==='confirm-delete'?'账号已删除。':'账号状态已更新。');
  }catch(error){toast(error.message);}finally{button.disabled=false;}
 });
-document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.page==='accounts')refreshJobs();});
 
 
 function resultsParams(){const period=$('#results-period').value;return period==='custom'?new URLSearchParams({from:$('#results-from').value,to:$('#results-to').value}):new URLSearchParams({period});}
@@ -434,7 +496,7 @@ async function refreshResults(force=false){
 function renderExtraMetrics(m){
  const s=m.system||{},u=m.upstream||{};
  setText('runtime-cpu',s.cpu_percent==null?'—':Number(s.cpu_percent).toFixed(1)+'%');setText('runtime-memory',bytes(s.memory_used_bytes)+(s.memory_limit_bytes?' / '+bytes(s.memory_limit_bytes):''));setText('runtime-disk',bytes(s.disk_available_bytes));setText('sse-active','活跃生成流 '+count(u.sse_active));
- $('#stage-body').innerHTML=Object.entries(u.stages||{}).sort((a,b)=>Number(b[1].mean_ms)-Number(a[1].mean_ms)).map(([key,v])=>'<tr><td>'+escapeHTML(stageName(key))+'</td><td>'+count(v.count)+'</td><td>'+duration(v.mean_ms)+'</td><td>'+duration(v.max_ms)+'</td></tr>').join('')||'<tr><td colspan="4" class="empty-cell">有生成任务后显示阶段采样</td></tr>';
+ const stages=Object.entries(u.stages||{}).sort((a,b)=>Number(b[1].mean_ms)-Number(a[1].mean_ms));const panel=$('.stage-panel');panel.classList.toggle('is-empty',stages.length===0);$('#stage-body').innerHTML=stages.map(([key,v])=>'<tr><td>'+escapeHTML(stageName(key))+'</td><td>'+count(v.count)+'</td><td>'+duration(v.mean_ms)+'</td><td>'+duration(v.max_ms)+'</td></tr>').join('')||'<tr><td colspan="4" class="empty-cell">有生成任务后显示阶段采样</td></tr>';
 }
 function stageName(key){return ({webdav_upload:'WebDAV 上传',webdav_wait:'WebDAV 排队',pow_solve:'PoW 计算',sse:'上游生成流',download:'图片下载',account_verify:'账号校验',download_wait:'下载排队',validation_wait:'解码排队'})[key]||key;}
 function bodySections(row){return '<h3>实际调用报文</h3><p class="small muted">保留调用方原始字段；长字符串点击后加载。异步创建响应与任务查询响应分别展示。升级前的日志可能没有原始报文。</p>'+[['request','请求体'],['response',row.is_async?'创建响应体':'响应体'],...(row.is_async?[['task_response','任务查询响应体（最近一次终态）']]:[])].map(([kind,label])=>'<details class="body-section" data-body-kind="'+kind+'"><summary>'+label+'</summary><div class="body-status">展开后读取</div><div class="json-tree hidden"></div><button type="button" class="raw-body-button">查看完整原文（按需加载）</button><pre class="raw-body hidden"></pre></details>').join('');}
@@ -503,17 +565,18 @@ $('#images-gallery').addEventListener('click',event=>{const button=event.target.
 
 function expireSession(message='已退出登录。'){
  historyData=null;historyVersion++;webdavVersion++;webdavDirty=false;accessVersion++;state.sessionVersion++;state.connected=false;state.demo=false;state.metrics=null;state.samples=[];state.settings=[];state.limits=[];state.draft={};state.saved='';
+ document.body.classList.add('auth-required');
  clearInterval(state.timer);clearTimeout(state.jobsTimer);clearTimeout(storageState.timer);resetLists();resultsVersion++;resultsAt=0;resultsKey='';
- $('#detail-dialog').close();$('#detail-content').replaceChildren();$('#access-panel').replaceChildren();$('#webdav-panel').replaceChildren();$('#proxy-panel').replaceChildren();proxyVersion++;$('#images-gallery').replaceChildren();$('#admin-jobs').replaceChildren();$('#settings-fields').replaceChildren();
+ $('#detail-dialog').close();$('#detail-content').replaceChildren();$('#access-panel').replaceChildren();$('#webdav-panel').replaceChildren();$('#proxy-panel').replaceChildren();proxyVersion++;$('#images-gallery').replaceChildren();$('#settings-fields').replaceChildren();state.jobs=[];renderNotifications();$('#notifications-panel').classList.add('hidden');$('#notifications-button').setAttribute('aria-expanded','false');
  for(const kind of ['accounts','logs'])renderEmpty(kind,'登录后查看记录。');updateConnectionUI();showConnection();$('#connect-error').textContent=message;
 }
 async function connectSession(){
  const [config,metrics]=await Promise.all([api('/admin/config'),api('/admin/metrics')]);
- state.sessionVersion++;state.connected=true;state.demo=false;state.metrics=metrics;state.samples=[];resultsAt=0;resultsKey='';installSettings(config);resetLists();updateConnectionUI();renderMetrics(metrics);await refreshMetrics();navigate(state.page);resetTimer();
+  state.sessionVersion++;state.connected=true;state.demo=false;document.body.classList.remove('auth-required');if($('#connect-dialog').open)$('#connect-dialog').close();state.metrics=metrics;state.samples=[];resultsAt=0;resultsKey='';installSettings(config);resetLists();updateConnectionUI();renderMetrics(metrics);await refreshMetrics();navigate(state.page);refreshJobs();resetTimer();
 }
 async function restoreSession(){
  try{await api('/admin/session');await connectSession();}
- catch(error){showConnection();if(error.code!==401)$('#connect-error').textContent='暂时无法恢复登录：'+error.message;}
+ catch(error){document.body.classList.remove('auth-pending');document.body.classList.add('auth-required');showConnection();if(error.code!==401)$('#connect-error').textContent='暂时无法恢复登录：'+error.message;}
 }
 async function logoutAdmin(){
  try{await api('/admin/session',{method:'DELETE'});expireSession('已主动退出登录。');}
@@ -654,3 +717,5 @@ async function renderProxy(){
   form.onsubmit=async event=>{event.preventDefault();if(busy)return;lock(true);setText('proxy-status','正在保存…');try{const saved=await api('/admin/proxy',{method:'PUT',body:JSON.stringify({revision:data.revision,config:config()})});if(!current())return;state.revision=saved.revision;toast('代理配置已保存，新会话生效。');await renderProxy();}catch(e){if(current())setText('proxy-status',e.message);}finally{if(current())lock(false);}};
  }catch(e){if(current())target.textContent=e.message;}
 }
+
+showConnection();restoreSession();

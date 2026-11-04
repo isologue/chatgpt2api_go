@@ -426,6 +426,42 @@ func TestHardTimeoutRecoveryPreservesSafetyRefusal(t *testing.T) {
 	assertRecoverySlotsReleased(t, e, n)
 }
 
+func TestTextSafetyRefusalDoesNotSwitchOrPenalize(t *testing.T) {
+	c := testConfig(t)
+	c.SwitchRetries = 3
+	m := recoveryUpstream(t, func(m *mockUpstream, w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/backend-api/f/conversation" {
+			return false
+		}
+		m.starts.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"conversation_id\":\"safety-text\",\"message\":{\"author\":{\"role\":\"assistant\"},\"content\":{\"content_type\":\"text\",\"parts\":[\"非常抱歉，生成的图片可能违反了关于裸露、色情或情色内容的防护限制。如果你认为此判断有误，请重试或修改提示语。\"]}}}\n\ndata: [DONE]\n\n")
+		return true
+	})
+	e, n, store := recoveryEngine(t, m, c, testAccounts(3))
+	_, done, err := e.Submit(context.Background(), Request{N: 1, Prompt: "blocked prompt", Quality: "auto"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := awaitRecoveryResult(t, done)
+	attempts := <-store.attempts
+	if result.err == nil || result.err.Code != "content_policy_violation" || len(attempts) != 1 || m.starts.Load() != 1 {
+		t.Fatalf("text safety refusal retried or misclassified: err=%v attempts=%d starts=%d", result.err, len(attempts), m.starts.Load())
+	}
+	a, _ := e.Pool.Get(attempts[0].AccountID)
+	if a.Score != 50 {
+		t.Fatalf("policy refusal changed account score: got %d", a.Score)
+	}
+	logValues, err := requestLogValues(requestLog{err: result.err})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := logValues.([]any)[10]; status != "safety_rejected" {
+		t.Fatalf("policy refusal log status = %v", status)
+	}
+	assertRecoverySlotsReleased(t, e, n)
+}
+
 func TestTruncateTextKeepsUnicode(t *testing.T) {
 	text := truncateText(strings.Repeat("中", 1001))
 	if len([]rune(text)) != 1000 || strings.ContainsRune(text, '\uFFFD') {

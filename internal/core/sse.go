@@ -2,6 +2,7 @@ package core
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,13 +18,49 @@ type imageRef struct {
 }
 type streamState struct {
 	Text                 string
+	RawResponse          string
+	RawResponseTruncated bool
 	ConversationID       string
 	Refs                 []imageRef
 	Blocked, ToolInvoked bool
 	seen                 map[string]bool
 }
 
+const rawResponseLimit = 64 << 10
+
+func boundedRawResponse(raw []byte) ([]byte, bool) {
+	if len(raw) <= rawResponseLimit {
+		return append([]byte(nil), raw...), false
+	}
+	return append([]byte(nil), raw[:rawResponseLimit]...), true
+}
+
+type responseCapture struct {
+	data      bytes.Buffer
+	truncated bool
+}
+
+func (c *responseCapture) Write(p []byte) (int, error) {
+	remaining := rawResponseLimit - c.data.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			_, _ = c.data.Write(p[:remaining])
+			c.truncated = true
+		} else {
+			_, _ = c.data.Write(p)
+		}
+	} else if len(p) > 0 {
+		c.truncated = true
+	}
+	return len(p), nil
+}
+
 var fileRef = regexp.MustCompile(`file-service://([A-Za-z0-9_-]+)|\b(file_00000000[a-f0-9]{24})\b|sediment://([A-Za-z0-9_-]+)`)
+var contentPolicyRejection = regexp.MustCompile(`(?i)content[_ -]policy[_ -]violation|moderation[_ -]blocked|safety[_ -]violation|unsafe[_ -]prompt|(?:violat\w*|against|rejected by|blocked by).{0,50}(?:content|safety|usage) (?:policy|policies|guidelines)|(?:content|safety|usage) (?:policy|policies|guidelines).{0,50}(?:violat|reject|block)|(?:reject\w*|block\w*).{0,40}(?:safety system|content filters?)|检测到敏感词，拒绝本次任务|AI\s*审核未通过|(?:内容|安全)审(?:查|核)(?:未通过|不通过|拒绝)|(?:违反|触发|不符合|违背).{0,20}(?:内容政策|安全政策|使用政策|内容策略|安全准则|内容准则)|(?:图片|图像).{0,30}(?:违反|触发).{0,50}(?:裸露|色情|情色).{0,30}(?:限制|政策|审核|规则)|(?:裸露|色情|情色).{0,50}(?:防护|限制|政策|审核)|(?:违规|违禁|不当|不安全)(?:的)?(?:内容|提示词|请求)`)
+
+func isContentPolicyRejection(message string) bool {
+	return contentPolicyRejection.MatchString(message)
+}
 
 func (s *streamState) addRefs(v any) {
 	if s.seen == nil {
@@ -76,6 +113,9 @@ func (s *streamState) consume(e map[string]any) {
 		}
 		if text.Len() > 0 {
 			s.Text = truncateText(text.String())
+			if isContentPolicyRejection(s.Text) {
+				s.Blocked = true
+			}
 		}
 	}
 	if role == "user" {
@@ -113,8 +153,7 @@ func (s *streamState) conversation(v any) {
 		}
 	}
 }
-func (s *session) stream(ctx context.Context, payload any, headers map[string]string) (streamState, error) {
-	state := streamState{}
+func (s *session) stream(ctx context.Context, payload any, headers map[string]string) (state streamState, resultErr error) {
 	parent := ctx
 	ctx, cancel := context.WithTimeoutCause(ctx, s.n.config(ctx).SSETimeout, errSSEHardTimeout)
 	defer cancel()
@@ -137,7 +176,12 @@ func (s *session) stream(ctx context.Context, payload any, headers map[string]st
 	s.n.activeSSE.Add(1)
 	defer s.n.activeSSE.Add(-1)
 	// 限制总字节与单事件大小，不持有整个生成流；取消由传输层 context 直接打断。
-	scanner := bufio.NewScanner(io.LimitReader(resp.Body, 32<<20))
+	capture := &responseCapture{}
+	defer func() {
+		state.RawResponse = capture.data.String()
+		state.RawResponseTruncated = capture.truncated
+	}()
+	scanner := bufio.NewScanner(io.LimitReader(io.TeeReader(resp.Body, capture), 32<<20))
 	scanner.Buffer(make([]byte, 4096), 2<<20)
 	var event strings.Builder
 	consume := func() bool {
@@ -191,11 +235,13 @@ func (s *session) poll(ctx context.Context, state *streamState) error {
 	ctx, cancel := context.WithTimeout(ctx, s.n.config(ctx).PollTimeout)
 	defer cancel()
 	for {
-		data, err := s.json(ctx, "GET", "/backend-api/conversation/"+state.ConversationID, nil, nil)
+		data, raw, err := s.jsonWithRaw(ctx, "GET", "/backend-api/conversation/"+state.ConversationID, nil, nil)
 		if err == nil {
 			state.conversation(data)
 			if state.Blocked {
-				return Err(400, "content_policy_violation", "上游安全审核拒绝")
+				apiErr := Err(400, "content_policy_violation", "上游安全审核拒绝")
+				apiErr.rawResponse, apiErr.rawResponseTruncated = boundedRawResponse(raw)
+				return apiErr
 			}
 			if len(state.Refs) > 0 {
 				return nil
@@ -203,9 +249,10 @@ func (s *session) poll(ctx context.Context, state *streamState) error {
 		}
 		// 只使用匹配当前会话的任务错误，避免把其它请求的审核失败串入本次请求。
 		if ctx.Err() == nil {
-			tasks, e := s.json(ctx, "GET", "/backend-api/tasks", nil, nil)
+			tasks, raw, e := s.jsonWithRaw(ctx, "GET", "/backend-api/tasks", nil, nil)
 			if e == nil {
 				if error := matchingTaskError(tasks, state.ConversationID); error != nil {
+					error.rawResponse, error.rawResponseTruncated = boundedRawResponse(raw)
 					return error
 				}
 			}
@@ -235,8 +282,7 @@ func matchingTaskError(v any, cid string) *APIError {
 						text += str(v)
 					}
 					text = truncateText(text)
-					lower := strings.ToLower(text)
-					if strings.Contains(lower, "content policy") || strings.Contains(lower, "safety") || strings.Contains(lower, "违规") {
+					if isContentPolicyRejection(text) {
 						return Err(400, "content_policy_violation", text)
 					}
 					return RetryError("no_image_generated", text)

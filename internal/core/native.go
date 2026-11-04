@@ -18,28 +18,31 @@ import (
 )
 
 type Native struct {
-	routes                                                                                       *proxyRouter
-	c                                                                                            Config
-	pool                                                                                         *Pool
-	store                                                                                        Store
-	http                                                                                         tlsclient.HttpClient
-	verify, downloads, validation                                                                *limiter
-	manualVerify, hotMaintenance, coldMaintenance, replenishment                                 *limiter
-	pow                                                                                          *limiter
-	settings                                                                                     *runtimeConfig
-	flight                                                                                       singleflight.Group
-	lifecycle                                                                                    sync.Mutex
-	closed                                                                                       bool
-	flights                                                                                      sync.WaitGroup
-	root                                                                                         context.Context
-	cancel                                                                                       context.CancelFunc
-	activeSSE, started, downloadActive, downloadWaiting, downloadBytes, verifyActive             atomic.Int64
-	validationActive, validationWaiting, manualVerifyActive                                      atomic.Int64
-	refreshSucceeded, refreshFailed, lastRefreshSuccess, lastRefreshFailure, persistenceFailures atomic.Int64
-	turnstileFailures                                                                            atomic.Int64
-	sseHardTimeouts, streamRecoveries                                                            atomic.Int64
-	stageMu                                                                                      sync.Mutex
-	stages                                                                                       map[string]*stageHistogram
+	routes                                                                                                    *proxyRouter
+	c                                                                                                         Config
+	pool                                                                                                      *Pool
+	store                                                                                                     Store
+	http                                                                                                      tlsclient.HttpClient
+	verify, downloads, validation                                                                             *limiter
+	manualVerify, hotMaintenance, coldMaintenance, replenishment                                              *limiter
+	pow                                                                                                       *limiter
+	settings                                                                                                  *runtimeConfig
+	flight                                                                                                    singleflight.Group
+	tokenFlight                                                                                               singleflight.Group
+	lifecycle                                                                                                 sync.Mutex
+	closed                                                                                                    bool
+	flights                                                                                                   sync.WaitGroup
+	root                                                                                                      context.Context
+	cancel                                                                                                    context.CancelFunc
+	activeSSE, started, downloadActive, downloadWaiting, downloadBytes, verifyActive                          atomic.Int64
+	validationActive, validationWaiting, manualVerifyActive                                                   atomic.Int64
+	refreshSucceeded, refreshFailed, lastRefreshSuccess, lastRefreshFailure, persistenceFailures              atomic.Int64
+	accountInfoRefreshActive, accessTokenRefreshActive, accessTokenRefreshSucceeded, accessTokenRefreshFailed atomic.Int64
+	turnstileFailures                                                                                         atomic.Int64
+	sseHardTimeouts, streamRecoveries                                                                         atomic.Int64
+	stageMu                                                                                                   sync.Mutex
+	stages                                                                                                    map[string]*stageHistogram
+	refreshRuns                                                                                               *accountRefreshTracker
 }
 type stageHistogram struct {
 	Count    int64
@@ -59,7 +62,17 @@ func NewNative(c Config, p *Pool, s Store) (*Native, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Native{c: c, pool: p, store: s, http: client, routes: newProxyRouter(), validation: newLimiter(c.ValidationConcurrency), verify: newLimiter(c.VerifyConcurrency), manualVerify: newLimiter(c.VerifyConcurrency), hotMaintenance: newLimiter(c.VerifyConcurrency), coldMaintenance: newLimiter(c.VerifyConcurrency), replenishment: newLimiter(c.VerifyConcurrency), downloads: newLimiter(c.DownloadConcurrency), pow: newLimiter(c.powLimit()), root: ctx, cancel: cancel, stages: map[string]*stageHistogram{}}, nil
+	n := &Native{c: c, pool: p, store: s, http: client, routes: newProxyRouter(), validation: newLimiter(c.ValidationConcurrency), verify: newLimiter(c.VerifyConcurrency), manualVerify: newLimiter(c.VerifyConcurrency), hotMaintenance: newLimiter(c.VerifyConcurrency), coldMaintenance: newLimiter(c.VerifyConcurrency), replenishment: newLimiter(c.VerifyConcurrency), downloads: newLimiter(c.DownloadConcurrency), pow: newLimiter(c.powLimit()), root: ctx, cancel: cancel, stages: map[string]*stageHistogram{}, refreshRuns: newAccountRefreshTracker()}
+	if store, ok := s.(accountRefreshRunStore); ok {
+		loadCtx, loadCancel := context.WithTimeout(ctx, 3*time.Second)
+		if runs, loadErr := store.ListLatestAccountRefreshRuns(loadCtx); loadErr == nil {
+			for _, run := range n.refreshRuns.load(runs) {
+				n.persistRefreshRun(run)
+			}
+		}
+		loadCancel()
+	}
+	return n, nil
 }
 func (n *Native) Close() {
 	n.lifecycle.Lock()
@@ -104,7 +117,7 @@ func (n *Native) Snapshot() map[string]any {
 		hist[k] = map[string]any{"count": h.Count, "mean_ms": h.Sum / float64(h.Count), "max_ms": h.Max, "histogram": h.Buckets, "bucket_upper_ms": stageBounds}
 	}
 	n.stageMu.Unlock()
-	return map[string]any{"account_persistence_errors": n.persistenceFailures.Load(), "account_refresh_succeeded": n.refreshSucceeded.Load(), "account_refresh_failed": n.refreshFailed.Load(), "last_refresh_success_unix": n.lastRefreshSuccess.Load(), "last_refresh_failure_unix": n.lastRefreshFailure.Load(), "replenishment_active": n.replenishment.Used(), "replenishment_limit": n.replenishment.Limit(), "replenishment_waiting": n.replenishment.Waiting(), "pow_active": n.pow.Used(), "pow_waiting": n.pow.Waiting(), "pow_limit": n.pow.Limit(), "sse_hard_timeouts": n.sseHardTimeouts.Load(), "stream_timeout_recoveries": n.streamRecoveries.Load(), "turnstile_solver_failures": n.turnstileFailures.Load(), "generation_started": n.started.Load(), "sse_active": n.activeSSE.Load(), "verification_active": n.verifyActive.Load(), "verification_limit": n.verify.Limit(), "verification_waiting": n.verify.Waiting(), "manual_verification_active": n.manualVerifyActive.Load(), "manual_verification_limit": n.manualVerify.Limit(), "manual_verification_waiting": n.manualVerify.Waiting(), "hot_maintenance_active": n.hotMaintenance.Used(), "hot_maintenance_waiting": n.hotMaintenance.Waiting(), "hot_maintenance_limit": n.hotMaintenance.Limit(), "cold_maintenance_active": n.coldMaintenance.Used(), "cold_maintenance_waiting": n.coldMaintenance.Waiting(), "cold_maintenance_limit": n.coldMaintenance.Limit(), "download_active": n.downloadActive.Load(), "download_waiting": n.downloadWaiting.Load(), "download_limit": n.downloads.Limit(), "download_bytes": n.downloadBytes.Load(), "validation_active": n.validationActive.Load(), "validation_waiting": n.validationWaiting.Load(), "validation_limit": n.validation.Limit(), "stages": hist}
+	return map[string]any{"account_persistence_errors": n.persistenceFailures.Load(), "account_refresh_succeeded": n.refreshSucceeded.Load(), "account_refresh_failed": n.refreshFailed.Load(), "account_info_refresh_succeeded": n.refreshSucceeded.Load(), "account_info_refresh_failed": n.refreshFailed.Load(), "account_info_refresh_active": n.accountInfoRefreshActive.Load(), "access_token_refresh_succeeded": n.accessTokenRefreshSucceeded.Load(), "access_token_refresh_failed": n.accessTokenRefreshFailed.Load(), "access_token_refresh_active": n.accessTokenRefreshActive.Load(), "last_refresh_success_unix": n.lastRefreshSuccess.Load(), "last_refresh_failure_unix": n.lastRefreshFailure.Load(), "replenishment_active": n.replenishment.Used(), "replenishment_limit": n.replenishment.Limit(), "replenishment_waiting": n.replenishment.Waiting(), "pow_active": n.pow.Used(), "pow_waiting": n.pow.Waiting(), "pow_limit": n.pow.Limit(), "sse_hard_timeouts": n.sseHardTimeouts.Load(), "stream_timeout_recoveries": n.streamRecoveries.Load(), "turnstile_solver_failures": n.turnstileFailures.Load(), "generation_started": n.started.Load(), "sse_active": n.activeSSE.Load(), "verification_active": n.verifyActive.Load(), "verification_limit": n.verify.Limit(), "verification_waiting": n.verify.Waiting(), "manual_verification_active": n.manualVerifyActive.Load(), "manual_verification_limit": n.manualVerify.Limit(), "manual_verification_waiting": n.manualVerify.Waiting(), "hot_maintenance_active": n.hotMaintenance.Used(), "hot_maintenance_waiting": n.hotMaintenance.Waiting(), "hot_maintenance_limit": n.hotMaintenance.Limit(), "cold_maintenance_active": n.coldMaintenance.Used(), "cold_maintenance_waiting": n.coldMaintenance.Waiting(), "cold_maintenance_limit": n.coldMaintenance.Limit(), "download_active": n.downloadActive.Load(), "download_waiting": n.downloadWaiting.Load(), "download_limit": n.downloads.Limit(), "download_bytes": n.downloadBytes.Load(), "validation_active": n.validationActive.Load(), "validation_waiting": n.validationWaiting.Load(), "validation_limit": n.validation.Limit(), "stages": hist}
 }
 func tokenExpiring(token string) bool {
 	parts := strings.Split(token, ".")
@@ -144,10 +157,18 @@ func (n *Native) checkAccount(ctx context.Context, a Account, force bool) (Accou
 	if force {
 		lane = "manual"
 	}
-	return n.checkAccountWithGate(ctx, a, force, gate, active, lane)
+	source := "on_demand"
+	if force {
+		source = "manual_quota"
+	}
+	return n.checkAccountWithGate(context.WithValue(ctx, refreshSourceContextKey{}, source), a, force, gate, active, lane)
 }
 
 func (n *Native) checkAccountWithGate(ctx context.Context, a Account, force bool, gate *limiter, active *atomic.Int64, lane string) (Account, error) {
+	source := refreshSource(ctx)
+	if source == "" {
+		source = map[string]string{"hot": "hot_maintenance", "cold": "cold_maintenance", "replenish": "replenishment", "manual": "manual_quota"}[lane]
+	}
 	if current, ok := n.pool.Get(a.ID); ok {
 		a = current
 	}
@@ -189,12 +210,29 @@ func (n *Native) checkAccountWithGate(ctx context.Context, a Account, force bool
 			active.Add(1)
 			defer active.Add(-1)
 		}
+		if source == "on_demand" {
+			n.refreshRuns.beginOnDemandItem(a.Hot)
+		} else {
+			dynamicTotal := source == "hot_maintenance" || source == "cold_maintenance" || source == "replenishment"
+			n.refreshRuns.beginItem(source, dynamicTotal, a.Hot)
+		}
+		defer func() {
+			message := ""
+			if flightErr != nil {
+				message = AsError(flightErr).Message
+			}
+			if run, ended := n.refreshRuns.finishItem(source, a.ID, a.Email, message); ended {
+				n.persistRefreshRun(run)
+			}
+		}()
 		if current, ok := n.pool.Get(a.ID); ok {
 			a = current
 		}
 		if !force && !tokenExpiring(a.AccessToken) && time.Since(maxTime(a.VerifiedAt, a.SuccessAt)) < n.config(ctx).Freshness {
 			return a, nil
 		}
+		n.accountInfoRefreshActive.Add(1)
+		defer n.accountInfoRefreshActive.Add(-1)
 		if tokenExpiring(a.AccessToken) {
 			if a.RefreshToken == "" {
 				e := RetryError("account_token_expired", "账号 AT 已过期且没有 RT")
@@ -202,17 +240,9 @@ func (n *Native) checkAccountWithGate(ctx context.Context, a Account, force bool
 				return nil, e
 			}
 			var err error
-			a, err = n.refreshToken(ctx, a)
+			a, err = n.refreshAccessToken(context.WithValue(ctx, refreshSourceContextKey{}, source), a)
 			if err != nil {
 				return nil, err
-			}
-			// RT 可能旋转，必须先保存凭据，失败时禁止继续使用无法恢复的刷新结果。
-			a = n.pool.UpdateCredentials(a)
-			if a.ID == "" {
-				return nil, Err(409, "account_removed", "账号已删除")
-			}
-			if err = n.store.SaveAccount(ctx, a); err != nil {
-				return nil, Err(503, "token_persistence_failed", "更新账号令牌后持久化失败")
 			}
 		}
 		s := n.session(a)
@@ -224,13 +254,14 @@ func (n *Native) checkAccountWithGate(ctx context.Context, a Account, force bool
 		a = applyAccountInfo(a, me)
 		init, initErr := n.accountMetadataJSON(ctx, &a, &s, "POST", "/backend-api/conversation/init", map[string]any{"gizmo_id": nil, "requested_default_model": nil, "conversation_id": nil, "timezone_offset_min": -480})
 		if initErr != nil {
-			code := AsError(initErr).Code
-			if code != "upstream_http_404" && code != "upstream_http_405" {
-				return nil, initErr
-			}
-		} else {
-			a = applyQuotaInfo(a, init)
+			return nil, initErr
 		}
+		a = applyQuotaInfo(a, init)
+		accountInfo, err := n.accountMetadataJSON(ctx, &a, &s, "GET", "/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-480", nil)
+		if err != nil {
+			return nil, err
+		}
+		a = applyDefaultAccountInfo(a, accountInfo)
 		a.VerifiedAt = time.Now()
 		a.LastRefreshAt = a.VerifiedAt
 		a.LastRefreshError = ""
@@ -262,6 +293,70 @@ func (n *Native) checkAccountWithGate(ctx context.Context, a Account, force bool
 	}
 }
 
+func (n *Native) refreshAccessToken(ctx context.Context, account Account) (Account, error) {
+	source := refreshSource(ctx)
+	if current, ok := n.pool.Get(account.ID); ok {
+		account = current
+	}
+	ch := n.tokenFlight.DoChan(account.ID, func() (any, error) {
+		n.lifecycle.Lock()
+		if n.closed {
+			n.lifecycle.Unlock()
+			return nil, context.Canceled
+		}
+		n.flights.Add(1)
+		n.lifecycle.Unlock()
+		defer n.flights.Done()
+		n.accessTokenRefreshActive.Add(1)
+		defer n.accessTokenRefreshActive.Add(-1)
+
+		if current, ok := n.pool.Get(account.ID); ok {
+			account = current
+		}
+		if account.RefreshToken == "" {
+			n.accessTokenRefreshFailed.Add(1)
+			n.refreshRuns.tokenResult(source, RetryError("refresh_token_missing", "账号没有 RT，无法刷新 AT"))
+			return nil, RetryError("refresh_token_missing", "账号没有 RT，无法刷新 AT")
+		}
+		refreshCtx, cancel := context.WithTimeout(n.root, 3*n.config(ctx).MetadataTimeout)
+		defer cancel()
+		refreshed, err := n.refreshToken(refreshCtx, account)
+		if err != nil {
+			n.accessTokenRefreshFailed.Add(1)
+			n.refreshRuns.tokenResult(source, err)
+			refreshed = n.pool.UpdateCredentials(refreshed)
+			if refreshed.ID != "" {
+				if saveErr := n.store.SaveAccount(refreshCtx, refreshed); saveErr != nil {
+					n.persistenceFailures.Add(1)
+				}
+			}
+			return nil, err
+		}
+		refreshed = n.pool.UpdateCredentials(refreshed)
+		if refreshed.ID == "" {
+			return nil, Err(409, "account_removed", "账号已删除")
+		}
+		if err := n.store.SaveAccount(refreshCtx, refreshed); err != nil {
+			n.accessTokenRefreshFailed.Add(1)
+			n.refreshRuns.tokenResult(source, err)
+			n.persistenceFailures.Add(1)
+			return nil, Err(503, "token_persistence_failed", "更新账号令牌后持久化失败")
+		}
+		n.accessTokenRefreshSucceeded.Add(1)
+		n.refreshRuns.tokenResult(source, nil)
+		return refreshed, nil
+	})
+	select {
+	case <-ctx.Done():
+		return account, ctx.Err()
+	case result := <-ch:
+		if result.Err != nil {
+			return account, result.Err
+		}
+		return result.Val.(Account), nil
+	}
+}
+
 // accountMetadataJSON repairs one rejected access token with its refresh token, persists any
 // rotated credentials, then retries the original metadata request exactly once.
 func (n *Native) accountMetadataJSON(ctx context.Context, a *Account, s **session, method, path string, payload any) (map[string]any, error) {
@@ -271,19 +366,12 @@ func (n *Native) accountMetadataJSON(ctx context.Context, a *Account, s **sessio
 	}
 	(*s).close()
 
-	refreshed, refreshErr := n.refreshToken(ctx, *a)
+	refreshed, refreshErr := n.refreshAccessToken(ctx, *a)
 	if refreshErr != nil {
 		return nil, refreshErr
 	}
 	if refreshed.AccessToken == a.AccessToken {
 		return nil, err
-	}
-	refreshed = n.pool.UpdateCredentials(refreshed)
-	if refreshed.ID == "" {
-		return nil, Err(409, "account_removed", "账号已删除")
-	}
-	if err := n.store.SaveAccount(ctx, refreshed); err != nil {
-		return nil, Err(503, "token_persistence_failed", "更新账号令牌后持久化失败")
 	}
 	*a = refreshed
 	*s = n.session(refreshed)
@@ -296,7 +384,32 @@ func maxTime(a, b time.Time) time.Time {
 	}
 	return b
 }
+
+// Generate retries the current account once when the access token is rejected
+// during the generation path. The outer engine still owns account switching;
+// a failed refresh or a second rejection is returned unchanged for that logic.
 func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[string]float64) ([]Artifact, error) {
+	current := a
+	for refreshAttempt := 0; ; refreshAttempt++ {
+		images, err := n.generateOnce(ctx, current, r, stages)
+		if err == nil {
+			return images, nil
+		}
+		if AsError(err).Code != "account_token_invalid" || refreshAttempt >= 1 {
+			return nil, err
+		}
+		refreshed, refreshErr := n.refreshAccessToken(ctx, current)
+		if refreshErr != nil {
+			return nil, refreshErr
+		}
+		if refreshed.AccessToken == current.AccessToken {
+			return nil, err
+		}
+		current = refreshed
+	}
+}
+
+func (n *Native) generateOnce(ctx context.Context, a Account, r Request, stages map[string]float64) ([]Artifact, error) {
 	ctx = context.WithValue(ctx, configKey{}, n.config(ctx))
 	if cfg := n.config(ctx); cfg.ImageResizeEnabled {
 		if target, err := parseImageSize(r.Size); err == nil && target.Width > 0 {
@@ -373,7 +486,7 @@ func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[
 		return nil, ctx.Err()
 	}
 	if state.Blocked {
-		return nil, Err(400, "content_policy_violation", "上游安全审核拒绝")
+		return nil, withRawResponse(Err(400, "content_policy_violation", "上游安全审核拒绝"), state)
 	}
 	// 先补查原会话；只有实际生成流硬超时才豁免总预算，阶段时限与取消继续生效。
 	if len(state.Refs) == 0 && state.ConversationID != "" {
@@ -384,9 +497,9 @@ func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[
 			// 生成流完整结束但仅返回文字时，补查无图后保留未出图类型和原文。
 			// 已调用工具或流中断时结果仍可能在生成，不能误判为明确未出图。
 			if streamErr == nil && !state.ToolInvoked && state.Text != "" && ctx.Err() == nil && AsError(err).Code == "image_result_uncertain" {
-				return nil, RetryError("no_image_generated", state.Text)
+				return nil, withRawResponse(RetryError("no_image_generated", state.Text), state)
 			}
-			return nil, err
+			return nil, withRawResponse(err, state)
 		}
 	}
 	if len(state.Refs) == 0 {
@@ -394,13 +507,13 @@ func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[
 			return nil, uncertainImageResult("上游生成流硬超时，未取得可补查的图片结果")
 		}
 		if streamErr != nil {
-			return nil, streamErr
+			return nil, withRawResponse(streamErr, state)
 		}
 		message := state.Text
 		if message == "" {
 			message = "上游没有返回可用图片"
 		}
-		return nil, RetryError("no_image_generated", message)
+		return nil, withRawResponse(RetryError("no_image_generated", message), state)
 	}
 	for _, ref := range state.Refs {
 		start = time.Now()
@@ -430,6 +543,15 @@ func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[
 		return []Artifact{artifact}, nil
 	}
 	return nil, RetryError("image_url_missing", "上游图片缺少下载地址")
+}
+
+func withRawResponse(err error, state streamState) error {
+	apiErr := AsError(err)
+	if len(apiErr.rawResponse) == 0 && state.RawResponse != "" {
+		apiErr.rawResponse = []byte(state.RawResponse)
+		apiErr.rawResponseTruncated = state.RawResponseTruncated
+	}
+	return apiErr
 }
 func (s *session) bootstrap(ctx context.Context) (string, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.n.config(ctx).MetadataTimeout)

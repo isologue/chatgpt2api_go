@@ -27,13 +27,15 @@ type Request struct {
 	Stream                     bool   `json:"stream,omitempty"`
 }
 type APIError struct {
-	Status     int           `json:"-"`
-	Code       string        `json:"code"`
-	Message    string        `json:"message"`
-	Retry      bool          `json:"-"`
-	Penalty    int           `json:"-"`
-	Cooldown   time.Duration `json:"-"`
-	Invalidate bool          `json:"-"`
+	Status               int           `json:"-"`
+	Code                 string        `json:"code"`
+	Message              string        `json:"message"`
+	Retry                bool          `json:"-"`
+	Penalty              int           `json:"-"`
+	Cooldown             time.Duration `json:"-"`
+	Invalidate           bool          `json:"-"`
+	rawResponse          []byte
+	rawResponseTruncated bool
 }
 
 func (e *APIError) Error() string { return e.Code + ": " + e.Message }
@@ -150,32 +152,36 @@ func parseImageSize(value string) (imageSize, error) {
 }
 
 type Account struct {
-	Extra            map[string]json.RawMessage `json:"-"`
-	NextRefreshAt    time.Time                  `json:"next_refresh_at,omitempty"`
-	RefreshFailures  int                        `json:"refresh_failures,omitempty"`
-	Revision         int64                      `json:"revision"`
-	ID               string                     `json:"id"`
-	IdentityID       string                     `json:"identity_id,omitempty"`
-	Email            string                     `json:"email"`
-	AccessToken      string                     `json:"access_token"`
-	RefreshToken     string                     `json:"refresh_token,omitempty"`
-	ClientID         string                     `json:"client_id,omitempty"`
-	DeviceID         string                     `json:"device_id,omitempty"`
-	UserAgent        string                     `json:"user_agent,omitempty"`
-	Score            int                        `json:"score"`
-	Enabled          bool                       `json:"enabled"`
-	VerifiedAt       time.Time                  `json:"verified_at,omitempty"`
-	SuccessAt        time.Time                  `json:"success_at,omitempty"`
-	AvailableAt      time.Time                  `json:"available_at,omitempty"`
-	LastUsedAt       time.Time                  `json:"last_used_at,omitempty"`
-	LastRefreshAt    time.Time                  `json:"last_refresh_at,omitempty"`
-	LastRefreshError string                     `json:"last_refresh_error,omitempty"`
-	Hot              bool                       `json:"hot"`
-	HotSince         time.Time                  `json:"hot_since,omitempty"`
-	Quota            *float64                   `json:"quota,omitempty"`
-	QuotaResetAt     time.Time                  `json:"quota_reset_at,omitempty"`
-	Status           string                     `json:"status,omitempty"`
-	LastErrorCode    string                     `json:"last_error_code,omitempty"`
+	Extra                   map[string]json.RawMessage `json:"-"`
+	NextRefreshAt           time.Time                  `json:"next_refresh_at,omitempty"`
+	RefreshFailures         int                        `json:"refresh_failures,omitempty"`
+	Revision                int64                      `json:"revision"`
+	ID                      string                     `json:"id"`
+	IdentityID              string                     `json:"identity_id,omitempty"`
+	Email                   string                     `json:"email"`
+	AccessToken             string                     `json:"access_token"`
+	RefreshToken            string                     `json:"refresh_token,omitempty"`
+	IDToken                 string                     `json:"id_token,omitempty"`
+	ClientID                string                     `json:"client_id,omitempty"`
+	DeviceID                string                     `json:"device_id,omitempty"`
+	UserAgent               string                     `json:"user_agent,omitempty"`
+	Score                   int                        `json:"score"`
+	Enabled                 bool                       `json:"enabled"`
+	VerifiedAt              time.Time                  `json:"verified_at,omitempty"`
+	SuccessAt               time.Time                  `json:"success_at,omitempty"`
+	AvailableAt             time.Time                  `json:"available_at,omitempty"`
+	LastUsedAt              time.Time                  `json:"last_used_at,omitempty"`
+	LastRefreshAt           time.Time                  `json:"last_refresh_at,omitempty"`
+	LastRefreshError        string                     `json:"last_refresh_error,omitempty"`
+	LastTokenRefreshAt      time.Time                  `json:"last_token_refresh_at,omitempty"`
+	LastTokenRefreshError   string                     `json:"last_token_refresh_error,omitempty"`
+	LastTokenRefreshErrorAt time.Time                  `json:"last_token_refresh_error_at,omitempty"`
+	Hot                     bool                       `json:"hot"`
+	HotSince                time.Time                  `json:"hot_since,omitempty"`
+	Quota                   *float64                   `json:"quota,omitempty"`
+	QuotaResetAt            time.Time                  `json:"quota_reset_at,omitempty"`
+	Status                  string                     `json:"status,omitempty"`
+	LastErrorCode           string                     `json:"last_error_code,omitempty"`
 }
 type Artifact struct {
 	RemoteURL string `json:"remote_url,omitempty"`
@@ -194,6 +200,8 @@ type Attempt struct {
 	Started                 time.Time          `json:"started_at"`
 	DurationMS              int64              `json:"duration_ms"`
 	Code                    string             `json:"code,omitempty"`
+	RawResponse             string             `json:"raw_response,omitempty"`
+	RawResponseTruncated    bool               `json:"raw_response_truncated,omitempty"`
 	Stages                  map[string]float64 `json:"stages_ms,omitempty"`
 }
 type Task struct {

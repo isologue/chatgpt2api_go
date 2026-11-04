@@ -193,7 +193,7 @@ func (s *Postgres) ListAdminJobs(ctx context.Context) ([]adminJob, error) {
 	return s.listAdminJobs(ctx, "SELECT data FROM core_admin_jobs ORDER BY created_at DESC,id DESC LIMIT 20")
 }
 func (s *Postgres) ListAccountJobs(ctx context.Context) ([]adminJob, error) {
-	return s.listAdminJobs(ctx, "SELECT data FROM core_admin_jobs WHERE kind IN ('import','push','verify','delete') ORDER BY created_at DESC,id DESC LIMIT 20")
+	return s.listAdminJobs(ctx, "SELECT data FROM core_admin_jobs WHERE kind IN ('import','push','verify','refresh_at','delete') ORDER BY created_at DESC,id DESC LIMIT 20")
 }
 func (s *Postgres) latestCleanupJobs(ctx context.Context) ([]adminJob, error) {
 	return s.listAdminJobs(ctx, "SELECT DISTINCT ON (kind) data FROM core_admin_jobs WHERE kind IN ('cleanup_images','cleanup_logs') ORDER BY kind,created_at DESC,id DESC")

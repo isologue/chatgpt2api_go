@@ -246,9 +246,15 @@ func (p *Pool) UpdateCredentials(a Account) Account {
 		e.a.AccessToken = a.AccessToken
 		e.paid = paidAccount(e.a)
 		e.a.RefreshToken = a.RefreshToken
+		if a.IDToken != "" {
+			e.a.IDToken = a.IDToken
+		}
 		e.a.VerifiedAt = a.VerifiedAt
 		e.a.LastRefreshAt = a.LastRefreshAt
 		e.a.LastRefreshError = a.LastRefreshError
+		e.a.LastTokenRefreshAt = a.LastTokenRefreshAt
+		e.a.LastTokenRefreshError = a.LastTokenRefreshError
+		e.a.LastTokenRefreshErrorAt = a.LastTokenRefreshErrorAt
 		e.a.Status = a.Status
 		e.a.NextRefreshAt = a.NextRefreshAt
 		e.a.RefreshFailures = a.RefreshFailures
@@ -256,6 +262,9 @@ func (p *Pool) UpdateCredentials(a Account) Account {
 		e.a.Email = a.Email
 		e.a.Quota = a.Quota
 		e.a.QuotaResetAt = a.QuotaResetAt
+		if a.Extra != nil {
+			e.a.Extra = cloneAccountExtra(a.Extra)
+		}
 		if a.Quota != nil && *a.Quota <= 0 {
 			p.setHot(e, false, time.Now())
 		}

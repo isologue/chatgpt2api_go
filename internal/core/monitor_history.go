@@ -105,6 +105,9 @@ func (e *Engine) StartMonitorHistory() {
 			var cleaned time.Time
 			for {
 				now := time.Now().UTC()
+				if n, ok := e.Generator.(*Native); ok {
+					n.persistActiveRefreshRuns()
+				}
 				ctx, cancel := context.WithTimeout(e.root, 4*time.Second)
 				err := store.SaveMonitorSample(ctx, monitorPoint{Time: now, Values: monitorValues(e.monitorSnapshot())})
 				cancel()

@@ -49,7 +49,7 @@ func parseAccountRow(raw json.RawMessage, context map[string]json.RawMessage) (A
 			return Account{}, fmt.Errorf("不支持的账号凭据类型")
 		}
 	}
-	for _, key := range []string{"access_token", "refresh_token", "client_id", "email", "device_id", "user_agent"} {
+	for _, key := range []string{"access_token", "refresh_token", "id_token", "client_id", "email", "device_id", "user_agent"} {
 		if strings.TrimSpace(str(m[key])) != "" {
 			continue
 		}

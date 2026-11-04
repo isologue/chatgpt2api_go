@@ -1,0 +1,52 @@
+body.auth-pending .app-shell,
+body.auth-required .app-shell {
+  display: none;
+}
+
+body.auth-required #connect-dialog[open] {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  max-height: none;
+  margin: 0;
+  padding: 24px;
+  border: 0;
+  border-radius: 0;
+  background: var(--bg);
+  box-shadow: none;
+}
+
+body.auth-required #connect-dialog::backdrop {
+  background: var(--bg);
+}
+
+body.auth-required #connect-dialog form {
+  width: min(430px, 100%);
+  padding: 34px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: 0 18px 56px #352c2412;
+}
+
+body.auth-required #connect-dialog .modal-heading {
+  margin-bottom: 22px;
+}
+
+body.auth-required #connect-dialog .form-label {
+  margin-top: 24px;
+}
+
+@media (max-width: 480px) {
+  body.auth-required #connect-dialog {
+    padding: 18px;
+  }
+
+  body.auth-required #connect-dialog form {
+    padding: 26px 22px;
+  }
+}

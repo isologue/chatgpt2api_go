@@ -42,6 +42,8 @@ func OpenPostgres(ctx context.Context, url string, connections int) (*Postgres, 
 
 const schema = exportSchema + `
 CREATE TABLE IF NOT EXISTS core_monitor_samples(sampled_at timestamptz PRIMARY KEY, data jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS core_account_refresh_runs(id text PRIMARY KEY,source text NOT NULL,started_at timestamptz NOT NULL,updated_at timestamptz NOT NULL,data jsonb NOT NULL);
+CREATE INDEX IF NOT EXISTS core_account_refresh_runs_latest ON core_account_refresh_runs(source,started_at DESC);
 CREATE TABLE IF NOT EXISTS core_accounts(id text PRIMARY KEY, access_fingerprint text NOT NULL UNIQUE, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now());
 ALTER TABLE core_accounts ADD COLUMN IF NOT EXISTS managed_enabled boolean;
 ALTER TABLE core_accounts ADD COLUMN IF NOT EXISTS identity_key text;

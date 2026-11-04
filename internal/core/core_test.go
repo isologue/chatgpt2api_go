@@ -320,6 +320,10 @@ func (m *mockUpstream) handle(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/backend-api/me":
 		m.me.Add(1)
 		sendJSON(w, 200, map[string]any{"id": "mock"})
+	case r.URL.Path == "/backend-api/conversation/init":
+		sendJSON(w, 200, map[string]any{"limits_progress": []any{map[string]any{"feature_name": "image_gen", "remaining": 12}}})
+	case r.URL.Path == "/backend-api/accounts/check/v4-2023-04-27":
+		sendJSON(w, 200, map[string]any{"accounts": map[string]any{"default": map[string]any{"account": map[string]any{"plan_type": "plus"}}}})
 	case strings.HasSuffix(r.URL.Path, "chat-requirements/prepare"):
 		challenge := map[string]any{"prepare_token": "prepare", "proofofwork": map[string]any{"required": true, "seed": "mock", "difficulty": "ff"}}
 		if mode == "turnstile_unsupported" || mode == "turnstile_rejected" {
@@ -342,6 +346,10 @@ func (m *mockUpstream) handle(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, 200, map[string]string{"conduit_token": "conduit"})
 	case r.URL.Path == "/backend-api/f/conversation":
 		m.starts.Add(1)
+		if mode == "generation_401" && strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") == "token-0" {
+			sendJSON(w, 401, map[string]any{"error": map[string]string{"code": "token_expired"}})
+			return
+		}
 		active := m.sseActive.Add(1)
 		defer m.sseActive.Add(-1)
 		for {
@@ -406,6 +414,27 @@ func (m *mockUpstream) handle(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, 200, map[string]string{"access_token": "new-access-token", "refresh_token": "rotated-refresh-token"})
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+func TestGeneration401RefreshesCurrentAccountBeforeSwitching(t *testing.T) {
+	m := newMockUpstream(t)
+	m.mode.Store("generation_401")
+	c := testConfig(t)
+	a := testAccounts(1)[0]
+	a.RefreshToken = "old-refresh-token"
+	n, pool, store := newNativeTest(t, m, c, []Account{a})
+
+	images, err := n.Generate(context.Background(), a, Request{N: 1, Prompt: "square", Quality: "auto"}, map[string]float64{})
+	if err != nil || len(images) != 1 {
+		t.Fatalf("generation did not recover after 401: images=%d err=%v", len(images), err)
+	}
+	current, ok := pool.Get(a.ID)
+	if !ok || current.AccessToken != "new-access-token" || current.RefreshToken != "rotated-refresh-token" || m.oauth.Load() != 1 {
+		t.Fatalf("rotated credentials not retained: account=%#v oauth=%d", current, m.oauth.Load())
+	}
+	if persisted, ok := store.accounts[a.ID]; !ok || persisted.RefreshToken != "rotated-refresh-token" {
+		t.Fatal("rotated RT was not persisted")
 	}
 }
 func newNativeTest(t *testing.T, m *mockUpstream, c Config, accounts []Account) (*Native, *Pool, *memoryStore) {

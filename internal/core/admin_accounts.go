@@ -62,6 +62,7 @@ func (a *API) registerAccountManagement(m *http.ServeMux) {
 	a.registerAccountPush(m)
 	m.HandleFunc("GET /admin/accounts/export", a.admin(a.exportAccounts))
 	m.HandleFunc("POST /admin/accounts/verify", a.admin(a.verifyAccounts))
+	m.HandleFunc("POST /admin/accounts/refresh-token", a.admin(a.verifyAccounts))
 	m.HandleFunc("POST /admin/accounts/delete", a.admin(a.deleteAccounts))
 	m.HandleFunc("PATCH /admin/accounts/{id}", a.admin(a.setAccountEnabled))
 	m.HandleFunc("DELETE /admin/accounts/{id}", a.admin(a.deleteAccount))
@@ -481,8 +482,9 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 		sendError(w, Err(503, "verification_unavailable", "当前生成器不支持远程账号校验"))
 		return
 	}
+	refreshTokenOnly := r.URL.Path == "/admin/accounts/refresh-token"
 	if !a.Engine.verifyBusy.CompareAndSwap(false, true) {
-		sendError(w, Err(429, "verification_busy", "已有手动校验任务正在执行"))
+		sendError(w, Err(429, "verification_busy", "已有账号刷新任务正在执行"))
 		return
 	}
 	if a.Engine.deleteBusy.Load() {
@@ -507,7 +509,13 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 		sendError(w, Err(400, "invalid_account_id", "账号 ID 无效"))
 		return
 	}
-	j := newAdminJob("verify")
+	jobKind := "verify"
+	refreshSource := "manual_quota"
+	if refreshTokenOnly {
+		jobKind = "refresh_at"
+		refreshSource = "manual_at"
+	}
+	j := newAdminJob(jobKind)
 	j.Total = len(ids)
 	if input.All || input.AllMatching {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -527,6 +535,7 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 	handed = a.startAdminJob(w, r, s, j, func(j *adminJob) {
 		defer a.Engine.verifyBusy.Store(false)
+		n.refreshRuns.begin(refreshSource, map[bool]string{true: "access_token", false: "account_info"}[refreshTokenOnly], j.Total)
 		workers := a.Engine.CurrentConfig().VerifyConcurrency
 		tasks := make(chan string)
 		results := make(chan adminJobError, workers)
@@ -542,8 +551,26 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 						result.Message = "账号已删除"
 					} else {
 						result.Email = account.Email
-						ctx, cancel := context.WithTimeout(a.Engine.root, 3*a.Engine.CurrentConfig().MetadataTimeout)
-						_, err := n.checkAccount(ctx, account, true)
+						timeout := 3 * a.Engine.CurrentConfig().MetadataTimeout
+						if refreshTokenOnly {
+							timeout += time.Second
+						}
+						ctx, cancel := context.WithTimeout(a.Engine.root, timeout)
+						var err error
+						if refreshTokenOnly {
+							if err = n.manualVerify.Acquire(ctx); err == nil {
+								n.refreshRuns.beginItem(refreshSource, false, account.Hot)
+								_, err = n.refreshAccessToken(context.WithValue(ctx, refreshSourceContextKey{}, refreshSource), account)
+								n.manualVerify.Release()
+								message := ""
+								if err != nil {
+									message = AsError(err).Message
+								}
+								n.refreshRuns.finishItem(refreshSource, account.ID, account.Email, message)
+							}
+						} else {
+							_, err = n.checkAccount(ctx, account, true)
+						}
 						cancel()
 						if err != nil {
 							ae := AsError(err)
@@ -621,6 +648,11 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 		if <-producerErr != nil || a.Engine.root.Err() != nil {
 			j.Status = "failed"
 		}
+		runStatus := "completed"
+		if j.Status != "completed" {
+			runStatus = "interrupted"
+		}
+		n.endRefreshRun(refreshSource, runStatus)
 		// 全部账号按游标流式处理，期间新增或删除会改变实际数量。
 		if j.Processed > j.Total {
 			j.Total = j.Processed

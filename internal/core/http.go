@@ -99,6 +99,9 @@ func (a *API) ready(w http.ResponseWriter, r *http.Request) {
 }
 func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
 	snapshot := a.Engine.monitorSnapshot()
+	if n, ok := a.Engine.Generator.(*Native); ok {
+		snapshot["account_refresh_runs"] = n.refreshRuns.snapshot()
+	}
 	sendJSON(w, 200, snapshot)
 }
 func (a *API) create(w http.ResponseWriter, r *http.Request) {
@@ -163,7 +166,7 @@ func (a *API) serveSubmission(w http.ResponseWriter, r *http.Request, req Reques
 	select {
 	case result := <-done:
 		if result.err != nil {
-			sendError(w, result.err)
+			sendError(w, callerFacingError(result.err))
 			return
 		}
 		a.writeGeneration(w, r, result.result, req.Format)
@@ -202,7 +205,7 @@ func (a *API) task(w http.ResponseWriter, r *http.Request) {
 	case "failed":
 		message := "任务失败"
 		if t.Error != nil {
-			message = t.Error.Message
+			message = callerFacingError(t.Error).Message
 		}
 		sendJSON(w, 200, map[string]any{"task_id": t.ID, "status": "failed", "error": map[string]string{"message": message}})
 	case "succeeded":
@@ -351,4 +354,15 @@ func sendError(w http.ResponseWriter, e *APIError) {
 		w.Header().Set("Retry-After", "1")
 	}
 	sendJSON(w, e.Status, map[string]any{"error": e})
+}
+
+func callerFacingError(e *APIError) *APIError {
+	if e == nil || e.Code != "image_result_uncertain" || e.Message != "结果补查预算耗尽，未拿到图片标识" {
+		return e
+	}
+	public := *e
+	public.Status = http.StatusBadRequest
+	public.Code = "image_generation_failed"
+	public.Message = "未生成图片，请重试"
+	return &public
 }
