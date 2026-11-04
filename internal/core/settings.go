@@ -70,6 +70,11 @@ func applySettingValues(base Config, values map[string]json.RawMessage) (Config,
 				return c, fmt.Errorf("%s 必须为布尔值", key)
 			}
 			continue
+		case "CORE_IMAGE_RESIZE_ENABLED":
+			if err := json.Unmarshal(raw, &c.ImageResizeEnabled); err != nil || string(raw) == "null" {
+				return c, fmt.Errorf("%s 必须为布尔值", key)
+			}
+			continue
 		case "CORE_PUBLIC_URL":
 			var value *string
 			if err := json.Unmarshal(raw, &value); err != nil || value == nil {

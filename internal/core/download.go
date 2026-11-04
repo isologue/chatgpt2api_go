@@ -147,11 +147,12 @@ func (n *Native) transfer(ctx context.Context, link string, stages map[string]fl
 	n.validationWaiting.Add(-1)
 	n.measure(stages, "图片校验排队", start)
 	start = time.Now()
+	var decoded image.Image
 	func() {
 		n.validationActive.Add(1)
 		defer func() { n.validation.Release(); n.validationActive.Add(-1) }()
 		_, _ = file.Seek(0, 0)
-		_, _, e = image.Decode(file)
+		decoded, _, e = image.Decode(file)
 	}()
 	n.measure(stages, "图片校验", start)
 	if e != nil {
@@ -159,6 +160,65 @@ func (n *Native) transfer(ctx context.Context, link string, stages map[string]fl
 	}
 	if ctx.Err() != nil {
 		return artifact, ctx.Err()
+	}
+	if target, ok := ctx.Value(imageResizeTargetKey{}).(imageSize); ok && target.Width > 0 {
+		queueStart := time.Now()
+		n.validationWaiting.Add(1)
+		if err := n.validation.Acquire(ctx); err != nil {
+			n.validationWaiting.Add(-1)
+			n.measure(stages, "图片缩放排队", queueStart)
+			return artifact, err
+		}
+		n.validationWaiting.Add(-1)
+		n.measure(stages, "图片缩放排队", queueStart)
+		n.validationActive.Add(1)
+		defer n.validationActive.Add(-1)
+		defer n.validation.Release()
+		resizeStart := time.Now()
+		if !supportedResizeFormat(format) || (format == "webp" && isAnimatedWebP(file)) {
+			return artifact, Err(422, "image_resize_unsupported", "启用图片缩放时仅支持静态 PNG、JPEG 和 WebP")
+		}
+		orientation := uint16(1)
+		if format == "jpeg" {
+			orientation, e = exifOrientation(file)
+			if e != nil {
+				return artifact, Err(422, "image_resize_failed", "读取 JPEG 方向信息失败")
+			}
+		}
+		decoded = orientImage(decoded, orientation)
+		bounds := decoded.Bounds()
+		if bounds.Dx() != target.Width || bounds.Dy() != target.Height || orientation != 1 {
+			resized, createErr := os.CreateTemp(n.c.ImageDir, ".resize-")
+			if createErr != nil {
+				return artifact, Err(507, "image_storage_failed", "无法创建缩放图片文件")
+			}
+			resizeErr := resizeDecodedImage(decoded, target, strings.ToLower(format), resized, n.config(ctx).MaxImageBytes)
+			if resizeErr == nil {
+				resizeErr = resized.Sync()
+			}
+			stat, statErr := resized.Stat()
+			if resizeErr == nil {
+				resizeErr = statErr
+			}
+			if resizeErr != nil {
+				resized.Close()
+				os.Remove(resized.Name())
+				return artifact, Err(422, "image_resize_failed", "图片缩放失败："+resizeErr.Error())
+			}
+			oldTemp := temp
+			if err := file.Close(); err != nil {
+				resized.Close()
+				os.Remove(resized.Name())
+				return artifact, Err(507, "image_storage_failed", "关闭原始图片文件失败")
+			}
+			if err := os.Remove(oldTemp); err != nil {
+				resized.Close()
+				os.Remove(resized.Name())
+				return artifact, Err(507, "image_storage_failed", "替换原始图片文件失败")
+			}
+			temp, file, count = resized.Name(), resized, stat.Size()
+		}
+		n.measure(stages, "图片尺寸缩放", resizeStart)
 	}
 	ext := map[string]string{"png": ".png", "jpeg": ".jpg", "gif": ".gif", "webp": ".webp"}[strings.ToLower(format)]
 	if ext == "" {

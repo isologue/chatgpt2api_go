@@ -26,7 +26,7 @@ type Config struct {
 	TotalTimeout, SSETimeout, PollTimeout, DownloadTimeout, MetadataTimeout, Freshness, HotIdle, HotMaintenanceInterval, ColdMaintenanceInterval                           time.Duration
 	MaxImageBytes                                                                                                                                                          int64
 	DefaultFormat                                                                                                                                                          string
-	AllowUserFormat                                                                                                                                                        bool
+	AllowUserFormat, ImageResizeEnabled                                                                                                                                    bool
 }
 
 func LoadConfig() (Config, error) {
@@ -80,6 +80,10 @@ func LoadConfig() (Config, error) {
 	c.AllowUserFormat, err = strconv.ParseBool(env("CORE_ALLOW_USER_RESPONSE_FORMAT", "true"))
 	if err != nil {
 		return c, fmt.Errorf("invalid CORE_ALLOW_USER_RESPONSE_FORMAT")
+	}
+	c.ImageResizeEnabled, err = strconv.ParseBool(env("CORE_IMAGE_RESIZE_ENABLED", "false"))
+	if err != nil {
+		return c, fmt.Errorf("invalid CORE_IMAGE_RESIZE_ENABLED")
 	}
 	c.MaxImageBytes, err = strconv.ParseInt(env("CORE_MAX_IMAGE_BYTES", "67108864"), 10, 64)
 	if err != nil || c.MaxImageBytes < 1 {

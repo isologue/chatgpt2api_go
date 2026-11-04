@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	httpx "github.com/bogdanfinn/fhttp"
+	"image"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -135,5 +137,46 @@ func TestDownloadSeparatesHeadersBodyAndDecodeWait(t *testing.T) {
 	}
 	if n.validationWaiting.Load() != 0 || n.validationActive.Load() != 0 || n.downloadActive.Load() != 0 {
 		t.Fatal("download/decoding counter leaked")
+	}
+}
+
+func TestDownloadAppliesRequestedImageResize(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(tinyPNG())
+	}))
+	defer server.Close()
+	c := testConfig(t)
+	c.DownloadRetries = 0
+	c.ValidationConcurrency = 1
+	n, err := NewNative(c, NewPool(nil, 1), newMemoryStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+	ctx := context.WithValue(context.Background(), imageResizeTargetKey{}, imageSize{48, 32})
+	stages := map[string]float64{}
+	artifact, err := n.download(ctx, server.URL+"/image.png", stages, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(filepath.Join(c.ImageDir, artifact.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	config, _, err := image.DecodeConfig(f)
+	if err != nil || config.Width != 48 || config.Height != 32 {
+		t.Fatalf("resized image dimensions=%dx%d err=%v", config.Width, config.Height, err)
+	}
+	stat, err := f.Stat()
+	if err != nil || artifact.Bytes != stat.Size() {
+		t.Fatalf("artifact byte count=%d stat=%v err=%v", artifact.Bytes, stat, err)
+	}
+	if _, ok := stages["图片尺寸缩放"]; !ok {
+		t.Fatal("missing image resize timing")
+	}
+	if n.validationWaiting.Load() != 0 || n.validationActive.Load() != 0 {
+		t.Fatal("image validation permit leaked after resize")
 	}
 }

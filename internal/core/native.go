@@ -269,6 +269,11 @@ func maxTime(a, b time.Time) time.Time {
 }
 func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[string]float64) ([]Artifact, error) {
 	ctx = context.WithValue(ctx, configKey{}, n.config(ctx))
+	if cfg := n.config(ctx); cfg.ImageResizeEnabled {
+		if target, err := parseImageSize(r.Size); err == nil && target.Width > 0 {
+			ctx = context.WithValue(ctx, imageResizeTargetKey{}, target)
+		}
+	}
 	start := time.Now()
 	a, err := n.ensureAccount(ctx, a)
 	n.measure(stages, "账号校验", start)
@@ -283,7 +288,14 @@ func (n *Native) Generate(ctx context.Context, a Account, r Request, stages map[
 	}
 	prompt := r.Prompt
 	if r.Size != "" && r.Size != "auto" {
-		prompt += "\n输出图片尺寸为 " + r.Size + "。"
+		if cfg := n.config(ctx); cfg.ImageResizeEnabled {
+			target, err := parseImageSize(r.Size)
+			if err == nil && target.Width > 0 {
+				prompt += "\n保持图片宽高比例为 " + nearestImageRatio(target) + "。"
+			}
+		} else {
+			prompt += "\n输出图片尺寸为 " + r.Size + "。"
+		}
 	}
 	if r.Quality != "auto" {
 		prompt += "\n输出图片质量为 " + r.Quality + "。"

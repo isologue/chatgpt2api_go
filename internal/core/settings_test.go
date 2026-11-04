@@ -47,6 +47,7 @@ func TestSettingsValidation(t *testing.T) {
 		`{"CORE_DOWNLOAD_CONCURRENCY":0}`,
 		`{"CORE_VERIFY_CONCURRENCY":1.5}`,
 		`{"CORE_ALLOW_USER_RESPONSE_FORMAT":null}`,
+		`{"CORE_IMAGE_RESIZE_ENABLED":null}`,
 		`{"CORE_RESPONSE_FORMAT":"bad"}`,
 		`{"CORE_IMAGE_QUEUE_SIZE":null}`,
 		`{"CORE_TOTAL_TIMEOUT":-1}`,
@@ -64,9 +65,9 @@ func TestSettingsValidation(t *testing.T) {
 		}
 	}
 	var v map[string]json.RawMessage
-	json.Unmarshal([]byte(`{"CORE_DOWNLOAD_CONCURRENCY":1000,"CORE_VALIDATION_CONCURRENCY":10,"CORE_IMAGE_QUEUE_SIZE":0,"CORE_RESPONSE_FORMAT":"base64"}`), &v)
+	json.Unmarshal([]byte(`{"CORE_DOWNLOAD_CONCURRENCY":1000,"CORE_VALIDATION_CONCURRENCY":10,"CORE_IMAGE_QUEUE_SIZE":0,"CORE_RESPONSE_FORMAT":"base64","CORE_IMAGE_RESIZE_ENABLED":true}`), &v)
 	got, err := applySettingValues(c, v)
-	if err != nil || got.DownloadConcurrency != 1000 || got.DefaultFormat != "b64_json" || got.QueueSize != 0 {
+	if err != nil || got.DownloadConcurrency != 1000 || got.DefaultFormat != "b64_json" || got.QueueSize != 0 || !got.ImageResizeEnabled {
 		t.Fatal(got, err)
 	}
 }

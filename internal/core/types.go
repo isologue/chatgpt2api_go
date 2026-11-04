@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -79,6 +81,17 @@ func (r *Request) Validate(c Config) error {
 	if r.N < 1 || r.N > 4 {
 		return Err(400, "invalid_n", "n 必须在 1 到 4 之间")
 	}
+	if c.ImageResizeEnabled {
+		size, err := parseImageSize(r.Size)
+		if err != nil {
+			return err
+		}
+		if size.Width > 0 {
+			r.Size = size.String()
+		} else {
+			r.Size = strings.ToLower(strings.TrimSpace(r.Size))
+		}
+	}
 	if r.Stream {
 		return Err(400, "unsupported_stream", "当前原型不支持对调用方流式返回；可使用 async:true")
 	}
@@ -96,6 +109,44 @@ func (r *Request) Validate(c Config) error {
 	format, err := NormalizeFormat(r.Format)
 	r.Format = format
 	return err
+}
+
+type imageSize struct{ Width, Height int }
+
+func (s imageSize) String() string { return fmt.Sprintf("%dx%d", s.Width, s.Height) }
+
+func parseImageSize(value string) (imageSize, error) {
+	value = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(value, "×", "x")))
+	if value == "" || strings.EqualFold(value, "auto") {
+		return imageSize{}, nil
+	}
+	parts := strings.Split(value, "x")
+	invalid := func() (imageSize, error) {
+		return imageSize{}, Err(400, "invalid_image_size", "启用图片缩放时 size 必须为宽x高（单边1–8192、总像素不超过3200万）或 auto")
+	}
+	if len(parts) != 2 {
+		return invalid()
+	}
+	widthText, heightText := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	for _, part := range []string{widthText, heightText} {
+		if part == "" {
+			return invalid()
+		}
+		for _, digit := range part {
+			if digit < '0' || digit > '9' {
+				return invalid()
+			}
+		}
+	}
+	width, err := strconv.Atoi(widthText)
+	if err != nil {
+		return invalid()
+	}
+	height, err := strconv.Atoi(heightText)
+	if err != nil || width < 1 || height < 1 || width > 8192 || height > 8192 || int64(width)*int64(height) > 32_000_000 {
+		return invalid()
+	}
+	return imageSize{Width: width, Height: height}, nil
 }
 
 type Account struct {
