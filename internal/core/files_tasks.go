@@ -155,7 +155,7 @@ func (a *API) createExport(w http.ResponseWriter, r *http.Request, kind string) 
 	c := e.CurrentConfig()
 	accepted := time.Now()
 	identity, _ := r.Context().Value(apiIdentityKey{}).(managedAPIKey)
-	req := Request{Model: "gpt-5-5-thinking", Async: true, apiKeyID: identity.ID, apiKeyName: identity.Name, keyConcurrency: identity.Concurrency}
+	req := Request{Model: "gpt-6", Async: true, apiKeyID: identity.ID, apiKeyName: identity.Name, keyConcurrency: identity.Concurrency}
 	// 准入只持短锁。大请求读取、base64 解码、落盘和数据库 I/O 均不持 admission 锁。
 	e.admission.RLock()
 	if e.closing.Load() {
@@ -192,6 +192,18 @@ func (a *API) createExport(w http.ResponseWriter, r *http.Request, kind string) 
 	stopBody := context.AfterFunc(inputCtx, func() { _ = r.Body.Close() })
 	defer stopBody()
 	body, raw, err := readObject(w, r, int64(c.editMaxMiB())*2<<20)
+	if err != nil {
+		sendError(w, AsError(err))
+		return
+	}
+	if v, exists := body["model"]; exists {
+		req.Model, err = rawString(v)
+		if err != nil || req.Model == "" {
+			sendError(w, Err(400, "invalid_model", "model 无效"))
+			return
+		}
+	}
+	req.UpstreamModel, err = e.resolveModel(req.Model, "file")
 	if err != nil {
 		sendError(w, AsError(err))
 		return
@@ -336,7 +348,7 @@ func (e *Engine) runExport(db *Postgres, g fileGenerator, task exportTask, req R
 		exclude[account.ID] = true
 		started := time.Now()
 		stages := map[string]float64{}
-		result, err = g.Export(ctx, account, task.Kind, req.Prompt, inputs, stages)
+		result, err = g.Export(context.WithValue(ctx, fileModelKey{}, req.UpstreamModel), account, task.Kind, req.Prompt, inputs, stages)
 		ae = nil
 		if err != nil {
 			ae = fileAPIError(ctx, err)

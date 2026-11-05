@@ -2,19 +2,39 @@
 
 ## 图片编辑
 
-`POST /v1/images/edits` 使用图片调用 Key 鉴权，接收 `multipart/form-data`。同步和异步共用路径，`async=true` 返回任务 ID，查询仍为 `GET /v1/images/tasks/{task_id}`。
+`POST /v1/images/edits` 使用图片调用 Key 鉴权，接收 `multipart/form-data` 或 `application/json`。同步和异步共用路径，`async=true` 返回任务 ID，查询仍为 `GET /v1/images/tasks/{task_id}`。
 
-支持字段：`prompt`（必填）、`model`、`n`、`size`、`quality`、`response_format`、`async`。上传文件字段为 `image`/`image[]` 和可选的 `mask`/`mask[]`。参考图支持 PNG、JPEG、WebP，遮罩使用 PNG。暂不接受编辑 JSON 图片 URL 或 Base64 输入；返回格式可选 URL 或 Base64，沿用系统默认和允许用户覆盖的设置。
+支持字段：`prompt`（必填）、`model`、`n`、`size`、`quality`、`response_format`、`async`。上传文件字段为 `image`/`image[]` 和可选的 `mask`/`mask[]`。参考图支持 PNG、JPEG、WebP，遮罩使用 PNG。JSON 通过 `images: [{"image_url": "https://..."}]` 提供参考图，也兼容 `image` 数组和对象内的 `url` 别名；`images` 与 `image` 不可同时提供。可选 `mask` 使用相同对象数组格式。输入 URL 仅支持无需登录的 HTTP(S)，暂不接受输入 Base64/data URL 或本地路径；返回格式可选 URL 或 Base64，沿用系统默认和允许用户覆盖的设置。
 
 ```powershell
 curl.exe http://127.0.0.1:9080/v1/images/edits -H "Authorization: Bearer <图片调用密钥>" -H "Idempotency-Key: edit-order-20261103-1" -F "prompt=把透明区域替换为一片花园" -F "image=@input.png" -F "mask=@mask.png" -F "response_format=url" -F "async=true"
 ```
 
+JSON 图片编辑示例（请求头 `Content-Type: application/json`）：
+
+```json
+{
+  "model": "gpt-image-2",
+  "prompt": "参考图片1，将衣服换成黑色，保留人物和背景",
+  "n": 1,
+  "size": "1024x1024",
+  "async": true,
+  "images": [
+    {"image_url": "https://images.example.com/reference.png"}
+  ],
+  "response_format": "url"
+}
+```
+
+服务端先下载并校验参考图，再进入与 multipart 相同的上传和生图流程。JSON 的参考图/遮罩下载遵循系统直连/代理设置，共享 `CORE_DOWNLOAD_CONCURRENCY`；单张下载含排队受 `CORE_DOWNLOAD_TIMEOUT` 限制，所有参考图及遮罩合计受 `CORE_EDIT_MAX_MIB` 限制，过大返回 413。URL 需从部署服务器可访问；不会转发调用方密钥、Cookie 或账号 AT，最多跟随 5 次 HTTP(S) 重定向。下载失败直接返回 `image_input_download_failed`，不会因此选择账号或扣分。异步创建响应需等待参考图下载校验完成；任务接纳后继续持有本地输入直到终态。输入大小限制与 JSON 请求体大小分别检查。
+
+模型名按系统模型映射验证，例如使用 `gpt-image-2.6` 前需在设置中启用对应的图片模型映射。`output_format` 不是当前的输出编码控制项：兼容请求可携带该字段，但不会强制转码；`response_format` 仅决定返回 URL 或 Base64，不决定 PNG/JPEG/WebP 编码。
+
 遮罩沿用旧 Python 项目的处理方式：RGBA PNG 取透明通道，透明处允许编辑，不透明处保留；灰度/RGB PNG 取灰度值。多图按顺序配对，缺少的遮罩复用最后一张；遮罩尺寸不同时缩放到参考图尺寸，再合成为 PNG 上传。Go 使用 Catmull-Rom 缩放，旧版使用 Lanczos，边缘插值不会逐像素相同。上游生成仍受模型行为影响，不能保证保留区域逐像素不变。
 
 `CORE_EDIT_MAX_MIB=32` 限制整个上传请求，超出返回 413；`CORE_EDIT_MAX_IMAGES=4` 限制参考图张数，与输出 `n`（1～4）独立。两项可在设置页在线调整。单张输入最多 6400 万像素，完整解码及遮罩合成共用 `CORE_VALIDATION_CONCURRENCY`；每次切号会用新账号重新上传。上传的元数据、内容 PUT 和确认步骤受请求预算及 `CORE_METADATA_TIMEOUT` 控制。
 
-输入写私有临时目录；任务接纳后由任务管理生命周期，异步创建响应不会提前删除文件。完成、失败或准入拒绝后清理，重启先将未完成任务标为失败，再清理残留输入。原始 multipart 报文独立存磁盘，日志详情不尝试转成 JSON，支持下载真实原始请求；日志保留策略同时回收报文文件。
+输入写私有临时目录；任务接纳后由任务管理生命周期，异步创建响应不会提前删除文件。完成、失败或准入拒绝后清理，重启先将未完成任务标为失败，再清理残留输入。原始 JSON 请求按字节保留在调用报文中；原始 multipart 报文独立存磁盘，日志详情不尝试转成 JSON，支持下载真实原始请求；日志保留策略同时回收报文文件。
 
 ## Key 并发与统计
 

@@ -146,7 +146,8 @@ func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inp
 		instruction = "将参考图片还原为分层可编辑的PSD。图像、背景、文字等元素保持原位置，各图层去掉多余白底。必须使用工具实际生成并提供可下载的 .psd 主文件与图层素材 .zip 文件，不能仅提供制作说明。"
 	}
 	prompt = instruction + "\n\n用户需求：\n" + prompt
-	in := textInput{Model: "gpt-5-5-thinking", Messages: []textMessage{{Role: "user", Content: prompt}}, File: true, Inputs: inputs}
+	target, _ := ctx.Value(fileModelKey{}).(string)
+	in := textInput{UpstreamModel: target, Model: "gpt-6", Messages: []textMessage{{Role: "user", Content: prompt}}, File: true, Inputs: inputs}
 	payload := s.textPayload(in)
 	message := obj(array(payload["messages"])[0])
 	start = time.Now()

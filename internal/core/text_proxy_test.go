@@ -76,7 +76,7 @@ func TestTextParseHistoryAndUnsupportedContent(t *testing.T) {
 	if err != nil || !in.Search || len(in.Messages) != 2 {
 		t.Fatal(in, err)
 	}
-	for _, raw := range []string{`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}`, `{"messages":[{"role":"tool","content":"tool"}]}`, `{"input":"x","previous_response_id":"r"}`, `{"input":"x","tools":[{"type":"function"}]}`, `{"model":"gpt-image-2","input":"x"}`} {
+	for _, raw := range []string{`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}`, `{"messages":[{"role":"tool","content":"tool"}]}`, `{"input":"x","previous_response_id":"r"}`, `{"input":"x","tools":[{"type":"function"}]}`} {
 		if _, _, err = parse(raw, "responses"); err == nil {
 			t.Fatal("accepted unsupported input", raw)
 		}

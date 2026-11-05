@@ -30,7 +30,7 @@ type Config struct {
 }
 
 func LoadConfig() (Config, error) {
-	c := Config{WebDAV: webDAVConfig{Concurrency: 16, TimeoutSeconds: 30, Retries: 1}, OAuthURL: os.Getenv("CORE_OAUTH_URL"), Listen: env("CORE_LISTEN", ":9080"), DatabaseURL: os.Getenv("CORE_DATABASE_URL"), APIKey: os.Getenv("CORE_API_KEY"), AdminKey: os.Getenv("CORE_ADMIN_KEY"), PublicURL: os.Getenv("CORE_PUBLIC_URL"), ImageDir: env("CORE_IMAGE_DIR", "data/images"), ProxyURL: os.Getenv("CORE_PROXY_URL"), UpstreamURL: strings.TrimRight(env("CORE_UPSTREAM_URL", "https://chatgpt.com"), "/"), UpstreamModel: env("CORE_UPSTREAM_MODEL", "gpt-5-5"), TLSProfile: env("CORE_TLS_PROFILE", "chrome_110"), DefaultFormat: env("CORE_RESPONSE_FORMAT", "url"), AllowUserFormat: true}
+	c := Config{WebDAV: webDAVConfig{Concurrency: 16, TimeoutSeconds: 30, Retries: 1}, OAuthURL: os.Getenv("CORE_OAUTH_URL"), Listen: env("CORE_LISTEN", ":9080"), DatabaseURL: os.Getenv("CORE_DATABASE_URL"), APIKey: os.Getenv("CORE_API_KEY"), AdminKey: os.Getenv("CORE_ADMIN_KEY"), PublicURL: os.Getenv("CORE_PUBLIC_URL"), ImageDir: env("CORE_IMAGE_DIR", "data/images"), ProxyURL: os.Getenv("CORE_PROXY_URL"), UpstreamURL: strings.TrimRight(env("CORE_UPSTREAM_URL", "https://chatgpt.com"), "/"), UpstreamModel: env("CORE_UPSTREAM_MODEL", "gpt-6"), TLSProfile: env("CORE_TLS_PROFILE", "chrome_110"), DefaultFormat: env("CORE_RESPONSE_FORMAT", "url"), AllowUserFormat: true}
 	var err error
 	c.TextConcurrency = 100
 	c.FileConcurrency = 4

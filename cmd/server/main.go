@@ -81,7 +81,10 @@ func run() error {
 	engine := core.NewEngine(c, pool, store, native)
 	defer engine.Close()
 	accessStartup, accessCancel := context.WithTimeout(ctx, 15*time.Second)
-	err = engine.InitializeAccess(accessStartup)
+	err = engine.InitializeModels(accessStartup)
+	if err == nil {
+		err = engine.InitializeAccess(accessStartup)
+	}
 	accessCancel()
 	if err != nil {
 		return err

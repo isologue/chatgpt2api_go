@@ -7,7 +7,7 @@ const bytes = n => n == null ? '—' : n >= 1073741824 ? `${(n / 1073741824).toF
 const date = value => !value || !Number.isFinite(new Date(value).getTime()) || new Date(value).getFullYear() < 2000 ? '—' : new Intl.DateTimeFormat('zh-CN', {timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date(value));
 const duration = ms => ms == null ? '—' : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 const titles = {overview:'运行概览',accounts:'账号池',logs:'调用日志',images:'图片管理',settings:'系统设置'};
-const groups = {proxy:['代理设置','统一配置上游连接方式，支持批量代理与连通测试。'],textfiles:['聊天与文件生成','独立并发与预算，共享账号槽位及下载资源。'],webdav:['WebDAV 图床','图片生成后上传至 WebDAV，并返回公开访问地址。'],concurrency:['图片生成并发','从任务执行、图片下载到解码和返回，分别控制。'],accounts:['账号校验','控制账号校验速度，以及可用性信息的复用时间。'],timeouts:['超时与重试','明确等待边界，兼顾成功率与请求耗时。'],output:['结果与存储','控制结果返回、图片大小和数据库连接占用。'],access:['访问与密钥','保持管理员登录，管理用于图片接口的调用密钥。']};
+const groups = {models:["模型列表","手动拉取上游目录，管理公开名称与实际调用模型。"],proxy:['代理设置','统一配置上游连接方式，支持批量代理与连通测试。'],textfiles:['聊天与文件生成','独立并发与预算，共享账号槽位及下载资源。'],webdav:['WebDAV 图床','图片生成后上传至 WebDAV，并返回公开访问地址。'],concurrency:['图片生成并发','从任务执行、图片下载到解码和返回，分别控制。'],accounts:['账号校验','控制账号校验速度，以及可用性信息的复用时间。'],timeouts:['超时与重试','明确等待边界，兼顾成功率与请求耗时。'],output:['结果与存储','控制结果返回、图片大小和数据库连接占用。'],access:['访问与密钥','保持管理员登录，管理用于图片接口的调用密钥。']};
 const notificationStorageKey='core-admin-notifications-v1';
 const savedNotifications=(()=>{try{return JSON.parse(localStorage.getItem(notificationStorageKey)||'{}');}catch{return {};}})();
 const state = {page:'overview',group:'concurrency',demo:false,connected:false,sessionVersion:0,metrics:null,settings:[],limits:[],draft:{},saved:'',samples:[],fetching:false,timer:null,toastTimer:null,jobs:[],notificationRead:new Set(savedNotifications.read||[]),notificationStatuses:savedNotifications.statuses||{},lists:{accounts:{cursors:[''],page:0,next:'',items:[],version:0,filters:null},logs:{cursors:[''],page:0,next:'',items:[],version:0}}};
@@ -173,7 +173,7 @@ function selectGroup(group){if(!groups[group])return;state.group=group;renderSet
 function renderSettings(){
   const [title,description]=groups[state.group];setText('settings-group-title',title);setText('settings-group-description',description);
   $$('[data-group]').forEach(el=>{el.classList.toggle('active',el.dataset.group===state.group);const total=state.settings.filter(s=>s.group===el.dataset.group).length;if(total)$('span',el).textContent=String(total).padStart(2,'0');});
-  const access=state.group==='access',webdav=state.group==='webdav',proxy=state.group==='proxy',custom=access||webdav||proxy;$('#proxy-panel').classList.toggle('hidden',!proxy);$('.settings-panel').classList.toggle('hidden',custom);$('.fixed-limits').classList.toggle('hidden',custom);$('.settings-savebar').classList.toggle('hidden',custom);$('#access-panel').classList.toggle('hidden',!access);$('#webdav-panel').classList.toggle('hidden',!webdav);$('#reset-settings').classList.toggle('hidden',custom);if(access){renderAccess();return;}if(webdav){renderWebDAV();return;}if(proxy){renderProxy();return;}
+  const access=state.group==='access',webdav=state.group==='webdav',proxy=state.group==='proxy',models=state.group==='models',custom=access||webdav||proxy||models;$('#models-panel').classList.toggle('hidden',!models);$('#proxy-panel').classList.toggle('hidden',!proxy);$('.settings-panel').classList.toggle('hidden',custom);$('.fixed-limits').classList.toggle('hidden',custom);$('.settings-savebar').classList.toggle('hidden',custom);$('#access-panel').classList.toggle('hidden',!access);$('#webdav-panel').classList.toggle('hidden',!webdav);$('#reset-settings').classList.toggle('hidden',custom);if(models){renderModels();return;}if(access){renderAccess();return;}if(webdav){renderWebDAV();return;}if(proxy){renderProxy();return;}
   if(!state.settings.length){$('#settings-fields').innerHTML='<div class="empty-cell">登录后查看配置。</div>';return;}
   const labels=Object.fromEntries(state.settings.map(s=>[s.key,s.label]));
   $('#settings-fields').innerHTML=state.settings.filter(s=>s.group===state.group).map(s=>{
@@ -340,7 +340,7 @@ for(const kind of ['accounts','logs']){
   $(`#${kind}-prev`).addEventListener('click',()=>{if(state.lists[kind].page>0){state.lists[kind].page--;loadList(kind);}});
   $(`#${kind}-next`).addEventListener('click',()=>{const l=state.lists[kind];if(l.next){l.page++;l.cursors[l.page]=l.next;loadList(kind);}});
 }
-$('#help-button').addEventListener('click',()=>{showDetail(`<h2>接口使用说明</h2><p>生成与图片编辑都支持同步和异步调用。调用方重试时可发送 Idempotency-Key，避免重复生成。</p><div class="detail-grid"><div class="detail-item"><span>创建图片</span><strong class="mono">POST /v1/images/generations</strong></div><div class="detail-item"><span>图片编辑（multipart）</span><strong class="mono">POST /v1/images/edits</strong></div><div class="detail-item"><span>异步结果查询</span><strong class="mono">GET /v1/images/tasks/{task_id}</strong></div></div><div class="detail-json"><pre>Authorization: Bearer &lt;图片调用密钥&gt;\n\n{\n  "model": "gpt-image-2",\n  "prompt": "一只在窗边晒太阳的橘猫",\n  "n": 1,\n  "async": true,\n  "response_format": "url"\n}</pre></div><p>编辑上传 image/image[]，可选 mask/mask[]（PNG）；遮罩透明区域需要编辑，不透明区域保留。支持 prompt、n、async、response_format 等表单字段。上传大小与参考图数量可在设置调整。Key 并发 0 表示不限，排队和异步执行均计入在途名额。相同 Key、路径、Idempotency-Key 的相同请求复用任务，修改参数或图片返回 409；幂等保证受日志和图片保留策略约束。</p><h3>聊天、搜索与文件生成</h3><div class="detail-json"><pre>POST /v1/chat/completions
+$('#help-button').addEventListener('click',()=>{showDetail(`<h2>接口使用说明</h2><p>生成与图片编辑都支持同步和异步调用。调用方重试时可发送 Idempotency-Key，避免重复生成。</p><div class="detail-grid"><div class="detail-item"><span>创建图片</span><strong class="mono">POST /v1/images/generations</strong></div><div class="detail-item"><span>图片编辑（multipart / JSON）</span><strong class="mono">POST /v1/images/edits</strong></div><div class="detail-item"><span>异步结果查询</span><strong class="mono">GET /v1/images/tasks/{task_id}</strong></div></div><div class="detail-json"><pre>Authorization: Bearer &lt;图片调用密钥&gt;\n\n{\n  "model": "gpt-image-2",\n  "prompt": "一只在窗边晒太阳的橘猫",\n  "n": 1,\n  "async": true,\n  "response_format": "url"\n}</pre></div><p>编辑可使用 multipart 上传 image/image[]，可选 mask/mask[]（PNG）；也可用 application/json 传 images: [{"image_url":"https://..."}]，可选 mask 同格式。JSON 参考图先下载校验，再接纳任务。遮罩透明区域需要编辑，不透明区域保留。支持 prompt、n、async、response_format 等表单字段。上传大小与参考图数量可在设置调整。Key 并发 0 表示不限，排队和异步执行均计入在途名额。相同 Key、路径、Idempotency-Key 的相同请求复用任务，修改参数或图片返回 409；幂等保证受日志和图片保留策略约束。</p><h3>聊天、搜索与文件生成</h3><div class="detail-json"><pre>POST /v1/chat/completions
 POST /v1/responses
 POST /v1/search
 POST /v1/messages
@@ -503,25 +503,31 @@ function bodySections(row){return '<h3>实际调用报文</h3><p class="small mu
 async function showAttemptResponse(index){
  const row=activeRequestDetail,attempt=row?.attempts?.[index];if(!row||!attempt)return;
  const host=$('#caller-response-content');host.replaceChildren();
- $('#raw-response-title').textContent='调用方响应 · '+(attempt.code||'请求结果');
- $('#raw-response-note').textContent='以下为本次调用实际返回给调用方的响应；异步任务分别展示创建响应和最近一次终态查询响应。';
- const responses=row.is_async?[['response','创建响应体'],['task_response','任务查询响应体（最近一次终态）']]:[['response','响应体']];
- for(const [kind,title] of responses){
-  const section=document.createElement('section');section.className='caller-response-section';section.dataset.kind=kind;
-  const heading=document.createElement('h3');heading.textContent=title;section.append(heading);
-  const meta=document.createElement('p');meta.className='caller-response-meta small muted';meta.textContent='正在读取响应…';section.append(meta);
-  const tree=document.createElement('div');tree.className='json-tree hidden';section.append(tree);
-  host.append(section);
- }
+ $('#raw-response-title').textContent='第 '+(index+1)+' 次尝试 · '+(attempt.code||'成功');
+ $('#raw-response-note').textContent='当前尝试的结果与整条请求的最终响应分开展示。切号前的失败不会单独返回给调用方。';
+ const attemptSection=document.createElement('section');attemptSection.className='caller-response-section';
+ const attemptHeading=document.createElement('h3');attemptHeading.textContent='当前账号尝试结果（内部）';attemptSection.append(attemptHeading);
+ const attemptMeta=document.createElement('p');attemptMeta.className='small muted';attemptMeta.textContent=(attempt.email||attempt.account_id||'未知账号')+' · 耗时 '+duration(attempt.duration_ms);attemptSection.append(attemptMeta);
+ const attemptBody=document.createElement('pre');attemptBody.textContent=JSON.stringify({attempt:index+1,status:attempt.code?'failed':'succeeded',http_status:attempt.http_status||null,...(attempt.code?{error:attempt.error||{code:attempt.code,message:'旧日志未保存本次尝试的具体错误说明，请查看下方上游原始响应。'}}:{})},null,2);attemptSection.append(attemptBody);
+ host.append(attemptSection);
+ if(!attempt.http_status){const legacy=document.createElement('p');legacy.className='small muted';legacy.textContent='该次尝试未单独记录 HTTP 状态码，不使用整条请求的状态码代替。';attemptSection.append(legacy);}
  if(attempt.raw_response){
   const details=document.createElement('details');details.className='upstream-raw-details';
-  const summary=document.createElement('summary');summary.textContent='上游原始响应（诊断信息）';details.append(summary);
+  const summary=document.createElement('summary');summary.textContent='当前尝试的上游原始响应（诊断信息）';details.append(summary);
   const pre=document.createElement('pre');pre.textContent=attempt.raw_response;details.append(pre);
   if(attempt.raw_response_truncated){const note=document.createElement('p');note.className='small muted';note.textContent='原始响应超过 64 KiB，仅保存前 64 KiB。';details.append(note);}
   host.append(details);
  }
+ const responses=row.is_async?[['response','创建响应体'],['task_response','任务查询响应体（最近一次终态）']]:[['response','响应体']];
+ for(const [kind,title] of responses){
+  const section=document.createElement('section');section.className='caller-response-section';section.dataset.kind=kind;
+  const heading=document.createElement('h3');heading.textContent='整条请求 · '+title;section.append(heading);
+  const meta=document.createElement('p');meta.className='caller-response-meta small muted';meta.textContent='正在读取响应…';section.append(meta);
+  const tree=document.createElement('div');tree.className='json-tree hidden';section.append(tree);
+  host.append(section);
+ }
  $('#raw-response-dialog').showModal();
- await Promise.all($$('.caller-response-section',host).map(async section=>{
+ await Promise.all($$('.caller-response-section[data-kind]',host).map(async section=>{
   const kind=section.dataset.kind,meta=$('.caller-response-meta',section),tree=$('.json-tree',section);
   if(state.demo){meta.textContent='界面演示不保存真实响应体。';return;}
   try{
@@ -608,7 +614,7 @@ function expireSession(message='已退出登录。'){
  historyData=null;historyVersion++;webdavVersion++;webdavDirty=false;accessVersion++;state.sessionVersion++;state.connected=false;state.demo=false;state.metrics=null;state.samples=[];state.settings=[];state.limits=[];state.draft={};state.saved='';
  document.body.classList.add('auth-required');
  clearInterval(state.timer);clearTimeout(state.jobsTimer);clearTimeout(storageState.timer);resetLists();resultsVersion++;resultsAt=0;resultsKey='';
- $('#detail-dialog').close();$('#detail-content').replaceChildren();$('#access-panel').replaceChildren();$('#webdav-panel').replaceChildren();$('#proxy-panel').replaceChildren();proxyVersion++;$('#images-gallery').replaceChildren();$('#settings-fields').replaceChildren();state.jobs=[];renderNotifications();$('#notifications-panel').classList.add('hidden');$('#notifications-button').setAttribute('aria-expanded','false');
+ $('#detail-dialog').close();$('#detail-content').replaceChildren();$('#access-panel').replaceChildren();$('#webdav-panel').replaceChildren();$('#proxy-panel').replaceChildren();proxyVersion++;$('#models-panel').replaceChildren();modelVersion++;clearTimeout(modelTimer);$('#images-gallery').replaceChildren();$('#settings-fields').replaceChildren();state.jobs=[];renderNotifications();$('#notifications-panel').classList.add('hidden');$('#notifications-button').setAttribute('aria-expanded','false');
  for(const kind of ['accounts','logs'])renderEmpty(kind,'登录后查看记录。');updateConnectionUI();showConnection();$('#connect-error').textContent=message;
 }
 async function connectSession(){
@@ -760,3 +766,62 @@ async function renderProxy(){
 }
 
 showConnection();restoreSession();
+
+
+let modelVersion=0,modelTimer=null;
+async function renderModels(){
+ const target=$('#models-panel'),version=++modelVersion,session=state.sessionVersion;
+ clearTimeout(modelTimer);target.textContent='正在读取模型配置…';
+ const current=()=>version===modelVersion&&session===state.sessionVersion&&state.page==='settings'&&state.group==='models'&&state.connected;
+ let data,dirty=false;
+ const capLabels={image:'图片',chat:'对话',search:'搜索',file:'PPT / PSD'};
+ const changeLabels={added:'新增',restored:'已恢复',updated:'已变更',missing:'本次未发现'};
+ function status(message,error=false){const el=$('#models-status');if(el){el.textContent=message;el.classList.toggle('model-error',error);}}
+ function poll(){clearTimeout(modelTimer);if(current()&&data.refreshing)modelTimer=setTimeout(load,1500);}
+ async function load(){try{const next=await api('/admin/models/catalog');if(!current())return;if(dirty){data.refreshing=next.refreshing;data.running=next.running;showFetch();poll();return;}data=next;draw();poll();}catch(e){if(current()){status(e.message,true);if(!data)target.textContent=e.message;}}}
+ function showFetch(){
+  const s=data.config,run=data.running||s.last_fetch;
+  const text=run?`${run.status==='running'?'正在拉取':run.status==='succeeded'?'拉取成功':'拉取失败'} · ${date(run.started_at)} · 已尝试 ${run.attempts?.length||0} 个账号${run.message?' · '+run.message:''}`:'尚未手动拉取；当前沿用初始模型配置。';
+  $('#models-fetch-status').textContent=text;$('#models-fetch').disabled=data.refreshing||dirty;
+  $('#models-attempts').innerHTML=(run?.attempts||[]).map(v=>`<li><span>${escapeHTML(v.email||v.account_id)}</span><span>${escapeHTML(v.code||'成功')} · ${duration(v.duration_ms)}${v.message?' · '+escapeHTML(v.message):''}</span></li>`).join('');
+ }
+ function updatePreview(){
+  const s=data.config,known=new Set(s.catalog.filter(v=>v.present).map(v=>v.id));
+  const enabled=s.mappings.filter(m=>m.enabled&&(!s.catalog_version||known.has(m.upstream_id)));
+  $('#models-preview').textContent=enabled.length?enabled.map(v=>v.public_id||'（未命名）').join(' · '):'暂无可公开的模型';
+  $('#models-save').textContent=dirty?'保存映射并生效':'保存映射';
+ }
+ function mappingRows(){
+  const s=data.config,known=new Set(s.catalog.filter(v=>v.present).map(v=>v.id));
+  $('#models-mappings').innerHTML=s.mappings.map((m,i)=>{
+   const available=!s.catalog_version||known.has(m.upstream_id),reason=!m.enabled?'已手动停用':available?'可用':'本次目录未发现目标模型';
+   const ids=[...new Set([...s.catalog.map(v=>v.id),m.upstream_id].filter(Boolean))];
+   return `<article class="model-mapping" data-map="${i}"><div class="model-mapping-top"><span class="badge ${m.enabled&&available?'success':'neutral'}">${escapeHTML(reason)}</span><button class="text-button model-delete" data-index="${i}" type="button" aria-label="删除映射 ${escapeHTML(m.public_id)}">删除</button></div><div class="model-fields"><label>公开模型名称<input class="key-input" maxlength="128" data-field="public_id" value="${escapeHTML(m.public_id)}" placeholder="下游调用的 model"></label><label>实际上游模型${s.catalog_version?`<select class="key-input" data-field="upstream_id">${ids.map(id=>`<option value="${escapeHTML(id)}" ${id===m.upstream_id?'selected':''}>${escapeHTML(id)}${known.has(id)?'':'（本次未发现）'}</option>`).join('')}</select>`:`<input class="key-input" maxlength="128" data-field="upstream_id" value="${escapeHTML(m.upstream_id)}">`}</label></div><div class="model-caps">${Object.entries(capLabels).map(([key,label])=>`<label><input type="checkbox" data-cap="${key}" ${m.capabilities.includes(key)?'checked':''}>${label}</label>`).join('')}<label class="model-enabled"><input type="checkbox" data-field="enabled" ${m.enabled?'checked':''}>启用</label></div></article>`;
+  }).join('')||'<p class="muted">还没有映射。选择左侧模型添加，或点击“新增映射”。</p>';
+  updatePreview();
+ }
+ function draw(){
+  const s=data.config;
+  target.innerHTML=`<div class="model-toolbar panel"><div><h2>模型目录与映射</h2><p>仅点击拉取时访问上游；目录持久保存，不自动过期。拉取失败只切换账号，不刷新 AT。</p></div><div class="model-fetch-controls"><label>拉取切号上限<input id="models-retries" class="key-input" type="number" min="0" max="100" value="${s.switch_retries}"></label><button id="models-fetch" class="button" type="button">拉取上游模型</button></div><p class="small muted">切号上限指首次账号之后最多再尝试多少个账号；修改后保存生效。每个账号最多等待30秒。</p><p id="models-fetch-status" class="small" role="status" aria-live="polite"></p><details class="model-attempt-details"><summary>拉取账号与结果</summary><ul id="models-attempts"></ul></details></div><div class="models-columns"><section class="panel model-column"><div class="panel-heading"><div><h2>上游原始模型</h2><p>最近成功拉取 ${date(s.fetched_at)} · 目录版本 ${s.catalog_version}</p><p>${s.account_email?'本次使用账号：'+escapeHTML(s.account_email):'尚未拉取上游目录'}</p></div><span class="badge neutral">${s.catalog.filter(v=>v.present).length} 个</span></div><p class="small muted model-catalog-note">模型缺失仅表示本次账号的目录未包含它。缺失目标的映射会暂停，重新出现后按启用状态恢复。</p><div class="model-catalog-list">${s.catalog.map(v=>`<article class="model-catalog-item"><div><strong class="mono">${escapeHTML(v.id)}</strong>${v.change?`<span class="badge ${v.present?'coral-badge':'neutral'}">${changeLabels[v.change]||''}</span>`:''}<p>${escapeHTML(v.title||v.description||'')}</p></div><button class="text-button" type="button" data-add-model="${escapeHTML(v.id)}" ${v.present?'':'disabled'}>添加映射</button></article>`).join('')||'<div class="empty-cell">点击“拉取上游模型”获取此账号可用的模型。</div>'}</div><details class="model-raw"><summary>查看目录数据</summary><pre></pre></details></section><section class="panel model-column"><div class="panel-heading"><div><h2>下游公开模型</h2><p>调用方使用左侧名称，服务转发到对应上游模型。</p></div><button class="button" id="models-add" type="button">新增映射</button></div><div id="models-mappings"></div><div class="model-public-preview"><strong>/v1/models 当前公开预览</strong><p class="mono" id="models-preview"></p></div><div id="models-status" role="status" aria-live="polite"></div><div class="model-save-actions"><button class="text-button" id="models-reload" type="button">重新加载</button><button class="button primary" id="models-save" type="button">保存映射</button></div></section></div>`;
+  $('.model-raw pre',target).textContent=JSON.stringify(s.raw||{},null,2);mappingRows();showFetch();
+  $('#models-retries').addEventListener('input',()=>{dirty=true;s.switch_retries=Number($('#models-retries').value);showFetch();updatePreview();});
+  $('#models-add').onclick=()=>add(s.catalog.find(v=>v.present)?.id||'');
+  $$('[data-add-model]',target).forEach(b=>b.onclick=()=>add(b.dataset.addModel));
+  $('#models-mappings').addEventListener('input',event=>{
+   const row=event.target.closest('[data-map]');if(!row)return;const m=s.mappings[Number(row.dataset.map)],field=event.target.dataset.field,cap=event.target.dataset.cap;
+   if(field)m[field]=field==='enabled'?event.target.checked:event.target.value;
+   if(cap)m.capabilities=event.target.checked?[...new Set([...m.capabilities,cap])]:m.capabilities.filter(v=>v!==cap);
+   dirty=true;updatePreview();showFetch();
+  });
+  $('#models-mappings').addEventListener('click',event=>{const button=event.target.closest('.model-delete');if(!button)return;s.mappings.splice(Number(button.dataset.index),1);dirty=true;mappingRows();showFetch();});
+  $('#models-reload').onclick=()=>{dirty=false;load();};
+  $('#models-save').onclick=async()=>{
+   const retries=Number($('#models-retries').value);if(!Number.isInteger(retries)||retries<0||retries>100){status('切号上限应为0至100的整数。',true);return;}
+   const button=$('#models-save');button.disabled=true;status('正在保存…');
+   try{const next=await api('/admin/models/mappings',{method:'PUT',body:JSON.stringify({revision:s.revision,switch_retries:retries,mappings:s.mappings})});if(!current())return;data=next;dirty=false;draw();status('映射已保存，新请求立即生效。');poll();}catch(e){if(current()){status(e.message,true);button.disabled=false;}}
+  };
+  $('#models-fetch').onclick=async()=>{const button=$('#models-fetch');button.disabled=true;try{await api('/admin/models/catalog/refresh',{method:'POST',body:'{}'});if(!current())return;await load();}catch(e){if(current()){status(e.message,true);button.disabled=false;}}};
+ }
+ function add(id){data.config.mappings.push({public_id:'',upstream_id:id,capabilities:['chat'],enabled:true});dirty=true;mappingRows();showFetch();$('#models-mappings [data-map]:last-child input')?.focus();}
+ await load();
+}

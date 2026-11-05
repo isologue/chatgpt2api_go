@@ -451,7 +451,11 @@ func (n *Native) generateOnce(ctx context.Context, a Account, r Request, stages 
 		metadata["attachments"] = attachments
 	}
 	parent, message := uuid.NewString(), uuid.NewString()
-	payload := map[string]any{"action": "next", "fork_from_shared_post": false, "parent_message_id": parent, "model": n.c.UpstreamModel, "client_prepare_state": "success", "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "conversation_mode": map[string]any{"kind": "primary_assistant"}, "system_hints": []string{"picture_v2"}, "partial_query": map[string]any{"id": message, "author": map[string]string{"role": "user"}, "content": content, "metadata": metadata}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": map[string]string{"app_name": "chatgpt.com"}}
+	target := r.UpstreamModel
+	if target == "" {
+		target = n.config(ctx).UpstreamModel
+	}
+	payload := map[string]any{"action": "next", "fork_from_shared_post": false, "parent_message_id": parent, "model": target, "client_prepare_state": "success", "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "conversation_mode": map[string]any{"kind": "primary_assistant"}, "system_hints": []string{"picture_v2"}, "partial_query": map[string]any{"id": message, "author": map[string]string{"role": "user"}, "content": content, "metadata": metadata}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": map[string]string{"app_name": "chatgpt.com"}}
 	start = time.Now()
 	cp, err := s.json(ctx, "POST", "/backend-api/f/conversation/prepare", payload, headers)
 	n.measure(stages, "会话准备", start)

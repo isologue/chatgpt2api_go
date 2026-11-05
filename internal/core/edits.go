@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"image"
 	"io"
@@ -39,8 +38,12 @@ func (c Config) editMaxImages() int {
 func (a *API) edit(w http.ResponseWriter, r *http.Request) {
 	c := a.Engine.CurrentConfig()
 	media, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err == nil && media == "application/json" {
+		a.editJSON(w, r, c)
+		return
+	}
 	if err != nil || media != "multipart/form-data" || params["boundary"] == "" {
-		sendError(w, Err(400, "invalid_multipart", "图片编辑需要 multipart/form-data，使用 image 或 image[] 上传图片"))
+		sendError(w, Err(400, "invalid_multipart", "图片编辑支持 application/json（images[].image_url）或 multipart/form-data（image/image[] 上传图片）"))
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, int64(c.editMaxMiB())<<20)
@@ -92,12 +95,7 @@ func (a *API) edit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 表单顺序、multipart boundary 改变不影响幂等；参数和所有文件内容均参与哈希。
-	hashBody, _ := json.Marshal(struct {
-		Request Request
-		Inputs  []editInput
-		Masks   []editInput
-	}{req, hashedInputs(req.inputs), hashedInputs(req.masks)})
-	r = r.WithContext(context.WithValue(r.Context(), requestHashKey{}, canonicalHash(hashBody)))
+	r = r.WithContext(context.WithValue(r.Context(), requestHashKey{}, hashEditRequest(req)))
 	r = r.WithContext(context.WithValue(r.Context(), configKey{}, c))
 	if err = req.Validate(c); err != nil {
 		cleanup()
@@ -108,6 +106,7 @@ func (a *API) edit(w http.ResponseWriter, r *http.Request) {
 	keep = true
 	a.captureWire(w, r, &wireCapture{kind: "create", requestFile: filepath.Base(raw.Name()), contentType: r.Header.Get("Content-Type")}, func(w http.ResponseWriter, r *http.Request) { a.serveSubmission(w, r, req) })
 }
+
 func hashedInputs(inputs []editInput) []editInput {
 	out := append([]editInput(nil), inputs...)
 	for i := range out {

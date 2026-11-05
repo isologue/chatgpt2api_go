@@ -45,6 +45,7 @@ type job struct {
 }
 type Metrics struct{ Accepted, Rejected, Completed, Failed, Safety, Active, Queued, PersistenceErrors atomic.Int64 }
 type Engine struct {
+	models          *modelManager
 	textSlots       *limiter
 	fileSlots       *limiter
 	filePermits     *limiter
@@ -87,7 +88,7 @@ type Engine struct {
 
 func NewEngine(c Config, p *Pool, s Store, g Generator) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &Engine{textSlots: newLimiter(c.textLimit()), fileSlots: newLimiter(c.fileLimit()), filePermits: newLimiter(c.fileLimit() + c.FileQueueSize), webdav: newWebDAVStorage(c.WebDAV), access: newAccessManager(c), Config: c, Pool: p, Store: s, Generator: g, root: ctx, cancel: cancel, permits: newLimiter(c.Workers + c.QueueSize), execution: newLimiter(c.Workers), responses: newLimiter(c.ResponseConcurrency), settings: newRuntimeConfig(c), logQueue: make(chan requestLog, max(1, c.LogQueueSize)), logOverflow: make(chan requestLog, max(1, c.LogQueueSize)), taskProgress: map[string]int{}}
+	e := &Engine{models: newModelManager(c), textSlots: newLimiter(c.textLimit()), fileSlots: newLimiter(c.fileLimit()), filePermits: newLimiter(c.fileLimit() + c.FileQueueSize), webdav: newWebDAVStorage(c.WebDAV), access: newAccessManager(c), Config: c, Pool: p, Store: s, Generator: g, root: ctx, cancel: cancel, permits: newLimiter(c.Workers + c.QueueSize), execution: newLimiter(c.Workers), responses: newLimiter(c.ResponseConcurrency), settings: newRuntimeConfig(c), logQueue: make(chan requestLog, max(1, c.LogQueueSize)), logOverflow: make(chan requestLog, max(1, c.LogQueueSize)), taskProgress: map[string]int{}}
 	if db, ok := s.(*Postgres); ok {
 		e.resources = &resourceManager{e: e, s: db, pins: map[string]int{}, busy: map[string]bool{}, thumbnails: newLimiter(c.thumbnailLimit())}
 	}
@@ -123,6 +124,15 @@ func (e *Engine) Submit(ctx context.Context, r Request) (Task, <-chan completed,
 	return e.submitNew(ctx, r)
 }
 func (e *Engine) submitNew(ctx context.Context, r Request) (Task, <-chan completed, error) {
+	target, err := e.resolveModel(r.Model, "image")
+	if err != nil {
+		return Task{}, nil, err
+	}
+	if r.Model == "" {
+		r.Model = "gpt-image-2"
+	}
+	r.UpstreamModel = target
+
 	config := configIn(ctx, e.CurrentConfig())
 	e.admission.RLock()
 	defer e.admission.RUnlock()
@@ -468,6 +478,8 @@ func (e *Engine) generate(ctx context.Context, r Request) (*Generation, []Attemp
 			at := Attempt{AccountID: a.ID, Email: a.Email, Started: start, DurationMS: time.Since(start).Milliseconds(), Stages: stages, TotalBudgetExemptReason: imageBudgetExemptReason(ctx)}
 			if ae != nil {
 				at.Code = ae.Code
+				at.HTTPStatus = ae.Status
+				at.Error = Err(ae.Status, ae.Code, ae.Message)
 				at.RawResponse = string(ae.rawResponse)
 				at.RawResponseTruncated = ae.rawResponseTruncated
 			}

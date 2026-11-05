@@ -54,6 +54,7 @@ ALTER TABLE core_api_keys ADD COLUMN IF NOT EXISTS concurrency bigint NOT NULL D
 CREATE TABLE IF NOT EXISTS core_account_push(id int PRIMARY KEY CHECK(id=1),enabled boolean NOT NULL DEFAULT false,key_hash text NOT NULL DEFAULT '',revision bigint NOT NULL DEFAULT 0);
 ALTER TABLE core_account_push ADD COLUMN IF NOT EXISTS key_value text NOT NULL DEFAULT '';
 INSERT INTO core_account_push(id) VALUES(1) ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS core_model_catalog(id int PRIMARY KEY CHECK(id=1),revision bigint NOT NULL,data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS core_settings(id int PRIMARY KEY CHECK(id=1),revision bigint NOT NULL DEFAULT 0,values jsonb NOT NULL DEFAULT '{}'::jsonb,updated_at timestamptz NOT NULL DEFAULT now());
 INSERT INTO core_settings(id) VALUES(1) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS core_admin_jobs(id text PRIMARY KEY,kind text NOT NULL,status text NOT NULL,data jsonb NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now());
@@ -65,6 +66,7 @@ ALTER TABLE core_tasks ADD COLUMN IF NOT EXISTS error_status int;
 CREATE TABLE IF NOT EXISTS core_idempotency(scope text PRIMARY KEY,fingerprint text NOT NULL,task_id text NOT NULL UNIQUE REFERENCES core_tasks(id) ON DELETE CASCADE,created_at timestamptz NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS core_tasks_status ON core_tasks(status) WHERE status IN ('queued','processing');
 CREATE TABLE IF NOT EXISTS core_requests(id text PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT now(), model text NOT NULL, is_async boolean NOT NULL, response_format text NOT NULL, status text NOT NULL, duration_ms bigint NOT NULL, attempts jsonb NOT NULL, error jsonb);
+ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS upstream_model text NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS core_requests_created_at ON core_requests(created_at DESC);
 ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS started_at timestamptz;
 ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS finished_at timestamptz;
@@ -230,7 +232,7 @@ type batchLogStore interface {
 	LogBatch(context.Context, []requestLog) error
 }
 
-const requestLogInsert = "INSERT INTO core_requests(id,created_at,started_at,finished_at,queue_ms,switch_count,image_count,model,is_async,response_format,status,duration_ms,attempts,error,api_key_id,api_key_name) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"
+const requestLogInsert = "INSERT INTO core_requests(id,created_at,started_at,finished_at,queue_ms,switch_count,image_count,model,is_async,response_format,status,duration_ms,attempts,error,api_key_id,api_key_name,upstream_model) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)"
 
 func requestLogValues(l requestLog) (any, error) {
 	a, err := json.Marshal(l.attempts)
@@ -267,7 +269,7 @@ func requestLogValues(l requestLog) (any, error) {
 	if l.err == nil {
 		images = l.req.N
 	}
-	return []any{l.id, timing.Finished, started, timing.Finished, timing.QueueMS, switches, images, l.req.Model, l.req.Async, l.req.Format, status, l.duration.Milliseconds(), a, eb, l.req.apiKeyID, l.req.apiKeyName}, nil
+	return []any{l.id, timing.Finished, started, timing.Finished, timing.QueueMS, switches, images, l.req.Model, l.req.Async, l.req.Format, status, l.duration.Milliseconds(), a, eb, l.req.apiKeyID, l.req.apiKeyName, l.req.UpstreamModel}, nil
 }
 
 func (s *Postgres) Log(ctx context.Context, id string, r Request, attempts []Attempt, e *APIError, d time.Duration) error {

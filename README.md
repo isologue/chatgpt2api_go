@@ -67,7 +67,7 @@ docker compose up -d core
 
 ## 接口
 
-接口需 `Authorization: Bearer <图片调用密钥>`。首次启动将 `CORE_API_KEY` 导入调用密钥列表，之后可在「系统设置 → 访问与密钥」新增、修改、停用或删除。图片接口支持 `gpt-image-2` 文生图和 multipart 图片编辑，`n` 为 `1..4`，单次多图按顺序生成，不返回 `revised_prompt`。新增聊天、Responses、搜索、PPTX/PSD 异步文件任务及多代理统一选路；接口示例、配置与兼容边界见 [聊天、搜索、文件与代理](docs/chat-search-files-proxy.md)。图片接口本身不输出 SSE。
+接口需 `Authorization: Bearer <图片调用密钥>`。首次启动将 `CORE_API_KEY` 导入调用密钥列表，之后可在「系统设置 → 访问与密钥」新增、修改、停用或删除。图片接口支持 `gpt-image-2` 文生图和 multipart/JSON 图片编辑，`n` 为 `1..4`，单次多图按顺序生成，不返回 `revised_prompt`。新增聊天、Responses、搜索、PPTX/PSD 异步文件任务及多代理统一选路；接口示例、配置与兼容边界见 [聊天、搜索、文件与代理](docs/chat-search-files-proxy.md)。图片接口本身不输出 SSE。
 
 同步与异步都使用 `POST /v1/images/generations`：
 
@@ -96,6 +96,17 @@ docker compose up -d core
 同步返回 `{"created":...,"data":[{"url":"..."}]}`。返回格式支持 `url` 和 `b64_json`，兼容 `base64`、`b64`、`base64_json`。系统默认值与是否接受用户指定格式分别由两个配置项控制。
 
 图片 URL 使用随机 UUID，持有 URL 即可访问，不额外要求 API key。`/healthz` 只检测进程；`/readyz` 检查服务状态及数据库。`GET /v1/models` 返回当前支持的模型。
+
+## 手动模型目录与公开映射
+
+在「系统设置 → 模型列表」点击「拉取上游模型」，然后配置公开名称、上游目标和适用接口，保存后对新请求立即生效。例如 `A → P`、`B → G`，调用方通过 `/v1/models` 只看到启用且可用的 `P`、`G`；请求中的 `model=P` 实际使用上游 `A`。
+
+- 只在点击按钮时拉取；启动、定时维护和普通 API 请求都不会拉取模型。目录与映射存入 PostgreSQL，没有缓存有效期，重启后保留。
+- 使用账号当前 AT 请求上游模型目录。失败（包括 AT 失效）只切换账号，不执行 RT 刷新 AT、额度刷新或账号评分；切号上限表示首次尝试后额外可尝试的账号数，每个账号最多等待 30 秒。
+- 拉取失败保留上一次成功目录和映射。成功拉取后标记新增、变化、消失或恢复；消失模型的映射保留但暂停公开与新请求，后续重新出现时恢复，手动停用的映射继续停用。
+- 初次拉取前保留原有默认模型以兼容已有调用。首次成功拉取后，以目录中存在的目标为准，不自动公开新发现的模型。
+- 图片、对话、搜索、PPT/PSD 能力由管理员在每条映射上选择；映射不能改变上游模型本身的能力。任务接纳时固定上游目标，修改映射不改变已接纳的图片和文件任务。
+- 管理接口为 `GET /admin/models/catalog`、`POST /admin/models/catalog/refresh`（异步返回 202）、`PUT /admin/models/mappings`，均需管理员身份。保存需提交 `revision`、`mappings`、`switch_retries`，并发修改冲突返回 409，重新加载后再保存。
 
 ## 主要性能参数
 

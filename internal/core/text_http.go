@@ -66,7 +66,7 @@ func (e *Engine) runText(ctx context.Context, in textInput, identity managedAPIK
 		e.admission.RUnlock()
 		return result, Err(503, "text_unavailable", "当前生成器不支持聊天和搜索")
 	}
-	req := Request{Prompt: in.Messages[len(in.Messages)-1].Content, Model: in.Model, apiKeyID: identity.ID, apiKeyName: identity.Name, keyConcurrency: identity.Concurrency}
+	req := Request{UpstreamModel: in.UpstreamModel, Prompt: in.Messages[len(in.Messages)-1].Content, Model: in.Model, apiKeyID: identity.ID, apiKeyName: identity.Name, keyConcurrency: identity.Concurrency}
 	release, err := e.acquireKey(req)
 	if err != nil {
 		e.admission.RUnlock()
@@ -223,9 +223,6 @@ func parseText(body map[string]json.RawMessage, kind string) (textInput, bool, e
 			return in, false, Err(400, "invalid_model", "model 无效")
 		}
 	}
-	if strings.HasPrefix(in.Model, "gpt-image-") {
-		return in, false, Err(400, "unsupported_model", "图片模型请使用 /v1/images/generations")
-	}
 	if v, ok := body["stream"]; ok && json.Unmarshal(v, &stream) != nil {
 		return in, false, Err(400, "invalid_stream", "stream 应为布尔值")
 	}
@@ -278,9 +275,6 @@ func parseText(body map[string]json.RawMessage, kind string) (textInput, bool, e
 			return in, false, err
 		}
 		in.Messages = []textMessage{{Role: "user", Content: prompt}}
-		if in.Model == "auto" {
-			in.Model = "gpt-5-5"
-		}
 	} else {
 		raw := body["messages"]
 		if kind == "responses" {
@@ -344,9 +338,6 @@ func parseText(body map[string]json.RawMessage, kind string) (textInput, bool, e
 	if strings.TrimSpace(in.Messages[len(in.Messages)-1].Content) == "" || total > 512<<10 {
 		return in, false, Err(400, "invalid_prompt", "文本不能为空且总长度不得超过512KiB")
 	}
-	if in.Search && in.Model == "auto" {
-		in.Model = "gpt-5-5"
-	}
 	return in, stream, nil
 }
 func (a *API) textRequest(w http.ResponseWriter, r *http.Request, kind string) {
@@ -356,6 +347,15 @@ func (a *API) textRequest(w http.ResponseWriter, r *http.Request, kind string) {
 		return
 	}
 	in, stream, err := parseText(body, kind)
+	if err != nil {
+		sendError(w, AsError(err))
+		return
+	}
+	capability := "chat"
+	if in.Search {
+		capability = "search"
+	}
+	in.UpstreamModel, err = a.Engine.resolveModel(in.Model, capability)
 	if err != nil {
 		sendError(w, AsError(err))
 		return

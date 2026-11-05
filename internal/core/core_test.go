@@ -99,7 +99,7 @@ func (s *memoryStore) Log(context.Context, string, Request, []Attempt, *APIError
 func (s *memoryStore) Ping(context.Context) error { return nil }
 func (s *memoryStore) Close()                     {}
 func testConfig(t *testing.T) Config {
-	return Config{ImageDir: t.TempDir(), Workers: 8, QueueSize: 8, AccountSlots: 1, SwitchRetries: 2, DownloadRetries: 1, DownloadConcurrency: 3, ValidationConcurrency: 2, VerifyConcurrency: 4, ResponseConcurrency: 4, DBConnections: 4, APIKey: "test-key", AdminKey: "admin-key", DefaultFormat: "url", AllowUserFormat: true, PublicURL: "http://localhost:9080", TotalTimeout: 5 * time.Second, SSETimeout: 2 * time.Second, PollTimeout: 200 * time.Millisecond, DownloadTimeout: time.Second, MetadataTimeout: time.Second, Freshness: time.Minute, MaxImageBytes: 1 << 20, TLSProfile: "chrome_110", UpstreamModel: "gpt-5-5"}
+	return Config{ImageDir: t.TempDir(), Workers: 8, QueueSize: 8, AccountSlots: 1, SwitchRetries: 2, DownloadRetries: 1, DownloadConcurrency: 3, ValidationConcurrency: 2, VerifyConcurrency: 4, ResponseConcurrency: 4, DBConnections: 4, APIKey: "test-key", AdminKey: "admin-key", DefaultFormat: "url", AllowUserFormat: true, PublicURL: "http://localhost:9080", TotalTimeout: 5 * time.Second, SSETimeout: 2 * time.Second, PollTimeout: 200 * time.Millisecond, DownloadTimeout: time.Second, MetadataTimeout: time.Second, Freshness: time.Minute, MaxImageBytes: 1 << 20, TLSProfile: "chrome_110", UpstreamModel: "gpt-6"}
 }
 func testAccounts(n int) []Account {
 	out := make([]Account, n)

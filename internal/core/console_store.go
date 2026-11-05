@@ -117,6 +117,7 @@ func (s *Postgres) ConsoleRequests(ctx context.Context, q consoleQuery) (map[str
 	return map[string]any{"items": items, "next_cursor": next}, nil
 }
 func (s *Postgres) ConsoleRequest(ctx context.Context, id string) (map[string]any, error) {
+	var upstreamModel string
 	var reqID, model, format, status, keyID, keyName string
 	var created time.Time
 	var async bool
@@ -124,7 +125,7 @@ func (s *Postgres) ConsoleRequest(ctx context.Context, id string) (map[string]an
 	var attempts, errorBytes []byte
 	var started, finished *time.Time
 	var queue *int64
-	err := s.db.QueryRow(ctx, `SELECT id,created_at,model,is_async,response_format,status,duration_ms,attempts,error,started_at,finished_at,queue_ms,api_key_id,api_key_name FROM core_requests WHERE id=$1`, id).Scan(&reqID, &created, &model, &async, &format, &status, &duration, &attempts, &errorBytes, &started, &finished, &queue, &keyID, &keyName)
+	err := s.db.QueryRow(ctx, `SELECT id,created_at,model,is_async,response_format,status,duration_ms,attempts,error,started_at,finished_at,queue_ms,api_key_id,api_key_name,upstream_model FROM core_requests WHERE id=$1`, id).Scan(&reqID, &created, &model, &async, &format, &status, &duration, &attempts, &errorBytes, &started, &finished, &queue, &keyID, &keyName, &upstreamModel)
 	if err != nil {
 		return nil, err
 	}
@@ -138,5 +139,5 @@ func (s *Postgres) ConsoleRequest(ctx context.Context, id string) (map[string]an
 			return nil, err
 		}
 	}
-	return map[string]any{"id": reqID, "created_at": created, "model": model, "is_async": async, "response_format": format, "status": status, "duration_ms": duration, "attempts": aa, "error": ae, "started_at": started, "finished_at": finished, "queue_ms": queue, "api_key_id": keyID, "api_key_name": keyName}, nil
+	return map[string]any{"id": reqID, "created_at": created, "model": model, "upstream_model": upstreamModel, "is_async": async, "response_format": format, "status": status, "duration_ms": duration, "attempts": aa, "error": ae, "started_at": started, "finished_at": finished, "queue_ms": queue, "api_key_id": keyID, "api_key_name": keyName}, nil
 }

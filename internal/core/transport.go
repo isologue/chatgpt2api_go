@@ -231,12 +231,8 @@ func (s *session) jsonWithRaw(ctx context.Context, method, path string, payload 
 func upstreamError(status int, raw []byte) *APIError {
 	var data map[string]any
 	_ = json.Unmarshal(raw, &data)
-	code := str(data["code"])
-	if e, ok := data["error"].(map[string]any); ok {
-		code = str(e["code"])
-	}
 	var apiErr *APIError
-	if code == "content_policy_violation" || code == "moderation_blocked" {
+	if policyError(data) || (len(data) == 0 && isContentPolicyRejection(string(raw))) {
 		apiErr = Err(400, "content_policy_violation", "上游安全审核拒绝")
 	} else if status == 401 {
 		apiErr = RetryError("account_token_invalid", "账号令牌失效")

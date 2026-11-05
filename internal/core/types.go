@@ -11,6 +11,7 @@ import (
 )
 
 type Request struct {
+	UpstreamModel              string `json:"upstream_model,omitempty"`
 	apiKeyID, apiKeyName       string
 	keyConcurrency             int
 	idemScope, idemFingerprint string
@@ -77,8 +78,8 @@ func (r *Request) Validate(c Config) error {
 	if r.Model == "" {
 		r.Model = "gpt-image-2"
 	}
-	if r.Model != "gpt-image-2" {
-		return Err(400, "unsupported_model", "当前仅支持 gpt-image-2")
+	if len(r.Model) > 128 || strings.ContainsAny(r.Model, " \t\r\n/") {
+		return Err(400, "invalid_model", "model 无效")
 	}
 	if r.N < 1 || r.N > 4 {
 		return Err(400, "invalid_n", "n 必须在 1 到 4 之间")
@@ -211,6 +212,8 @@ type Generation struct {
 	Usage   *ImageUsage `json:"usage,omitempty"`
 }
 type Attempt struct {
+	HTTPStatus              int                `json:"http_status,omitempty"`
+	Error                   *APIError          `json:"error,omitempty"`
 	Warning                 *APIError          `json:"warning,omitempty"`
 	TotalBudgetExemptReason string             `json:"total_budget_exempt_reason,omitempty"`
 	AccountID               string             `json:"account_id"`

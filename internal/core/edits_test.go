@@ -109,129 +109,151 @@ func TestMaskCompositeSemantics(t *testing.T) {
 	}
 }
 func TestEditsMaskedNativeUploadAndCleanup(t *testing.T) {
-	for _, async := range []bool{false, true} {
-		t.Run(map[bool]string{false: "sync", true: "async"}[async], func(t *testing.T) {
-			c := testConfig(t)
-			m := newMockUpstream(t)
-			gate := make(chan struct{})
-			if async {
-				m.gate = gate
-			}
-			var uploads, confirmations, conversations atomic.Int64
-			var srv *httptest.Server
-			srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch {
-				case r.URL.Path == "/backend-api/files":
-					var meta map[string]any
-					json.NewDecoder(r.Body).Decode(&meta)
-					if meta["use_case"] != "multimodal" || !strings.HasSuffix(str(meta["file_name"]), ".png") {
-						t.Error("wrong upload metadata")
-					}
-					sendJSON(w, 200, map[string]string{"file_id": "input-fixture", "upload_url": srv.URL + "/signed-upload"})
-					return
-				case r.URL.Path == "/signed-upload":
-					if r.Method != "PUT" || r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
-						t.Error("signed upload auth leak")
-					}
-					data, err := io.ReadAll(r.Body)
-					if err != nil {
-						t.Error(err)
-					}
-					im, _, err := image.Decode(bytes.NewReader(data))
-					if err != nil {
-						t.Error(err)
-					} else {
-						_, _, _, a0 := im.At(0, 0).RGBA()
-						_, _, _, a1 := im.At(1, 0).RGBA()
-						if a0 != 0 || a1 != 65535 {
-							t.Error("mask did not reach upstream upload")
+	for _, asJSON := range []bool{false, true} {
+		for _, async := range []bool{false, true} {
+			t.Run(map[bool]string{false: "multipart", true: "json"}[asJSON]+"/"+map[bool]string{false: "sync", true: "async"}[async], func(t *testing.T) {
+				c := testConfig(t)
+				m := newMockUpstream(t)
+				gate := make(chan struct{})
+				if async {
+					m.gate = gate
+				}
+				var uploads, confirmations, conversations atomic.Int64
+				var inputMask []byte
+				var srv *httptest.Server
+				srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					switch {
+					case r.URL.Path == "/reference.png" || r.URL.Path == "/mask.png":
+						if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
+							t.Error("input URL credential leak")
 						}
+						w.Header().Set("Content-Type", "image/png")
+						if r.URL.Path == "/reference.png" {
+							_, _ = w.Write(tinyPNG())
+						} else {
+							_, _ = w.Write(inputMask)
+						}
+						return
+					case r.URL.Path == "/backend-api/files":
+						var meta map[string]any
+						json.NewDecoder(r.Body).Decode(&meta)
+						if meta["use_case"] != "multimodal" || !strings.HasSuffix(str(meta["file_name"]), ".png") {
+							t.Error("wrong upload metadata")
+						}
+						sendJSON(w, 200, map[string]string{"file_id": "input-fixture", "upload_url": srv.URL + "/signed-upload"})
+						return
+					case r.URL.Path == "/signed-upload":
+						if r.Method != "PUT" || r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
+							t.Error("signed upload auth leak")
+						}
+						data, err := io.ReadAll(r.Body)
+						if err != nil {
+							t.Error(err)
+						}
+						im, _, err := image.Decode(bytes.NewReader(data))
+						if err != nil {
+							t.Error(err)
+						} else {
+							_, _, _, a0 := im.At(0, 0).RGBA()
+							_, _, _, a1 := im.At(1, 0).RGBA()
+							if a0 != 0 || a1 != 65535 {
+								t.Error("mask did not reach upstream upload")
+							}
+						}
+						uploads.Add(1)
+						w.WriteHeader(201)
+						return
+					case r.URL.Path == "/backend-api/files/input-fixture/uploaded":
+						confirmations.Add(1)
+						sendJSON(w, 200, map[string]bool{"ok": true})
+						return
+					case r.URL.Path == "/backend-api/f/conversation":
+						data, _ := io.ReadAll(r.Body)
+						if !bytes.Contains(data, []byte("file-service://input-fixture")) || !bytes.Contains(data, []byte("attachments")) {
+							t.Error("missing multimodal input")
+						}
+						r.Body = io.NopCloser(bytes.NewReader(data))
+						conversations.Add(1)
 					}
-					uploads.Add(1)
-					w.WriteHeader(201)
-					return
-				case r.URL.Path == "/backend-api/files/input-fixture/uploaded":
-					confirmations.Add(1)
-					sendJSON(w, 200, map[string]bool{"ok": true})
-					return
-				case r.URL.Path == "/backend-api/f/conversation":
-					data, _ := io.ReadAll(r.Body)
-					if !bytes.Contains(data, []byte("file-service://input-fixture")) || !bytes.Contains(data, []byte("attachments")) {
-						t.Error("missing multimodal input")
+					m.handle(w, r)
+				}))
+				defer srv.Close()
+				c.UpstreamURL = srv.URL
+				c.OAuthURL = srv.URL + "/oauth/token"
+				pool := NewPool(testAccounts(2), c.AccountSlots)
+				store := newMemoryStore()
+				native, err := NewNative(c, pool, store)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer native.Close()
+				e := NewEngine(c, pool, store, native)
+				defer e.Close()
+				h := NewHandler(e)
+				mask := image.NewNRGBA(image.Rect(0, 0, 4, 4))
+				for y := 0; y < 4; y++ {
+					for x := 1; x < 4; x++ {
+						mask.SetNRGBA(x, y, color.NRGBA{A: 255})
 					}
-					r.Body = io.NopCloser(bytes.NewReader(data))
-					conversations.Add(1)
 				}
-				m.handle(w, r)
-			}))
-			defer srv.Close()
-			c.UpstreamURL = srv.URL
-			c.OAuthURL = srv.URL + "/oauth/token"
-			pool := NewPool(testAccounts(2), c.AccountSlots)
-			store := newMemoryStore()
-			native, err := NewNative(c, pool, store)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer native.Close()
-			e := NewEngine(c, pool, store, native)
-			defer e.Close()
-			h := NewHandler(e)
-			mask := image.NewNRGBA(image.Rect(0, 0, 4, 4))
-			for y := 0; y < 4; y++ {
-				for x := 1; x < 4; x++ {
-					mask.SetNRGBA(x, y, color.NRGBA{A: 255})
+				fields := map[string]string{"prompt": "Replace the transparent region"}
+				if async {
+					fields["async"] = "true"
 				}
-			}
-			fields := map[string]string{"prompt": "Replace the transparent region"}
-			if async {
-				fields["async"] = "true"
-			}
-			body, ct := editBody(t, fields, [][]byte{tinyPNG()}, [][]byte{encodedPNG(t, mask)})
-			w := postEdit(h, body, ct, "")
-			if w.Code != 200 {
-				t.Fatal(w.Code, w.Body.String())
-			}
-			if async {
-				var queued struct {
-					ID string `json:"task_id"`
-				}
-				json.Unmarshal(w.Body.Bytes(), &queued)
-				entries, _ := os.ReadDir(filepath.Join(c.ImageDir, ".edit-inputs"))
-				if len(entries) != 1 {
-					t.Fatal("async input removed before completion")
-				}
-				close(gate)
-				deadline := time.Now().Add(3 * time.Second)
-				for {
-					task, err := store.GetTask(context.Background(), queued.ID)
+				inputMask = encodedPNG(t, mask)
+				body, ct := editBody(t, fields, [][]byte{tinyPNG()}, [][]byte{inputMask})
+				if asJSON {
+					body, err = json.Marshal(map[string]any{"prompt": fields["prompt"], "n": 1, "async": async, "size": "1024x1024", "response_format": "url", "output_format": "png", "images": []any{map[string]string{"image_url": srv.URL + "/reference.png"}}, "mask": []any{map[string]string{"image_url": srv.URL + "/mask.png"}}})
 					if err != nil {
 						t.Fatal(err)
 					}
-					if task.Status == "succeeded" {
+					ct = "application/json; charset=utf-8"
+				}
+				w := postEdit(h, body, ct, "")
+				if w.Code != 200 {
+					t.Fatal(w.Code, w.Body.String())
+				}
+				if async {
+					var queued struct {
+						ID string `json:"task_id"`
+					}
+					json.Unmarshal(w.Body.Bytes(), &queued)
+					entries, _ := os.ReadDir(filepath.Join(c.ImageDir, ".edit-inputs"))
+					if len(entries) != 1 {
+						t.Fatal("async input removed before completion")
+					}
+					close(gate)
+					deadline := time.Now().Add(3 * time.Second)
+					for {
+						task, err := store.GetTask(context.Background(), queued.ID)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if task.Status == "succeeded" {
+							break
+						}
+						if task.Status == "failed" || time.Now().After(deadline) {
+							t.Fatal("async edit did not finish", task.Error)
+						}
+						time.Sleep(time.Millisecond * 5)
+					}
+				}
+				deadline := time.Now().Add(time.Second)
+				for {
+					entries, _ := os.ReadDir(filepath.Join(c.ImageDir, ".edit-inputs"))
+					if len(entries) == 0 {
 						break
 					}
-					if task.Status == "failed" || time.Now().After(deadline) {
-						t.Fatal("async edit did not finish", task.Error)
+					if time.Now().After(deadline) {
+						t.Fatal("input files leaked")
 					}
 					time.Sleep(time.Millisecond * 5)
 				}
-			}
-			deadline := time.Now().Add(time.Second)
-			for {
-				entries, _ := os.ReadDir(filepath.Join(c.ImageDir, ".edit-inputs"))
-				if len(entries) == 0 {
-					break
+				if uploads.Load() != 1 || confirmations.Load() != 1 || conversations.Load() != 1 {
+					t.Fatal("incomplete upstream edit flow", uploads.Load(), confirmations.Load(), conversations.Load())
 				}
-				if time.Now().After(deadline) {
-					t.Fatal("input files leaked")
-				}
-				time.Sleep(time.Millisecond * 5)
-			}
-			if uploads.Load() != 1 || confirmations.Load() != 1 || conversations.Load() != 1 {
-				t.Fatal("incomplete upstream edit flow", uploads.Load(), confirmations.Load(), conversations.Load())
-			}
-		})
+			})
+		}
 	}
 }
 func TestEditValidationAndSizeLimit(t *testing.T) {

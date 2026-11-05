@@ -18,12 +18,13 @@ type textMessage struct {
 	Content string `json:"content"`
 }
 type textInput struct {
-	Model    string
-	Messages []textMessage
-	Search   bool
-	Effort   string
-	Inputs   []editInput
-	File     bool
+	UpstreamModel string
+	Model         string
+	Messages      []textMessage
+	Search        bool
+	Effort        string
+	Inputs        []editInput
+	File          bool
 }
 type textSource struct {
 	Title   string `json:"title"`
@@ -386,15 +387,21 @@ func (s *session) textStream(ctx context.Context, route string, payload any, hea
 	}
 	return state, nil
 }
+func (in textInput) targetModel() string {
+	if in.UpstreamModel != "" {
+		return in.UpstreamModel
+	}
+	return in.Model
+}
 func (s *session) textPayload(in textInput) map[string]any {
 	messages := make([]any, 0, len(in.Messages))
 	for _, m := range in.Messages {
 		messages = append(messages, map[string]any{"id": uuid.NewString(), "author": map[string]string{"role": m.Role}, "content": map[string]any{"content_type": "text", "parts": []string{m.Content}}})
 	}
-	return map[string]any{"action": "next", "messages": messages, "model": in.Model, "parent_message_id": uuid.NewString(), "conversation_mode": map[string]string{"kind": "primary_assistant"}, "history_and_training_disabled": true, "force_use_sse": true, "force_paragen": false, "system_hints": []string{}, "supported_encodings": []string{}, "timezone": "Asia/Shanghai", "timezone_offset_min": -480, "suggestions": []string{}, "reset_rate_limits": false, "websocket_request_id": uuid.NewString()}
+	return map[string]any{"action": "next", "messages": messages, "model": in.targetModel(), "parent_message_id": uuid.NewString(), "conversation_mode": map[string]string{"kind": "primary_assistant"}, "history_and_training_disabled": true, "force_use_sse": true, "force_paragen": false, "system_hints": []string{}, "supported_encodings": []string{}, "timezone": "Asia/Shanghai", "timezone_offset_min": -480, "suggestions": []string{}, "reset_rate_limits": false, "websocket_request_id": uuid.NewString()}
 }
 func (s *session) prepareText(ctx context.Context, in textInput) (string, error) {
-	p := map[string]any{"model": in.Model, "parent_message_id": "client-created-root", "partial_query": map[string]any{"id": uuid.NewString(), "author": map[string]string{"role": "user"}, "content": map[string]any{"content_type": "text", "parts": []string{in.Messages[len(in.Messages)-1].Content}}}, "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "action": "next", "client_prepare_state": "success", "fork_from_shared_post": false, "conversation_mode": map[string]string{"kind": "primary_assistant"}, "system_hints": []string{}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": map[string]string{"app_name": "chatgpt.com"}}
+	p := map[string]any{"model": in.targetModel(), "parent_message_id": "client-created-root", "partial_query": map[string]any{"id": uuid.NewString(), "author": map[string]string{"role": "user"}, "content": map[string]any{"content_type": "text", "parts": []string{in.Messages[len(in.Messages)-1].Content}}}, "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "action": "next", "client_prepare_state": "success", "fork_from_shared_post": false, "conversation_mode": map[string]string{"kind": "primary_assistant"}, "system_hints": []string{}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": map[string]string{"app_name": "chatgpt.com"}}
 	if in.Search {
 		p["system_hints"] = []string{"search"}
 	}

@@ -32,7 +32,7 @@ Content-Type: application/json
 {"model":"auto","messages":[{"role":"system","content":"请简洁作答"},{"role":"user","content":"介绍一下 Go"}],"stream":true}
 ```
 
-角色支持 system、developer（转换为 system）、user、assistant。多轮历史由调用方完整传入。model 原样交给私有上游，实际可用性受账号权限限制；模型列表包含 auto、gpt-5-5、gpt-5-5-thinking 和原图片模型。文本请求体上限为 1 MiB。
+角色支持 system、developer（转换为 system）、user、assistant。多轮历史由调用方完整传入。model 按「系统设置 → 模型列表」中的映射转发到上游，实际可用性受账号权限限制；初始公开模型为 gpt-image-2、auto、gpt-5-6、gpt-6，文件任务默认使用 gpt-6。文本请求体上限为 1 MiB。
 
 stream=false 返回 chat.completion；stream=true 返回 SSE chat.completion.chunk，正常结束含 [DONE]，中途失败以错误事件结束，不伪造成功。Responses 返回 response/output_text 结构及相应 SSE 生命周期事件。请求头成功发出前可返回非 200 错误；流已经开始后的错误只能放在 SSE 中。
 
@@ -47,7 +47,7 @@ Responses 示例：
 ### 网页搜索
 
 ```json
-{"prompt":"查找 Go 官方最近发布信息","model":"gpt-5-5","stream":false}
+{"prompt":"查找 Go 官方最近发布信息","model":"gpt-5-6","stream":false}
 ```
 
 发送到 /v1/search，返回结构示例（示例不是实际搜索结果）：

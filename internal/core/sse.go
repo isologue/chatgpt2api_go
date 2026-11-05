@@ -24,6 +24,7 @@ type streamState struct {
 	Refs                 []imageRef
 	Blocked, ToolInvoked bool
 	seen                 map[string]bool
+	messageStream        textStream
 }
 
 const rawResponseLimit = 64 << 10
@@ -56,11 +57,6 @@ func (c *responseCapture) Write(p []byte) (int, error) {
 }
 
 var fileRef = regexp.MustCompile(`file-service://([A-Za-z0-9_-]+)|\b(file_00000000[a-f0-9]{24})\b|sediment://([A-Za-z0-9_-]+)`)
-var contentPolicyRejection = regexp.MustCompile(`(?i)content[_ -]policy[_ -]violation|moderation[_ -]blocked|safety[_ -]violation|unsafe[_ -]prompt|(?:violat\w*|against|rejected by|blocked by).{0,50}(?:content|safety|usage) (?:policy|policies|guidelines)|(?:content|safety|usage) (?:policy|policies|guidelines).{0,50}(?:violat|reject|block)|(?:reject\w*|block\w*).{0,40}(?:safety system|content filters?)|检测到敏感词，拒绝本次任务|AI\s*审核未通过|(?:内容|安全)审(?:查|核)(?:未通过|不通过|拒绝)|(?:违反|触发|不符合|违背).{0,20}(?:内容政策|安全政策|使用政策|内容策略|安全准则|内容准则)|(?:图片|图像).{0,30}(?:违反|触发).{0,50}(?:裸露|色情|情色).{0,30}(?:限制|政策|审核|规则)|(?:裸露|色情|情色).{0,50}(?:防护|限制|政策|审核)|(?:违规|违禁|不当|不安全)(?:的)?(?:内容|提示词|请求)`)
-
-func isContentPolicyRejection(message string) bool {
-	return contentPolicyRejection.MatchString(message)
-}
 
 func (s *streamState) addRefs(v any) {
 	if s.seen == nil {
@@ -85,24 +81,29 @@ func (s *streamState) consume(e map[string]any) {
 	if id := str(e["conversation_id"]); id != "" {
 		s.ConversationID = id
 	}
-	if str(e["type"]) == "moderation" && yes(obj(e["moderation_response"])["blocked"]) {
+	if policyError(e) {
 		s.Blocked = true
 	}
 	if str(e["type"]) == "server_ste_metadata" && yes(obj(e["metadata"])["tool_invoked"]) {
 		s.ToolInvoked = true
-	}
-	if str(e["code"]) == "content_policy_violation" || str(obj(e["error"])["code"]) == "content_policy_violation" {
-		s.Blocked = true
 	}
 	message := obj(e["message"])
 	v := obj(e["v"])
 	if len(message) == 0 {
 		message = obj(v["message"])
 	}
+	// 与文本链路共用 v1 补丁拼装，兼容拒绝文案分段 append / patch 的返回。
+	_ = s.messageStream.applyEvent(e, 0)
+	if len(message) == 0 && (strings.HasPrefix(str(e["p"]), "/message") || str(e["o"]) == "patch" || str(e["v"]) != "") {
+		message = s.messageStream.message
+	}
 	if id := str(v["conversation_id"]); id != "" {
 		s.ConversationID = id
 	}
 	role := str(obj(message["author"])["role"])
+	if messagePolicyRejection(message) {
+		s.Blocked = true
+	}
 	if role == "assistant" && str(obj(message["content"])["content_type"]) == "text" {
 		var text strings.Builder
 		for _, part := range array(obj(message["content"])["parts"]) {
@@ -113,9 +114,6 @@ func (s *streamState) consume(e map[string]any) {
 		}
 		if text.Len() > 0 {
 			s.Text = truncateText(text.String())
-			if isContentPolicyRejection(s.Text) {
-				s.Blocked = true
-			}
 		}
 	}
 	if role == "user" {
@@ -127,18 +125,15 @@ func (s *streamState) consume(e map[string]any) {
 	} else if s.ToolInvoked || str(e["o"]) == "patch" {
 		s.addRefs(e)
 	}
-	if yes(obj(message["metadata"])["is_error"]) {
-		code := str(obj(message["metadata"])["error_code"])
-		if code == "content_policy_violation" {
-			s.Blocked = true
-		}
-	}
 }
 func (s *streamState) conversation(v any) {
 	switch x := v.(type) {
 	case map[string]any:
 		if str(obj(x["author"])["role"]) == "user" {
 			return
+		}
+		if messagePolicyRejection(x) {
+			s.Blocked = true
 		}
 		if str(obj(x["author"])["role"]) == "tool" {
 			s.addRefs(x)
@@ -274,6 +269,9 @@ func matchingTaskError(v any, cid string) *APIError {
 	case map[string]any:
 		if str(x["conversation_id"]) == cid || str(x["original_conversation_id"]) == cid {
 			m := obj(x["image_gen_message"])
+			if messagePolicyRejection(m) || policyError(x["error"]) || policyError(x["metadata"]) {
+				return Err(400, "content_policy_violation", "上游安全审核拒绝")
+			}
 			if yes(obj(m["metadata"])["is_error"]) && str(obj(m["author"])["role"]) == "assistant" {
 				content := obj(m["content"])
 				if str(content["content_type"]) == "text" {
