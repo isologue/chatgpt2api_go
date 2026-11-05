@@ -303,7 +303,7 @@ window.addEventListener('hashchange',()=>navigate(location.hash.slice(1),false))
 document.addEventListener('click',event=>{
   const go=event.target.closest('[data-go]');if(go)navigate(go.dataset.go);
   const close=event.target.closest('[data-close]');if(close)$(`#${close.dataset.close}`).close();
-  const rawButton=event.target.closest('[data-attempt-response]');if(rawButton){const attempt=activeRequestDetail?.attempts?.[Number(rawButton.dataset.attemptResponse)];$('#raw-response-code').textContent=attempt?.code||'错误响应';$('#raw-response-content').textContent=attempt?.raw_response||'该条日志没有采集到上游原始响应（可能是旧日志，或错误发生在收到上游响应之前）。';$('#raw-response-truncated').classList.toggle('hidden',!attempt?.raw_response_truncated);$('#raw-response-dialog').showModal();}
+  const rawButton=event.target.closest('[data-attempt-response]');if(rawButton)showAttemptResponse(Number(rawButton.dataset.attemptResponse));
   const account=event.target.closest('[data-account]');if(account)accountDetail(Number(account.dataset.account));
   const request=event.target.closest('[data-request]');if(request)requestDetail(request.dataset.request);
   const related=event.target.closest('[data-related]');if(related){const setting=state.settings.find(s=>s.key===related.dataset.related);if(setting){selectGroup(setting.group);const row=$(`#row-${setting.key}`);row.scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth',block:'center'});$(`[data-setting="${setting.key}"]`).focus({preventScroll:true});}}
@@ -500,6 +500,47 @@ function renderExtraMetrics(m){
 }
 function stageName(key){return ({webdav_upload:'WebDAV 上传',webdav_wait:'WebDAV 排队',pow_solve:'PoW 计算',sse:'上游生成流',download:'图片下载',account_verify:'账号校验',download_wait:'下载排队',validation_wait:'解码排队'})[key]||key;}
 function bodySections(row){return '<h3>实际调用报文</h3><p class="small muted">保留调用方原始字段；长字符串点击后加载。异步创建响应与任务查询响应分别展示。升级前的日志可能没有原始报文。</p>'+[['request','请求体'],['response',row.is_async?'创建响应体':'响应体'],...(row.is_async?[['task_response','任务查询响应体（最近一次终态）']]:[])].map(([kind,label])=>'<details class="body-section" data-body-kind="'+kind+'"><summary>'+label+'</summary><div class="body-status">展开后读取</div><div class="json-tree hidden"></div><button type="button" class="raw-body-button">查看完整原文（按需加载）</button><pre class="raw-body hidden"></pre></details>').join('');}
+async function showAttemptResponse(index){
+ const row=activeRequestDetail,attempt=row?.attempts?.[index];if(!row||!attempt)return;
+ const host=$('#caller-response-content');host.replaceChildren();
+ $('#raw-response-title').textContent='调用方响应 · '+(attempt.code||'请求结果');
+ $('#raw-response-note').textContent='以下为本次调用实际返回给调用方的响应；异步任务分别展示创建响应和最近一次终态查询响应。';
+ const responses=row.is_async?[['response','创建响应体'],['task_response','任务查询响应体（最近一次终态）']]:[['response','响应体']];
+ for(const [kind,title] of responses){
+  const section=document.createElement('section');section.className='caller-response-section';section.dataset.kind=kind;
+  const heading=document.createElement('h3');heading.textContent=title;section.append(heading);
+  const meta=document.createElement('p');meta.className='caller-response-meta small muted';meta.textContent='正在读取响应…';section.append(meta);
+  const tree=document.createElement('div');tree.className='json-tree hidden';section.append(tree);
+  host.append(section);
+ }
+ if(attempt.raw_response){
+  const details=document.createElement('details');details.className='upstream-raw-details';
+  const summary=document.createElement('summary');summary.textContent='上游原始响应（诊断信息）';details.append(summary);
+  const pre=document.createElement('pre');pre.textContent=attempt.raw_response;details.append(pre);
+  if(attempt.raw_response_truncated){const note=document.createElement('p');note.className='small muted';note.textContent='原始响应超过 64 KiB，仅保存前 64 KiB。';details.append(note);}
+  host.append(details);
+ }
+ $('#raw-response-dialog').showModal();
+ await Promise.all($$('.caller-response-section',host).map(async section=>{
+  const kind=section.dataset.kind,meta=$('.caller-response-meta',section),tree=$('.json-tree',section);
+  if(state.demo){meta.textContent='界面演示不保存真实响应体。';return;}
+  try{
+   const data=await api('/admin/requests/'+encodeURIComponent(row.id)+'/body/'+kind,{timeout:30000});
+   meta.textContent='HTTP '+data.http_status+' · 返回时间 '+date(data.captured_at)+' · '+count(data.bytes)+' 字节';
+   if(data.tree)renderJSONNode(data.tree,'',tree);
+   else if(data.raw_only){const pre=document.createElement('pre');pre.textContent=data.preview;tree.append(pre);}
+   else tree.textContent=data.multipart?'multipart 响应不支持结构化预览。':'没有可展示的 JSON 响应体。';
+   tree.classList.remove('hidden');
+  }catch(error){meta.textContent=error.message+'（可能是旧日志未记录该响应）';}
+ }));
+}
+$('#caller-response-content').addEventListener('click',async event=>{
+ const button=event.target.closest('.deferred-value');if(!button)return;
+ const section=button.closest('.caller-response-section'),kind=section?.dataset.kind,n=button._deferred;if(!section||!n)return;
+ button.disabled=true;button.textContent='正在加载…';
+ try{const value=await api('/admin/requests/'+encodeURIComponent(activeRequestDetail.id)+'/body/'+kind+'?offset='+n.offset+'&length='+n.length,{timeout:60000});if(!button.isConnected)return;$('.json-value',button.parentElement).textContent=JSON.stringify(value);button.remove();}
+ catch(error){button.disabled=false;button.textContent='重试加载';toast(error.message);}
+});
 function renderJSONNode(n,path,host){
  if(n.kind==='object'||n.kind==='array'){
   const container=document.createElement('details');container.open=true;const summary=document.createElement('summary');summary.textContent=(path?JSON.stringify(path)+': ':'')+(n.kind==='object'?'{':'[')+' '+(n.children||[]).length+' 项';container.append(summary);for(const child of n.children||[])renderJSONNode(child.node,child.key,container);host.append(container);return;

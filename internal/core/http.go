@@ -199,7 +199,11 @@ func (a *API) task(w http.ResponseWriter, r *http.Request) {
 	case "queued", "processing":
 		progress := "0%"
 		if t.Status == "processing" {
-			progress = "1%"
+			value := 10
+			if current, ok := a.Engine.taskProgressValue(t.ID); ok {
+				value = current
+			}
+			progress = fmt.Sprintf("%d%%", value)
 		}
 		sendJSON(w, 200, map[string]any{"task_id": t.ID, "status": t.Status, "progress": progress})
 	case "failed":
@@ -229,7 +233,7 @@ func (a *API) writeTaskSuccess(w http.ResponseWriter, r *http.Request, t Task) {
 	defer closeFiles(files)
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, "{\"created_at\":%d,\"model\":%q,\"progress\":\"100%%\",\"status\":\"succeeded\",\"task_id\":%q,\"data\":", t.Created.Unix(), t.Request.Model, t.ID)
-	a.streamGeneration(w, t.Result, t.Request.Format, files, a.imageBaseURL(r))
+	a.streamGeneration(w, t.Result, t.Request.Format, files, a.imageBaseURL(r), true)
 	io.WriteString(w, "}")
 }
 func (a *API) reserveResponse(w http.ResponseWriter, r *http.Request) bool {
@@ -260,7 +264,7 @@ func (a *API) writeGeneration(w http.ResponseWriter, r *http.Request, g *Generat
 	}
 	defer closeFiles(files)
 	w.Header().Set("Content-Type", "application/json")
-	a.streamGeneration(w, g, format, files, a.imageBaseURL(r))
+	a.streamGeneration(w, g, format, files, a.imageBaseURL(r), true)
 }
 func (a *API) openArtifacts(g *Generation, format string) ([]*os.File, error) {
 	if g == nil {
@@ -293,7 +297,7 @@ func closeFiles(files []*os.File) {
 }
 
 // Base64 边读文件边编码，不构造整张图的 base64 字符串，避免并发响应放大堆内存。
-func (a *API) streamGeneration(w io.Writer, g *Generation, format string, files []*os.File, baseURL string) {
+func (a *API) streamGeneration(w io.Writer, g *Generation, format string, files []*os.File, baseURL string, includeUsage bool) {
 	if _, err := fmt.Fprintf(w, "{\"created\":%d,\"data\":[", g.Created); err != nil {
 		return
 	}
@@ -328,6 +332,23 @@ func (a *API) streamGeneration(w io.Writer, g *Generation, format string, files 
 				return
 			}
 		}
+	}
+	if includeUsage && g.Usage != nil {
+		usage, err := json.Marshal(g.Usage)
+		if err != nil {
+			return
+		}
+		if _, err = w.Write([]byte("],")); err != nil {
+			return
+		}
+		if _, err = w.Write([]byte(`"usage":`)); err != nil {
+			return
+		}
+		if _, err = w.Write(usage); err != nil {
+			return
+		}
+		_, _ = io.WriteString(w, "}")
+		return
 	}
 	io.WriteString(w, "]}")
 }

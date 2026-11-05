@@ -81,11 +81,13 @@ type Engine struct {
 	wg              sync.WaitGroup
 	closing         atomic.Bool
 	admission       sync.RWMutex
+	progressMu      sync.RWMutex
+	taskProgress    map[string]int
 }
 
 func NewEngine(c Config, p *Pool, s Store, g Generator) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &Engine{textSlots: newLimiter(c.textLimit()), fileSlots: newLimiter(c.fileLimit()), filePermits: newLimiter(c.fileLimit() + c.FileQueueSize), webdav: newWebDAVStorage(c.WebDAV), access: newAccessManager(c), Config: c, Pool: p, Store: s, Generator: g, root: ctx, cancel: cancel, permits: newLimiter(c.Workers + c.QueueSize), execution: newLimiter(c.Workers), responses: newLimiter(c.ResponseConcurrency), settings: newRuntimeConfig(c), logQueue: make(chan requestLog, max(1, c.LogQueueSize)), logOverflow: make(chan requestLog, max(1, c.LogQueueSize))}
+	e := &Engine{textSlots: newLimiter(c.textLimit()), fileSlots: newLimiter(c.fileLimit()), filePermits: newLimiter(c.fileLimit() + c.FileQueueSize), webdav: newWebDAVStorage(c.WebDAV), access: newAccessManager(c), Config: c, Pool: p, Store: s, Generator: g, root: ctx, cancel: cancel, permits: newLimiter(c.Workers + c.QueueSize), execution: newLimiter(c.Workers), responses: newLimiter(c.ResponseConcurrency), settings: newRuntimeConfig(c), logQueue: make(chan requestLog, max(1, c.LogQueueSize)), logOverflow: make(chan requestLog, max(1, c.LogQueueSize)), taskProgress: map[string]int{}}
 	if db, ok := s.(*Postgres); ok {
 		e.resources = &resourceManager{e: e, s: db, pins: map[string]int{}, busy: map[string]bool{}, thumbnails: newLimiter(c.thumbnailLimit())}
 	}
@@ -147,12 +149,16 @@ func (e *Engine) submitNew(ctx context.Context, r Request) (Task, <-chan complet
 		capture.logPersisted = logPersisted
 	}
 	t := Task{ID: "task_" + uuid.NewString(), Created: time.Now(), Status: "queued", Request: r}
+	if r.Async {
+		e.setTaskProgress(t.ID, 0)
+	}
 	if r.Async || r.idemScope != "" {
 		// 接纳阶段的数据库等待也必须有界，避免写入故障卡住准入锁与停机。
 		persist, cancel := context.WithTimeout(ctx, 10*time.Second)
 		err := e.Store.CreateTask(persist, t)
 		cancel()
 		if err != nil {
+			e.clearTaskProgress(t.ID)
 			e.permits.Release()
 			return Task{}, nil, Err(503, "task_persistence_failed", "无法持久化任务")
 		}
@@ -186,6 +192,7 @@ func (e *Engine) failQueued(j *job, err *APIError) {
 	e.Stats.Queued.Add(-1)
 	e.Stats.Failed.Add(1)
 	e.permits.Release()
+	e.clearTaskProgress(j.id)
 	j.cancel()
 	j.stop()
 	if j.request.Async || j.request.idemScope != "" {
@@ -196,6 +203,7 @@ func (e *Engine) failQueued(j *job, err *APIError) {
 }
 func (e *Engine) execute(j *job) {
 	defer j.releaseKey()
+	defer e.clearTaskProgress(j.id)
 	if j.request.cleanup != nil {
 		defer j.request.cleanup()
 	}
@@ -212,7 +220,14 @@ func (e *Engine) execute(j *job) {
 		apiErr = Err(503, "task_persistence_failed", "任务状态写入失败，未开始生成")
 	}
 	if apiErr == nil {
+		e.setTaskProgress(j.id, 10)
+	}
+	if apiErr == nil {
+		e.setTaskProgress(j.id, 20)
 		result, attempts, apiErr = e.generate(j.ctx, j.request)
+		if apiErr == nil {
+			e.setTaskProgress(j.id, 90)
+		}
 	}
 	if j.request.Async || j.request.idemScope != "" {
 		status := "succeeded"
@@ -221,6 +236,11 @@ func (e *Engine) execute(j *job) {
 		}
 		if !e.persistTask(j.id, status, result, apiErr) {
 			apiErr = Err(503, "task_persistence_failed", "结果已生成，但任务状态持久化失败")
+		}
+		if apiErr == nil {
+			e.setTaskProgress(j.id, 100)
+		} else {
+			e.clearTaskProgress(j.id)
 		}
 	}
 	e.enqueueLog(requestLog{persisted: j.logPersisted, id: j.id, req: j.request, attempts: attempts, err: apiErr, duration: time.Since(j.accepted), timing: logTiming{Started: j.accepted, Finished: time.Now(), QueueMS: executionStarted.Sub(j.accepted).Milliseconds()}})
@@ -366,6 +386,33 @@ func (e *Engine) persistTask(id, status string, g *Generation, a *APIError) bool
 	}
 	return true
 }
+
+func (e *Engine) setTaskProgress(id string, progress int) {
+	if id == "" {
+		return
+	}
+	progress = max(0, min(100, progress))
+	e.progressMu.Lock()
+	if e.taskProgress == nil {
+		e.taskProgress = map[string]int{}
+	}
+	e.taskProgress[id] = progress
+	e.progressMu.Unlock()
+}
+
+func (e *Engine) taskProgressValue(id string) (int, bool) {
+	e.progressMu.RLock()
+	progress, ok := e.taskProgress[id]
+	e.progressMu.RUnlock()
+	return progress, ok
+}
+
+func (e *Engine) clearTaskProgress(id string) {
+	e.progressMu.Lock()
+	delete(e.taskProgress, id)
+	e.progressMu.Unlock()
+}
+
 func (e *Engine) generate(ctx context.Context, r Request) (*Generation, []Attempt, *APIError) {
 	g := &Generation{Created: time.Now().Unix()}
 	var attempts []Attempt
@@ -376,7 +423,7 @@ func (e *Engine) generate(ctx context.Context, r Request) (*Generation, []Attemp
 			unpin()
 		}
 	}()
-	for range r.N {
+	for index := range r.N {
 		excluded := map[string]bool{}
 		var last *APIError
 		for retry := 0; retry <= configIn(ctx, e.CurrentConfig()).SwitchRetries; retry++ {
@@ -449,6 +496,7 @@ func (e *Engine) generate(ctx context.Context, r Request) (*Generation, []Attemp
 					}
 				}
 				g.Images = append(g.Images, im)
+				e.setTaskProgress(taskID(ctx), 20+((index+1)*50/r.N))
 				last = nil
 				break
 			}
@@ -461,7 +509,13 @@ func (e *Engine) generate(ctx context.Context, r Request) (*Generation, []Attemp
 			return nil, attempts, last
 		}
 	}
+	g.Usage = imageUsageForRequest(r, len(g.Images))
 	return g, attempts, nil
+}
+
+func taskID(ctx context.Context) string {
+	id, _ := ctx.Value(imageRequestIDKey{}).(string)
+	return id
 }
 func (e *Engine) Close() {
 	e.admission.Lock()

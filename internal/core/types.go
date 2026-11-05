@@ -188,9 +188,27 @@ type Artifact struct {
 	Name      string `json:"name"`
 	Bytes     int64  `json:"bytes"`
 }
+type ImageUsage struct {
+	InputTokens         int                `json:"input_tokens"`
+	OutputTokens        int                `json:"output_tokens"`
+	TotalTokens         int                `json:"total_tokens"`
+	InputTokensDetails  InputTokenDetails  `json:"input_tokens_details"`
+	OutputTokensDetails OutputTokenDetails `json:"output_tokens_details"`
+}
+type InputTokenDetails struct {
+	TextTokens   int `json:"text_tokens"`
+	ImageTokens  int `json:"image_tokens"`
+	CachedTokens int `json:"cached_tokens"`
+}
+type OutputTokenDetails struct {
+	TextTokens      int `json:"text_tokens"`
+	ImageTokens     int `json:"image_tokens"`
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
 type Generation struct {
-	Created int64      `json:"created"`
-	Images  []Artifact `json:"images"`
+	Created int64       `json:"created"`
+	Images  []Artifact  `json:"images"`
+	Usage   *ImageUsage `json:"usage,omitempty"`
 }
 type Attempt struct {
 	Warning                 *APIError          `json:"warning,omitempty"`

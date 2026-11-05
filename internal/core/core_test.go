@@ -129,6 +129,92 @@ func tinyPNG() []byte {
 	png.Encode(&b, im)
 	return b.Bytes()
 }
+
+func TestImageUsageCompatibilityShape(t *testing.T) {
+	usage := imageUsageForRequest(Request{Prompt: "red square", Size: "1024x1024", Quality: "auto"}, 2)
+	if usage.InputTokens <= 0 || usage.OutputTokens <= 0 || usage.TotalTokens != usage.InputTokens+usage.OutputTokens {
+		t.Fatalf("invalid usage totals: %+v", usage)
+	}
+	if usage.InputTokensDetails.TextTokens != usage.InputTokens || usage.OutputTokensDetails.ImageTokens != usage.OutputTokens {
+		t.Fatalf("usage details do not reconcile: %+v", usage)
+	}
+	encoded, err := json.Marshal(usage)
+	if err != nil || !strings.Contains(string(encoded), `"input_tokens_details"`) || !strings.Contains(string(encoded), `"output_tokens_details"`) {
+		t.Fatalf("legacy usage shape missing: %s", encoded)
+	}
+}
+
+func TestAsyncProgressMovesBeyondFixedOnePercent(t *testing.T) {
+	c := testConfig(t)
+	os.WriteFile(c.ImageDir+"/test.png", tinyPNG(), 0600)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	e := NewEngine(c, NewPool(testAccounts(1), 1), newMemoryStore(), generateFunc(func(ctx context.Context, _ Account, _ Request, _ map[string]float64) ([]Artifact, error) {
+		once.Do(func() { close(started) })
+		select {
+		case <-release:
+			return []Artifact{{Name: "test.png"}}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}))
+	defer e.Close()
+	h := NewHandler(e)
+	created := requestJSON(t, h, "POST", "/v1/images/generations", `{"prompt":"progress","async":true}`, c.APIKey)
+	if created.Code != 200 {
+		t.Fatalf("create failed: %d %s", created.Code, created.Body)
+	}
+	var task struct {
+		ID string `json:"task_id"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &task); err != nil || task.ID == "" {
+		t.Fatalf("invalid create response: %s", created.Body)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("async generation did not start")
+	}
+	deadline := time.Now().Add(time.Second)
+	var progress int
+	for time.Now().Before(deadline) {
+		polled := requestJSON(t, h, "GET", "/v1/images/tasks/"+task.ID, "", c.APIKey)
+		var body struct {
+			Status   string `json:"status"`
+			Progress string `json:"progress"`
+		}
+		_ = json.Unmarshal(polled.Body.Bytes(), &body)
+		if body.Status == "processing" {
+			fmt.Sscanf(body.Progress, "%d%%", &progress)
+			if progress >= 10 && progress != 1 {
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if progress < 10 || progress == 1 {
+		t.Fatalf("progress stayed fixed or invalid: %d", progress)
+	}
+	close(release)
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		polled := requestJSON(t, h, "GET", "/v1/images/tasks/"+task.ID, "", c.APIKey)
+		if strings.Contains(polled.Body.String(), `"succeeded"`) {
+			var result struct {
+				Data struct {
+					Usage *ImageUsage `json:"usage"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(polled.Body.Bytes(), &result); err != nil || result.Data.Usage == nil {
+				t.Fatalf("async usage missing: %s", polled.Body)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("async task did not finish")
+}
 func TestPoolSlotFairnessAndScoring(t *testing.T) {
 	p := NewPool(testAccounts(2), 1)
 	a, ok := p.Acquire(nil)
@@ -250,6 +336,14 @@ func TestAPISyncAsyncAndValidation(t *testing.T) {
 		json.Unmarshal(w.Body.Bytes(), &body)
 		if len(body.Data) != 1 {
 			t.Fatal("wrong n")
+		}
+		if format == "url" {
+			var envelope struct {
+				Usage *ImageUsage `json:"usage"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil || envelope.Usage == nil {
+				t.Fatalf("sync usage missing: %s", w.Body)
+			}
 		}
 		if strings.Contains(w.Body.String(), "revised_prompt") {
 			t.Fatal("extra field")
