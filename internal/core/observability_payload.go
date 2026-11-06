@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"io"
 	"net/http"
@@ -21,6 +22,10 @@ var errPayloadExpired = errors.New("request already removed")
 
 type wireCaptureKey struct{}
 type wireCapture struct {
+	started                  time.Time
+	req                      *Request
+	rejected                 *APIError
+	admitted                 bool
 	logPersisted             <-chan struct{}
 	requestFile, contentType string
 	id, kind                 string
@@ -50,6 +55,14 @@ type wireWriter struct {
 	status  int
 	size    int64
 	err     error
+}
+
+// 只有尚未接纳的创建请求需要补日志；已接纳任务仍由执行器记录，避免重复。
+func (w *wireWriter) captureError(e *APIError) {
+	if w.capture.kind == "create" && !w.capture.admitted && w.capture.id == "" && w.status == 0 {
+		w.capture.id = "req_" + uuid.NewString()
+		w.capture.rejected = e
+	}
 }
 
 func (w *wireWriter) WriteHeader(code int) {
@@ -93,12 +106,53 @@ func (a *API) captureCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	r = r.WithContext(context.WithValue(r.Context(), requestHashKey{}, canonicalHash(raw)))
-	a.captureWire(w, r, &wireCapture{kind: "create", request: raw}, a.create)
+	a.captureWire(w, r, &wireCapture{kind: "create", request: raw, contentType: r.Header.Get("Content-Type")}, a.create)
 }
+
+// 复用有界日志队列、父记录确认和原有清理策略，不创建可轮询任务或执行尝试。
+func (a *API) logRejectedRequest(r *http.Request, c *wireCapture) {
+	req := Request{}
+	if c.req != nil {
+		req = *c.req
+	} else {
+		// 只在拒绝时提取列表元数据，不给正常请求增加一次 JSON 扫描。
+		_ = json.Unmarshal(c.request, &req)
+	}
+	req.requestKind = "image"
+	if req.Model == "" {
+		req.Model = "gpt-image-2"
+	}
+	config := a.Engine.CurrentConfig()
+	if !config.AllowUserFormat || req.Format == "" {
+		req.Format = config.DefaultFormat
+	}
+	if format, err := NormalizeFormat(req.Format); err == nil {
+		req.Format = format
+	}
+	if identity, ok := r.Context().Value(apiIdentityKey{}).(managedAPIKey); ok {
+		req.apiKeyID, req.apiKeyName = identity.ID, identity.Name
+	}
+	finished := time.Now()
+	persisted := make(chan struct{})
+	c.logPersisted = persisted
+	entry := requestLog{persisted: persisted, id: c.id, req: req, err: c.rejected,
+		duration: finished.Sub(c.started), timing: logTiming{Started: c.started, Finished: finished}}
+	// 停机后日志队列可能已关闭；与准入锁同步，不能再向关闭的通道写入。
+	a.Engine.admission.RLock()
+	if a.Engine.closing.Load() {
+		a.Engine.admission.RUnlock()
+		a.Engine.persistLogActive(entry)
+		return
+	}
+	a.Engine.enqueueLog(entry)
+	a.Engine.admission.RUnlock()
+}
+
 func (a *API) captureTask(w http.ResponseWriter, r *http.Request) {
 	a.captureWire(w, r, &wireCapture{kind: "result"}, a.task)
 }
 func (a *API) captureWire(w http.ResponseWriter, r *http.Request, c *wireCapture, next http.HandlerFunc) {
+	c.started = time.Now()
 	r = r.WithContext(context.WithValue(r.Context(), wireCaptureKey{}, c))
 	requestSaved := false
 	defer func() {
@@ -114,6 +168,9 @@ func (a *API) captureWire(w http.ResponseWriter, r *http.Request, c *wireCapture
 	ww := &wireWriter{ResponseWriter: w, api: a, capture: c}
 	r = r.WithContext(context.WithValue(r.Context(), wireCaptureKey{}, c))
 	next(ww, r)
+	if c.rejected != nil {
+		a.logRejectedRequest(r, c)
+	}
 	if ww.file == nil {
 		return
 	}
@@ -522,7 +579,16 @@ func (a *API) consoleBody(w http.ResponseWriter, r *http.Request) {
 	}
 	tree, e := previewJSON(source)
 	if e != nil {
-		sendError(w, Err(422, "body_preview_failed", "报文不是完整 JSON；可查看原始内容"))
+		if _, err := source.Seek(0, io.SeekStart); err != nil {
+			sendError(w, Err(503, "body_read_failed", "原始报文读取失败"))
+			return
+		}
+		head, err := io.ReadAll(io.LimitReader(source, 4096))
+		if err != nil {
+			sendError(w, Err(503, "body_read_failed", "原始报文读取失败"))
+			return
+		}
+		sendJSON(w, 200, map[string]any{"raw_only": true, "content_type": "text/plain", "preview": strings.ToValidUTF8(string(head), "�"), "bytes": size, "http_status": p.Status, "captured_at": p.Finished})
 		return
 	}
 	sendJSON(w, 200, map[string]any{"tree": tree, "bytes": size, "http_status": p.Status, "captured_at": p.Finished})

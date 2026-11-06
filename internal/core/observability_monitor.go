@@ -92,9 +92,17 @@ func (s *Postgres) ConsoleResults(ctx context.Context, span resultRange) (map[st
 		}
 		query, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		// 新日志按入口类型统计，不依赖可变的模型映射。旧日志通过任务 ID、
+		// 原模型或已记录的出图数量识别；不全表回填，不扫描请求/响应 JSON。
 		var success, failed, safety, images, unknown int64
 		var p50, p95, queueP95 float64
-		e := s.db.QueryRow(query, `SELECT count(*) FILTER(WHERE status='succeeded'),count(*) FILTER(WHERE status='failed'),count(*) FILTER(WHERE status='safety_rejected'),COALESCE(sum(image_count) FILTER(WHERE status='succeeded'),0),count(*) FILTER(WHERE status='succeeded' AND image_count IS NULL),COALESCE(percentile_cont(0.5) WITHIN GROUP(ORDER BY duration_ms) FILTER(WHERE status='succeeded'),0),COALESCE(percentile_cont(0.95) WITHIN GROUP(ORDER BY duration_ms) FILTER(WHERE status='succeeded'),0),COALESCE(percentile_cont(0.95) WITHIN GROUP(ORDER BY queue_ms) FILTER(WHERE queue_ms IS NOT NULL),0) FROM core_requests WHERE model='gpt-image-2' AND created_at >= $1 AND created_at < $2`, span.From, span.To).Scan(&success, &failed, &safety, &images, &unknown, &p50, &p95, &queueP95)
+		e := s.db.QueryRow(query, `SELECT count(*) FILTER(WHERE status='succeeded'),count(*) FILTER(WHERE status='failed'),count(*) FILTER(WHERE status='safety_rejected'),COALESCE(sum(image_count) FILTER(WHERE status='succeeded'),0),count(*) FILTER(WHERE status='succeeded' AND image_count IS NULL),COALESCE(percentile_cont(0.5) WITHIN GROUP(ORDER BY duration_ms) FILTER(WHERE status='succeeded'),0),COALESCE(percentile_cont(0.95) WITHIN GROUP(ORDER BY duration_ms) FILTER(WHERE status='succeeded'),0),COALESCE(percentile_cont(0.95) WITHIN GROUP(ORDER BY queue_ms) FILTER(WHERE queue_ms IS NOT NULL),0) FROM core_requests WHERE created_at >= $1 AND created_at < $2 AND (
+ request_kind='image' OR (
+  request_kind='' AND left(id,5)<>'chat_' AND left(id,9)<>'filetask_' AND (
+   left(id,5)='task_' OR model='gpt-image-2' OR image_count>0
+  )
+ )
+)`, span.From, span.To).Scan(&success, &failed, &safety, &images, &unknown, &p50, &p95, &queueP95)
 		if e != nil {
 			return nil, e
 		}

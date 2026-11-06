@@ -456,6 +456,7 @@ func (n *Native) generateOnce(ctx context.Context, a Account, r Request, stages 
 		target = n.config(ctx).UpstreamModel
 	}
 	payload := map[string]any{"action": "next", "fork_from_shared_post": false, "parent_message_id": parent, "model": target, "client_prepare_state": "success", "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "conversation_mode": map[string]any{"kind": "primary_assistant"}, "system_hints": []string{"picture_v2"}, "partial_query": map[string]any{"id": message, "author": map[string]string{"role": "user"}, "content": content, "metadata": metadata}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": map[string]string{"app_name": "chatgpt.com"}}
+	applyImageParameters(payload, r.extraFields)
 	start = time.Now()
 	cp, err := s.json(ctx, "POST", "/backend-api/f/conversation/prepare", payload, headers)
 	n.measure(stages, "会话准备", start)
@@ -490,7 +491,7 @@ func (n *Native) generateOnce(ctx context.Context, a Account, r Request, stages 
 		return nil, ctx.Err()
 	}
 	if state.Blocked {
-		return nil, withRawResponse(Err(400, "content_policy_violation", "上游安全审核拒绝"), state)
+		return nil, withRawResponse(Err(400, "content_policy_violation", contentPolicyMessage), state)
 	}
 	// 先补查原会话；只有实际生成流硬超时才豁免总预算，阶段时限与取消继续生效。
 	if len(state.Refs) == 0 && state.ConversationID != "" {

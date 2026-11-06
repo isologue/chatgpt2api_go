@@ -3,13 +3,12 @@ package core
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"time"
 )
 
 // 管理列表使用数据库游标分页，仅选择页面需要的字段，不读取完整 AT/RT。
 func (s *Postgres) ConsoleAccounts(ctx context.Context, q consoleQuery) (map[string]any, error) {
-	if q.Status != "" && q.Status != "enabled" && q.Status != "disabled" {
+	if q.Status != "" && q.Status != "enabled" && q.Status != "disabled" && q.Status != "rate_limited" && q.Status != "cooling" && q.Status != "available" {
 		return nil, Err(400, "invalid_status", "无效的账号状态")
 	}
 	cursor := ""
@@ -18,7 +17,7 @@ func (s *Postgres) ConsoleAccounts(ctx context.Context, q consoleQuery) (map[str
 			return nil, err
 		}
 	}
-	rows, err := s.db.Query(ctx, `SELECT id, COALESCE(data->>'email',''), COALESCE((data->>'score')::int,0), COALESCE(managed_enabled,(data->>'enabled')::boolean,false), right(COALESCE(data->>'access_token',''),6), COALESCE(data->>'refresh_token','')<>'', data->>'verified_at', data->>'success_at', data->>'available_at',jsonb_build_object('hot',COALESCE((data->>'hot')::boolean,false),'quota',data->'quota','quota_reset_at',data->'quota_reset_at','status',data->'status','last_refresh_at',data->'last_refresh_at','last_refresh_error',data->'last_refresh_error','next_refresh_at',data->'next_refresh_at','last_token_refresh_at',data->'last_token_refresh_at','last_token_refresh_error',data->'last_token_refresh_error','last_token_refresh_error_at',data->'last_token_refresh_error_at') FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%') AND ($3='' OR COALESCE(managed_enabled,(data->>'enabled')::boolean,false)=($3='enabled')) ORDER BY id LIMIT $4`, cursor, q.Search, q.Status, q.Limit+1)
+	rows, err := s.db.Query(ctx, `SELECT id, COALESCE(data->>'email',''), COALESCE((data->>'score')::int,0), COALESCE(managed_enabled,(data->>'enabled')::boolean,false), right(COALESCE(data->>'access_token',''),6), COALESCE(data->>'refresh_token','')<>'', data->>'verified_at', data->>'success_at', data->>'available_at',jsonb_build_object('hot',COALESCE((data->>'hot')::boolean,false),'quota',data->'quota','quota_reset_at',data->'quota_reset_at','rate_limited_until',data->'rate_limited_until','rate_limit_reason',data->'rate_limit_reason','rate_limit_source',data->'rate_limit_source','rate_limit_message',data->'rate_limit_message','status',data->'status','last_error_code',data->'last_error_code','last_refresh_at',data->'last_refresh_at','last_refresh_error',data->'last_refresh_error','next_refresh_at',data->'next_refresh_at','last_token_refresh_at',data->'last_token_refresh_at','last_token_refresh_error',data->'last_token_refresh_error','last_token_refresh_error_at',data->'last_token_refresh_error_at') FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%')`+availabilitySQL("3")+` ORDER BY id LIMIT $4`, cursor, q.Search, q.Status, q.Limit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -47,24 +46,18 @@ func (s *Postgres) ConsoleAccounts(ctx context.Context, q consoleQuery) (map[str
 			item[k] = v
 		}
 		item["refresh_token_status"] = refreshTokenStatus(rt, consoleAccountTime(fields["last_token_refresh_at"]), str(fields["last_token_refresh_error"]), consoleAccountTime(fields["last_token_refresh_error_at"]))
+		availability := accountAvailabilityFromFields(map[string]any{"enabled": enabled, "available_at": available, "rate_limited_until": fields["rate_limited_until"], "rate_limit_reason": fields["rate_limit_reason"], "rate_limit_message": fields["rate_limit_message"], "quota": fields["quota"], "quota_reset_at": fields["quota_reset_at"], "last_error_code": fields["last_error_code"]}, time.Now())
+		item["availability_status"] = availability.Status
+		item["availability_reason"] = availability.Reason
+		if !availability.RecoveryAt.IsZero() {
+			item["recovery_at"] = availability.RecoveryAt
+		}
 		items = append(items, item)
 	}
 	if rows.Err() != nil {
 		return nil, rows.Err()
 	}
 	return map[string]any{"items": items, "next_cursor": next}, nil
-}
-
-func consoleAccountTime(value any) time.Time {
-	text, ok := value.(string)
-	if !ok || strings.TrimSpace(text) == "" {
-		return time.Time{}
-	}
-	parsed, err := time.Parse(time.RFC3339Nano, text)
-	if err != nil {
-		return time.Time{}
-	}
-	return parsed
 }
 
 type requestCursor struct {

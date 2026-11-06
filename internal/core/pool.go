@@ -177,6 +177,12 @@ func (p *Pool) release(id string, err *APIError, image bool) Account {
 		e.a.Score = min(100, e.a.Score+1)
 		e.a.SuccessAt = now
 		e.a.LastErrorCode = ""
+		if !e.a.RateLimitedUntil.After(now) {
+			e.a.RateLimitedUntil = time.Time{}
+			e.a.RateLimitReason = ""
+			e.a.RateLimitSource = ""
+			e.a.RateLimitMessage = ""
+		}
 		if e.a.Quota != nil {
 			remaining := max(0, *e.a.Quota-1)
 			e.a.Quota = &remaining
@@ -190,6 +196,12 @@ func (p *Pool) release(id string, err *APIError, image bool) Account {
 		if image {
 			e.a.SuccessAt = now
 		}
+		e.a.LastErrorCode = err.Code
+	} else if err.RateLimited {
+		e.a.RateLimitedUntil = maxTime(e.a.RateLimitedUntil, err.RateLimitedUntil)
+		e.a.RateLimitReason = err.RateLimitReason
+		e.a.RateLimitSource = err.RateLimitSource
+		e.a.RateLimitMessage = err.RateLimitMessage
 		e.a.LastErrorCode = err.Code
 	} else {
 		e.a.Score = max(0, e.a.Score-err.Penalty)
@@ -224,6 +236,12 @@ func (p *Pool) RecordRefreshFailure(id string, err error) Account {
 	p.detach(e)
 	e.a.Status = "refresh_failed"
 	p.setHot(e, false, time.Now())
+	if ae.RateLimited {
+		e.a.RateLimitedUntil = maxTime(e.a.RateLimitedUntil, ae.RateLimitedUntil)
+		e.a.RateLimitReason = ae.RateLimitReason
+		e.a.RateLimitSource = ae.RateLimitSource
+		e.a.RateLimitMessage = ae.RateLimitMessage
+	}
 	e.a.AvailableAt = maxTime(e.a.AvailableAt, time.Now().Add(ae.Cooldown))
 	if ae.Invalidate && e.a.Enabled {
 		e.a.Enabled = false
@@ -262,6 +280,10 @@ func (p *Pool) UpdateCredentials(a Account) Account {
 		e.a.Email = a.Email
 		e.a.Quota = a.Quota
 		e.a.QuotaResetAt = a.QuotaResetAt
+		e.a.RateLimitedUntil = a.RateLimitedUntil
+		e.a.RateLimitReason = a.RateLimitReason
+		e.a.RateLimitSource = a.RateLimitSource
+		e.a.RateLimitMessage = a.RateLimitMessage
 		if a.Extra != nil {
 			e.a.Extra = cloneAccountExtra(a.Extra)
 		}
@@ -294,7 +316,7 @@ func (p *Pool) MaintenancePage(cursor, size int) ([]Account, int, bool) {
 	return out, end, done
 }
 func accountUsable(a Account, now time.Time) bool {
-	return a.Enabled && !a.NextRefreshAt.After(now) && !a.AvailableAt.After(now) && (a.Quota == nil || *a.Quota > 0 || (!a.QuotaResetAt.IsZero() && !a.QuotaResetAt.After(now)))
+	return a.Enabled && !a.NextRefreshAt.After(now) && !imageAvailable(a).After(now) && (a.Quota == nil || *a.Quota > 0 || (!a.QuotaResetAt.IsZero() && !a.QuotaResetAt.After(now)))
 }
 
 // 排序在锁外完成；应用时再次检查当前槽位和状态，保留正在使用的账号。

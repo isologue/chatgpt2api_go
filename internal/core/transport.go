@@ -13,7 +13,10 @@ import (
 	"github.com/bogdanfinn/tls-client/profiles"
 	"github.com/google/uuid"
 	"io"
+	stdhttp "net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -218,7 +221,7 @@ func (s *session) jsonWithRaw(ctx context.Context, method, path string, payload 
 		return nil, raw, apiErr
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, raw, upstreamError(resp.StatusCode, raw)
+		return nil, raw, upstreamError(resp.StatusCode, raw, resp.Header)
 	}
 	var data map[string]any
 	if json.Unmarshal(raw, &data) != nil {
@@ -228,18 +231,24 @@ func (s *session) jsonWithRaw(ctx context.Context, method, path string, payload 
 	}
 	return data, raw, nil
 }
-func upstreamError(status int, raw []byte) *APIError {
+func upstreamError(status int, raw []byte, headers ...http.Header) *APIError {
 	var data map[string]any
 	_ = json.Unmarshal(raw, &data)
 	var apiErr *APIError
 	if policyError(data) || (len(data) == 0 && isContentPolicyRejection(string(raw))) {
-		apiErr = Err(400, "content_policy_violation", "上游安全审核拒绝")
+		apiErr = Err(400, "content_policy_violation", contentPolicyMessage)
 	} else if status == 401 {
 		apiErr = RetryError("account_token_invalid", "账号令牌失效")
 		apiErr.Invalidate = true
-	} else if status == 429 {
+	} else if rateLimitedResponse(status, data, raw) {
 		apiErr = RetryError("upstream_rate_limited", "上游限流")
-		apiErr.Cooldown = time.Minute
+		cooldown, source, reason, message := rateLimitCooldown(data, raw, headers...)
+		apiErr.Cooldown = cooldown
+		apiErr.RateLimited = true
+		apiErr.RateLimitedUntil = time.Now().Add(cooldown)
+		apiErr.RateLimitReason = reason
+		apiErr.RateLimitSource = source
+		apiErr.RateLimitMessage = message
 		apiErr.Penalty = 0
 	} else if status == 403 {
 		apiErr = RetryError("upstream_access_denied", "上游拒绝访问，需要检查代理或账号状态")
@@ -248,6 +257,86 @@ func upstreamError(status int, raw []byte) *APIError {
 	}
 	apiErr.rawResponse, apiErr.rawResponseTruncated = boundedRawResponse(raw)
 	return apiErr
+}
+
+var rateLimitDurationPattern = regexp.MustCompile(`(?i)(?:(?:in|within|请)\s*)?(\d+)\s*(秒|分钟|分|小时|天|seconds?|minutes?|hours?|days?)`)
+
+func rateLimitedResponse(status int, data map[string]any, raw []byte) bool {
+	if status == 429 {
+		return true
+	}
+	text := strings.ToLower(string(raw))
+	for _, marker := range []string{"throttled", "rate_limit", "rate limit", "upload_protection_limit_exceeded", "reached our limit", "try again later"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return strings.Contains(strings.ToLower(str(obj(data["error"])["code"])), "thrott")
+}
+
+func rateLimitCooldown(data map[string]any, raw []byte, headers ...http.Header) (time.Duration, string, string, string) {
+	message := rateLimitMessage(data, raw)
+	reason := str(obj(data["detail"])["reason"])
+	if reason == "" {
+		reason = str(obj(data["error"])["reason"])
+	}
+	if reason == "" {
+		reason = str(obj(data["detail"])["error_code"])
+	}
+	if reason == "" {
+		reason = str(obj(data["error"])["code"])
+	}
+	if reason == "" {
+		reason = "upstream_rate_limit"
+	}
+	if match := rateLimitDurationPattern.FindStringSubmatch(message); len(match) == 3 {
+		value, _ := strconv.Atoi(match[1])
+		unit := strings.ToLower(match[2])
+		var unitDuration time.Duration
+		switch unit {
+		case "秒", "second", "seconds":
+			unitDuration = time.Second
+		case "分钟", "分", "minute", "minutes":
+			unitDuration = time.Minute
+		case "小时", "hour", "hours":
+			unitDuration = time.Hour
+		case "天", "day", "days":
+			unitDuration = 24 * time.Hour
+		}
+		if value > 0 && unitDuration > 0 {
+			return time.Duration(value)*unitDuration + time.Minute, "message", reason, message
+		}
+	}
+	if strings.Contains(strings.ToLower(message), "per hour") || strings.Contains(message, "每小时") {
+		return time.Hour + time.Minute, "message", reason, message
+	}
+	if len(headers) > 0 {
+		if retryAfter := strings.TrimSpace(headers[0].Get("Retry-After")); retryAfter != "" {
+			if seconds, err := strconv.Atoi(retryAfter); err == nil && seconds > 0 {
+				return time.Duration(seconds)*time.Second + time.Minute, "retry-after", reason, message
+			}
+			if retryAt, err := stdhttp.ParseTime(retryAfter); err == nil {
+				cooldown := time.Until(retryAt)
+				if cooldown > 0 {
+					return cooldown + time.Minute, "retry-after", reason, message
+				}
+			}
+		}
+	}
+	return time.Minute, "default", reason, message
+}
+
+func rateLimitMessage(data map[string]any, raw []byte) string {
+	for _, candidate := range []string{
+		str(obj(data["detail"])["message"]),
+		str(obj(data["error"])["message"]),
+		str(data["message"]),
+	} {
+		if strings.TrimSpace(candidate) != "" {
+			return strings.TrimSpace(candidate)
+		}
+	}
+	return strings.TrimSpace(string(raw))
 }
 func str(v any) string { s, _ := v.(string); return s }
 func obj(v any) map[string]any {
@@ -298,7 +387,7 @@ func (n *Native) refreshToken(ctx context.Context, a Account) (Account, error) {
 		return fail(RetryError("token_refresh_failed", "读取令牌续期响应失败"))
 	}
 	if resp.StatusCode != 200 {
-		ae := upstreamError(resp.StatusCode, raw)
+		ae := upstreamError(resp.StatusCode, raw, resp.Header)
 		if terminalRefreshResponse(resp.StatusCode, raw) {
 			ae = RetryError("refresh_token_invalid", "Refresh Token 已失效或已被重复使用")
 			ae.Invalidate = true

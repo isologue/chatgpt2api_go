@@ -66,7 +66,7 @@ func (e *Engine) runText(ctx context.Context, in textInput, identity managedAPIK
 		e.admission.RUnlock()
 		return result, Err(503, "text_unavailable", "当前生成器不支持聊天和搜索")
 	}
-	req := Request{UpstreamModel: in.UpstreamModel, Prompt: in.Messages[len(in.Messages)-1].Content, Model: in.Model, apiKeyID: identity.ID, apiKeyName: identity.Name, keyConcurrency: identity.Concurrency}
+	req := Request{requestKind: "text", UpstreamModel: in.UpstreamModel, Prompt: in.Messages[len(in.Messages)-1].Content, Model: in.Model, apiKeyID: identity.ID, apiKeyName: identity.Name, keyConcurrency: identity.Concurrency}
 	release, err := e.acquireKey(req)
 	if err != nil {
 		e.admission.RUnlock()

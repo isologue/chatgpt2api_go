@@ -107,13 +107,24 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 	decoder := json.NewDecoder(r.Body)
 	req := Request{N: 1}
-	if err := decoder.Decode(&req); err != nil {
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
 		sendError(w, Err(400, "invalid_json", "请求 JSON 无效或超过 1 MiB"))
 		return
 	}
 	var extra any
 	if decoder.Decode(&extra) != io.EOF {
 		sendError(w, Err(400, "invalid_json", "请求只能包含一个 JSON 对象"))
+		return
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		sendError(w, Err(400, "invalid_json", "请求 JSON 无效"))
+		return
+	}
+	var err error
+	req.extraFields, err = imageExtraFields(raw, false)
+	if err != nil {
+		sendError(w, Err(400, "invalid_json", "请求 JSON 必须是一个对象"))
 		return
 	}
 	config := a.Engine.CurrentConfig()
@@ -137,6 +148,9 @@ func (a *API) serveSubmission(w http.ResponseWriter, r *http.Request, req Reques
 		req.apiKeyName = identity.Name
 		req.keyConcurrency = identity.Concurrency
 	}
+	if capture, ok := r.Context().Value(wireCaptureKey{}).(*wireCapture); ok {
+		capture.req = &req
+	}
 	if err := prepareIdempotency(r, &req); err != nil {
 		sendError(w, AsError(err))
 		return
@@ -151,8 +165,11 @@ func (a *API) serveSubmission(w http.ResponseWriter, r *http.Request, req Reques
 	} else {
 		w.Header().Set("Idempotency-Replayed", "true")
 	}
-	if capture, ok := r.Context().Value(wireCaptureKey{}).(*wireCapture); ok && done != nil {
-		capture.id = task.ID
+	if capture, ok := r.Context().Value(wireCaptureKey{}).(*wireCapture); ok {
+		capture.admitted = true
+		if done != nil {
+			capture.id = task.ID
+		}
 	}
 	if task.Request.Async {
 		sendJSON(w, 200, map[string]any{"created_at": task.Created.Unix(), "model": task.Request.Model, "status": "queued", "task_id": task.ID})
@@ -370,6 +387,9 @@ func sendJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 func sendError(w http.ResponseWriter, e *APIError) {
+	if capture, ok := w.(interface{ captureError(*APIError) }); ok {
+		capture.captureError(e)
+	}
 	if e.Status == 429 {
 		w.Header().Set("Retry-After", "1")
 	}
@@ -377,6 +397,12 @@ func sendError(w http.ResponseWriter, e *APIError) {
 }
 
 func callerFacingError(e *APIError) *APIError {
+	// 历史异步任务也使用现行提示，不修改已存储的错误或上游原文。
+	if e != nil && e.Code == "content_policy_violation" {
+		public := *e
+		public.Message = contentPolicyMessage
+		return &public
+	}
 	if e == nil || e.Code != "image_result_uncertain" || e.Message != "结果补查预算耗尽，未拿到图片标识" {
 		return e
 	}

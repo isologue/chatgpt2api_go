@@ -79,7 +79,7 @@ func TestPolicyStructuredErrorsAndUserIsolation(t *testing.T) {
 				t.Fatal("structured refusal not recognized")
 			}
 			ae := upstreamError(403, []byte(raw))
-			if ae.Code != "content_policy_violation" || ae.Status != 400 || ae.Retry || ae.Penalty != 0 || ae.Invalidate {
+			if ae.Code != "content_policy_violation" || ae.Message != contentPolicyMessage || ae.Status != 400 || ae.Retry || ae.Penalty != 0 || ae.Invalidate {
 				t.Fatalf("wrong policy settlement: %+v", ae)
 			}
 		})
@@ -180,7 +180,7 @@ func TestPolicyRefusalEndsBeforePollAndAccountSwitch(t *testing.T) {
 			}
 			result := awaitRecoveryResult(t, done)
 			attempts := <-store.attempts
-			if result.err == nil || result.err.Code != "content_policy_violation" || result.err.Status != 400 || result.err.Retry || len(attempts) != 1 || m.starts.Load() != 1 {
+			if result.err == nil || result.err.Code != "content_policy_violation" || result.err.Message != contentPolicyMessage || result.err.Status != 400 || result.err.Retry || len(attempts) != 1 || m.starts.Load() != 1 {
 				t.Fatalf("wrong settlement: err=%+v attempts=%+v", result.err, attempts)
 			}
 			if scenario != "poll" && scenario != "task" && polls != 0 {

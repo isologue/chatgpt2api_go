@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -109,9 +110,9 @@ func TestMaskCompositeSemantics(t *testing.T) {
 	}
 }
 func TestEditsMaskedNativeUploadAndCleanup(t *testing.T) {
-	for _, asJSON := range []bool{false, true} {
+	for _, inputMode := range []string{"multipart", "json", "json-base64", "json-mixed"} {
 		for _, async := range []bool{false, true} {
-			t.Run(map[bool]string{false: "multipart", true: "json"}[asJSON]+"/"+map[bool]string{false: "sync", true: "async"}[async], func(t *testing.T) {
+			t.Run(inputMode+"/"+map[bool]string{false: "sync", true: "async"}[async], func(t *testing.T) {
 				c := testConfig(t)
 				m := newMockUpstream(t)
 				gate := make(chan struct{})
@@ -122,6 +123,19 @@ func TestEditsMaskedNativeUploadAndCleanup(t *testing.T) {
 				var inputMask []byte
 				var srv *httptest.Server
 				srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/backend-api/f/conversation/prepare" || r.URL.Path == "/backend-api/f/conversation" {
+						raw, _ := io.ReadAll(r.Body)
+						var wire map[string]any
+						if err := json.Unmarshal(raw, &wire); err != nil {
+							t.Error(err)
+						}
+						for key, want := range map[string]string{"negative_prompt": "blurry, watermark", "moderation": "auto", "output_format": "png", "future_param": "future-value"} {
+							if wire[key] != want {
+								t.Errorf("%s missing %s: %v", r.URL.Path, key, wire[key])
+							}
+						}
+						r.Body = io.NopCloser(bytes.NewReader(raw))
+					}
 					switch {
 					case r.URL.Path == "/reference.png" || r.URL.Path == "/mask.png":
 						if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
@@ -196,14 +210,21 @@ func TestEditsMaskedNativeUploadAndCleanup(t *testing.T) {
 						mask.SetNRGBA(x, y, color.NRGBA{A: 255})
 					}
 				}
-				fields := map[string]string{"prompt": "Replace the transparent region"}
+				fields := map[string]string{"prompt": "Replace the transparent region", "negative_prompt": "blurry, watermark", "moderation": "auto", "output_format": "png", "future_param": "future-value"}
 				if async {
 					fields["async"] = "true"
 				}
 				inputMask = encodedPNG(t, mask)
 				body, ct := editBody(t, fields, [][]byte{tinyPNG()}, [][]byte{inputMask})
-				if asJSON {
-					body, err = json.Marshal(map[string]any{"prompt": fields["prompt"], "n": 1, "async": async, "size": "1024x1024", "response_format": "url", "output_format": "png", "images": []any{map[string]string{"image_url": srv.URL + "/reference.png"}}, "mask": []any{map[string]string{"image_url": srv.URL + "/mask.png"}}})
+				if inputMode != "multipart" {
+					reference, maskURL := srv.URL+"/reference.png", srv.URL+"/mask.png"
+					if inputMode == "json-base64" || inputMode == "json-mixed" {
+						reference = "data:image/png;base64," + base64.StdEncoding.EncodeToString(tinyPNG())
+					}
+					if inputMode == "json-base64" {
+						maskURL = "data:image/png;base64," + base64.StdEncoding.EncodeToString(inputMask)
+					}
+					body, err = json.Marshal(map[string]any{"prompt": fields["prompt"], "n": 1, "async": async, "size": "1024x1024", "response_format": "url", "output_format": "png", "negative_prompt": fields["negative_prompt"], "moderation": fields["moderation"], "future_param": fields["future_param"], "images": []any{map[string]string{"image_url": reference}}, "mask": []any{map[string]string{"image_url": maskURL}}})
 					if err != nil {
 						t.Fatal(err)
 					}

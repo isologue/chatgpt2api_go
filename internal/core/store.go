@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/singleflight"
+	"strings"
 	"sync"
 	"time"
 )
@@ -67,6 +68,7 @@ CREATE TABLE IF NOT EXISTS core_idempotency(scope text PRIMARY KEY,fingerprint t
 CREATE INDEX IF NOT EXISTS core_tasks_status ON core_tasks(status) WHERE status IN ('queued','processing');
 CREATE TABLE IF NOT EXISTS core_requests(id text PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT now(), model text NOT NULL, is_async boolean NOT NULL, response_format text NOT NULL, status text NOT NULL, duration_ms bigint NOT NULL, attempts jsonb NOT NULL, error jsonb);
 ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS upstream_model text NOT NULL DEFAULT '';
+ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS request_kind text NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS core_requests_created_at ON core_requests(created_at DESC);
 ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS started_at timestamptz;
 ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS finished_at timestamptz;
@@ -157,7 +159,10 @@ func (s *Postgres) SaveAccount(ctx context.Context, a Account) error {
 	return err
 }
 func (s *Postgres) CreateTask(ctx context.Context, t Task) error {
-	b, _ := json.Marshal(t.Request)
+	b, err := marshalStoredRequest(t.Request)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return err
@@ -194,7 +199,7 @@ func (s *Postgres) GetTask(ctx context.Context, id string) (Task, error) {
 	if err != nil {
 		return t, err
 	}
-	if err = json.Unmarshal(req, &t.Request); err != nil {
+	if err = unmarshalStoredRequest(req, &t.Request); err != nil {
 		return t, err
 	}
 	if len(result) > 0 {
@@ -232,7 +237,24 @@ type batchLogStore interface {
 	LogBatch(context.Context, []requestLog) error
 }
 
-const requestLogInsert = "INSERT INTO core_requests(id,created_at,started_at,finished_at,queue_ms,switch_count,image_count,model,is_async,response_format,status,duration_ms,attempts,error,api_key_id,api_key_name,upstream_model) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)"
+const requestLogInsert = "INSERT INTO core_requests(id,created_at,started_at,finished_at,queue_ms,switch_count,image_count,model,is_async,response_format,status,duration_ms,attempts,error,api_key_id,api_key_name,upstream_model,request_kind) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)"
+
+// 新日志使用入口类型；兼容直接调用 Store.Log 的旧调用与扩展。
+func requestLogKind(id string, r Request) string {
+	switch r.requestKind {
+	case "image", "text", "file":
+		return r.requestKind
+	}
+	switch {
+	case strings.HasPrefix(id, "chat_"):
+		return "text"
+	case strings.HasPrefix(id, "filetask_"):
+		return "file"
+	case strings.HasPrefix(id, "task_") || r.N > 0 || r.Model == "gpt-image-2":
+		return "image"
+	}
+	return ""
+}
 
 func requestLogValues(l requestLog) (any, error) {
 	a, err := json.Marshal(l.attempts)
@@ -269,7 +291,7 @@ func requestLogValues(l requestLog) (any, error) {
 	if l.err == nil {
 		images = l.req.N
 	}
-	return []any{l.id, timing.Finished, started, timing.Finished, timing.QueueMS, switches, images, l.req.Model, l.req.Async, l.req.Format, status, l.duration.Milliseconds(), a, eb, l.req.apiKeyID, l.req.apiKeyName, l.req.UpstreamModel}, nil
+	return []any{l.id, timing.Finished, started, timing.Finished, timing.QueueMS, switches, images, l.req.Model, l.req.Async, l.req.Format, status, l.duration.Milliseconds(), a, eb, l.req.apiKeyID, l.req.apiKeyName, l.req.UpstreamModel, requestLogKind(l.id, l.req)}, nil
 }
 
 func (s *Postgres) Log(ctx context.Context, id string, r Request, attempts []Attempt, e *APIError, d time.Duration) error {

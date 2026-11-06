@@ -3,8 +3,9 @@ package core
 import "time"
 
 func imageAvailable(a Account) time.Time {
+	available := a.AvailableAt
 	if a.Quota != nil && *a.Quota <= 0 {
-		return maxTime(a.AvailableAt, a.QuotaResetAt)
+		available = maxTime(available, a.QuotaResetAt)
 	}
-	return a.AvailableAt
+	return maxTime(available, a.RateLimitedUntil)
 }

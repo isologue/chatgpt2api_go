@@ -28,7 +28,7 @@ func (a *Account) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
-var accountKeys = []string{"revision", "id", "identity_id", "email", "access_token", "refresh_token", "id_token", "client_id", "device_id", "user_agent", "score", "enabled", "verified_at", "success_at", "available_at", "last_used_at", "last_refresh_at", "last_refresh_error", "last_token_refresh_at", "last_token_refresh_error", "last_token_refresh_error_at", "hot", "hot_since", "quota", "quota_reset_at", "status", "last_error_code", "next_refresh_at", "refresh_failures"}
+var accountKeys = []string{"revision", "id", "identity_id", "email", "access_token", "refresh_token", "id_token", "client_id", "device_id", "user_agent", "score", "enabled", "verified_at", "success_at", "available_at", "rate_limited_until", "rate_limit_reason", "rate_limit_source", "rate_limit_message", "last_used_at", "last_refresh_at", "last_refresh_error", "last_token_refresh_at", "last_token_refresh_error", "last_token_refresh_error_at", "hot", "hot_since", "quota", "quota_reset_at", "status", "last_error_code", "next_refresh_at", "refresh_failures"}
 var terminalRefreshErrorPattern = regexp.MustCompile(`\brefresh[\s_-]*token\b.{0,24}\b(?:is|has\s+been|was)?\s*(?:expired|revoked|invalid|reused)\b|\b(?:expired|revoked|invalid|reused)\s+refresh[\s_-]*token\b`)
 
 func refreshTokenStatus(hasToken bool, lastSuccess time.Time, lastError string, lastErrorAt time.Time) string {

@@ -81,7 +81,7 @@ func prepareIdempotency(r *http.Request, req *Request) error {
 	req.idemScope = keyDigest(req.apiKeyID + "\x00" + r.URL.Path + "\x00" + key)
 	fingerprint, _ := r.Context().Value(requestHashKey{}).(string)
 	if fingerprint == "" {
-		b, _ := json.Marshal(req)
+		b, _ := marshalStoredRequest(*req)
 		fingerprint = canonicalHash(b)
 	}
 	req.idemFingerprint = fingerprint

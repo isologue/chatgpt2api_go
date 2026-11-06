@@ -124,6 +124,7 @@ func (e *Engine) Submit(ctx context.Context, r Request) (Task, <-chan completed,
 	return e.submitNew(ctx, r)
 }
 func (e *Engine) submitNew(ctx context.Context, r Request) (Task, <-chan completed, error) {
+	r.requestKind = "image"
 	target, err := e.resolveModel(r.Model, "image")
 	if err != nil {
 		return Task{}, nil, err

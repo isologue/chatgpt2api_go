@@ -11,7 +11,9 @@ import (
 )
 
 type Request struct {
-	UpstreamModel              string `json:"upstream_model,omitempty"`
+	extraFields                map[string]json.RawMessage // 仅透传请求体参数，不作为账号、路由或鉴权配置。
+	requestKind                string                     // 仅由内部入口赋值，不能由调用方传入或改变幂等指纹。
+	UpstreamModel              string                     `json:"upstream_model,omitempty"`
 	apiKeyID, apiKeyName       string
 	keyConcurrency             int
 	idemScope, idemFingerprint string
@@ -35,6 +37,11 @@ type APIError struct {
 	Penalty              int           `json:"-"`
 	Cooldown             time.Duration `json:"-"`
 	Invalidate           bool          `json:"-"`
+	RateLimited          bool          `json:"-"`
+	RateLimitedUntil     time.Time     `json:"-"`
+	RateLimitReason      string        `json:"-"`
+	RateLimitSource      string        `json:"-"`
+	RateLimitMessage     string        `json:"-"`
 	rawResponse          []byte
 	rawResponseTruncated bool
 }
@@ -102,7 +109,7 @@ func (r *Request) Validate(c Config) error {
 		r.Quality = "auto"
 	}
 	switch r.Quality {
-	case "auto", "low", "medium", "high":
+	case "auto", "low", "medium", "high", "xhigh", "max":
 	default:
 		return Err(400, "invalid_quality", "quality 无效")
 	}
@@ -171,6 +178,10 @@ type Account struct {
 	VerifiedAt              time.Time                  `json:"verified_at,omitempty"`
 	SuccessAt               time.Time                  `json:"success_at,omitempty"`
 	AvailableAt             time.Time                  `json:"available_at,omitempty"`
+	RateLimitedUntil        time.Time                  `json:"rate_limited_until,omitempty"`
+	RateLimitReason         string                     `json:"rate_limit_reason,omitempty"`
+	RateLimitSource         string                     `json:"rate_limit_source,omitempty"`
+	RateLimitMessage        string                     `json:"rate_limit_message,omitempty"`
 	LastUsedAt              time.Time                  `json:"last_used_at,omitempty"`
 	LastRefreshAt           time.Time                  `json:"last_refresh_at,omitempty"`
 	LastRefreshError        string                     `json:"last_refresh_error,omitempty"`

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"image"
 	"io"
@@ -117,6 +118,7 @@ func hashedInputs(inputs []editInput) []editInput {
 func parseEdit(ctx context.Context, reader *multipart.Reader, dir string, c Config) (Request, error) {
 	req := Request{N: 1}
 	seen := map[string]bool{}
+	extraValues := map[string][]json.RawMessage{}
 	for {
 		if ctx.Err() != nil {
 			return req, ctx.Err()
@@ -178,7 +180,12 @@ func parseEdit(ctx context.Context, reader *multipart.Reader, dir string, c Conf
 				req.inputs = append(req.inputs, input)
 			}
 		} else {
-			if seen[name] {
+			known := false
+			switch name {
+			case "prompt", "model", "n", "size", "quality", "response_format", "async", "stream":
+				known = true
+			}
+			if known && seen[name] {
 				return req, Err(400, "duplicate_form_field", "表单参数不能重复")
 			}
 			seen[name] = true
@@ -208,13 +215,33 @@ func parseEdit(ctx context.Context, reader *multipart.Reader, dir string, c Conf
 			case "stream":
 				req.Stream, err = strconv.ParseBool(v)
 			default:
-				return req, Err(400, "unsupported_form_field", "不支持的编辑表单字段："+name)
+				// multipart 文本值保留为字符串；显式 application/json 的 part 保留 JSON 类型。
+				value, _ := json.Marshal(v)
+				media, _, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
+				if media == "application/json" {
+					if !json.Valid(data) {
+						return req, Err(400, "invalid_form_value", "表单 JSON 参数无效："+name)
+					}
+					value = data
+				}
+				// 收集后一次性序列化，避免重复字段导致逐次复制大数组。
+				extraValues[name] = append(extraValues[name], value)
 			}
 			if err != nil {
 				return req, Err(400, "invalid_form_value", "表单参数无效："+name)
 			}
 		}
 		part.Close()
+	}
+	for name, values := range extraValues {
+		if req.extraFields == nil {
+			req.extraFields = make(map[string]json.RawMessage)
+		}
+		if len(values) == 1 {
+			req.extraFields[name] = values[0]
+		} else {
+			req.extraFields[name], _ = json.Marshal(values)
+		}
 	}
 	if len(req.inputs) == 0 {
 		return req, Err(400, "image_required", "至少需要上传一张参考图片")

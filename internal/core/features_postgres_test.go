@@ -127,8 +127,13 @@ func TestPostgresConcurrentIdempotencyAndRecovery(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if logs != 1 || tasks != 1 || keys != 1 {
+	// 生图只记录一次；幂等冲突另有一条准入拒绝日志。
+	if logs != 2 || tasks != 1 || keys != 1 {
 		t.Fatal("duplicate persisted records", logs, tasks, keys)
+	}
+	var generatedLogs, conflicts int
+	if err := s.db.QueryRow(context.Background(), "SELECT count(*) FILTER (WHERE status='succeeded'), count(*) FILTER (WHERE error->>'code'='idempotency_conflict') FROM core_requests").Scan(&generatedLogs, &conflicts); err != nil || generatedLogs != 1 || conflicts != 1 {
+		t.Fatal("expected one generation and one rejected conflict", generatedLogs, conflicts, err)
 	}
 	var id string
 	if err := s.db.QueryRow(context.Background(), "SELECT task_id FROM core_idempotency").Scan(&id); err != nil {
@@ -139,7 +144,7 @@ func TestPostgresConcurrentIdempotencyAndRecovery(t *testing.T) {
 		t.Fatal("task owner missing", err)
 	}
 	page, err := s.ConsoleRequests(context.Background(), consoleQuery{Limit: 10, KeyID: "key_default"})
-	if err != nil || len(page["items"].([]map[string]any)) != 1 {
+	if err != nil || len(page["items"].([]map[string]any)) != 2 {
 		t.Fatal("key filter failed", err)
 	}
 	page, err = s.ConsoleRequests(context.Background(), consoleQuery{Limit: 10, KeyID: "different"})

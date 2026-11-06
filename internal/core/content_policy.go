@@ -5,6 +5,8 @@ import (
 	"strings"
 )
 
+const contentPolicyMessage = "非常抱歉，该提示可能违反了我们的内容政策。如果你认为此判断有误，请重试或修改提示语。"
+
 // 错误码和审核标记优先；文案兜底要求拒绝/违规语义与政策或敏感主题同时出现。
 // 不检查请求提示词，也不把普通 is_error、403、工具调用失败当成审核拒绝。
 var policyTextPatterns = []*regexp.Regexp{

@@ -200,7 +200,7 @@ func readConsoleQuery(r *http.Request) (consoleQuery, error) {
 		return q, Err(400, "invalid_query", "搜索条件过长")
 	}
 	switch q.Status {
-	case "", "enabled", "disabled", "succeeded", "failed", "safety_rejected":
+	case "", "enabled", "disabled", "rate_limited", "cooling", "available", "succeeded", "failed", "safety_rejected":
 	default:
 		return q, Err(400, "invalid_status", "无效的状态筛选")
 	}

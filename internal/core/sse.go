@@ -234,7 +234,7 @@ func (s *session) poll(ctx context.Context, state *streamState) error {
 		if err == nil {
 			state.conversation(data)
 			if state.Blocked {
-				apiErr := Err(400, "content_policy_violation", "上游安全审核拒绝")
+				apiErr := Err(400, "content_policy_violation", contentPolicyMessage)
 				apiErr.rawResponse, apiErr.rawResponseTruncated = boundedRawResponse(raw)
 				return apiErr
 			}
@@ -270,7 +270,7 @@ func matchingTaskError(v any, cid string) *APIError {
 		if str(x["conversation_id"]) == cid || str(x["original_conversation_id"]) == cid {
 			m := obj(x["image_gen_message"])
 			if messagePolicyRejection(m) || policyError(x["error"]) || policyError(x["metadata"]) {
-				return Err(400, "content_policy_violation", "上游安全审核拒绝")
+				return Err(400, "content_policy_violation", contentPolicyMessage)
 			}
 			if yes(obj(m["metadata"])["is_error"]) && str(obj(m["author"])["role"]) == "assistant" {
 				content := obj(m["content"])
@@ -281,7 +281,7 @@ func matchingTaskError(v any, cid string) *APIError {
 					}
 					text = truncateText(text)
 					if isContentPolicyRejection(text) {
-						return Err(400, "content_policy_violation", text)
+						return Err(400, "content_policy_violation", contentPolicyMessage)
 					}
 					return RetryError("no_image_generated", text)
 				}

@@ -4,7 +4,7 @@
 
 `POST /v1/images/edits` 使用图片调用 Key 鉴权，接收 `multipart/form-data` 或 `application/json`。同步和异步共用路径，`async=true` 返回任务 ID，查询仍为 `GET /v1/images/tasks/{task_id}`。
 
-支持字段：`prompt`（必填）、`model`、`n`、`size`、`quality`、`response_format`、`async`。上传文件字段为 `image`/`image[]` 和可选的 `mask`/`mask[]`。参考图支持 PNG、JPEG、WebP，遮罩使用 PNG。JSON 通过 `images: [{"image_url": "https://..."}]` 提供参考图，也兼容 `image` 数组和对象内的 `url` 别名；`images` 与 `image` 不可同时提供。可选 `mask` 使用相同对象数组格式。输入 URL 仅支持无需登录的 HTTP(S)，暂不接受输入 Base64/data URL 或本地路径；返回格式可选 URL 或 Base64，沿用系统默认和允许用户覆盖的设置。
+支持字段：`prompt`（必填）、`model`、`n`、`size`、`quality`、`response_format`、`async`。上传文件字段为 `image`/`image[]` 和可选的 `mask`/`mask[]`。参考图支持 PNG、JPEG、WebP，遮罩使用 PNG。JSON 通过 `images: [{"image_url": "https://..."}]` 提供参考图，也兼容 `image` 数组和对象内的 `url` 别名；`images` 与 `image` 不可同时提供。可选 `mask` 使用相同对象数组格式。输入支持无需登录的 HTTP(S) 地址和 `data:image/png|jpeg|webp;base64,...`，Base64 可带标准填充或省略填充，也支持 CR/LF 换行；不接受本地路径、blob URL 或无前缀的裸 Base64；返回格式可选 URL 或 Base64，沿用系统默认和允许用户覆盖的设置。
 
 ```powershell
 curl.exe http://127.0.0.1:9080/v1/images/edits -H "Authorization: Bearer <图片调用密钥>" -H "Idempotency-Key: edit-order-20261103-1" -F "prompt=把透明区域替换为一片花园" -F "image=@input.png" -F "mask=@mask.png" -F "response_format=url" -F "async=true"
@@ -26,9 +26,20 @@ JSON 图片编辑示例（请求头 `Content-Type: application/json`）：
 }
 ```
 
-服务端先下载并校验参考图，再进入与 multipart 相同的上传和生图流程。JSON 的参考图/遮罩下载遵循系统直连/代理设置，共享 `CORE_DOWNLOAD_CONCURRENCY`；单张下载含排队受 `CORE_DOWNLOAD_TIMEOUT` 限制，所有参考图及遮罩合计受 `CORE_EDIT_MAX_MIB` 限制，过大返回 413。URL 需从部署服务器可访问；不会转发调用方密钥、Cookie 或账号 AT，最多跟随 5 次 HTTP(S) 重定向。下载失败直接返回 `image_input_download_failed`，不会因此选择账号或扣分。异步创建响应需等待参考图下载校验完成；任务接纳后继续持有本地输入直到终态。输入大小限制与 JSON 请求体大小分别检查。
+也可将 `image_url` 替换为 `data:image/jpeg;base64,/9j/4AAQ...`，`mask` 同样支持 Data URL（实际内容必须为 PNG）。HTTP 地址与 Data URL 可混用，顺序不变。服务端先下载或流式解码并校验参考图，再进入与 multipart 相同的上传和生图流程。JSON 的参考图/遮罩下载遵循系统直连/代理设置，共享 `CORE_DOWNLOAD_CONCURRENCY`；单张下载含排队受 `CORE_DOWNLOAD_TIMEOUT` 限制，所有参考图及遮罩合计受 `CORE_EDIT_MAX_MIB` 限制，过大返回 413。URL 需从部署服务器可访问；不会转发调用方密钥、Cookie 或账号 AT，最多跟随 5 次 HTTP(S) 重定向。下载失败直接返回 `image_input_download_failed`，不会因此选择账号或扣分。异步创建响应需等待参考图下载校验完成；任务接纳后继续持有本地输入直到终态。Data URL 在本地解码，不发起下载、不占用远程下载名额；实际图片格式根据内容识别，不信任声明的 MIME。输入大小限制与 JSON 请求体大小分别检查，Base64 编码约膨胀三分之一，整个 JSON 请求仍受 `CORE_EDIT_MAX_MIB` 限制。
 
-模型名按系统模型映射验证，例如使用 `gpt-image-2.6` 前需在设置中启用对应的图片模型映射。`output_format` 不是当前的输出编码控制项：兼容请求可携带该字段，但不会强制转码；`response_format` 仅决定返回 URL 或 Base64，不决定 PNG/JPEG/WebP 编码。
+模型名按系统模型映射验证，例如使用 `gpt-image-2.6` 前需在设置中启用对应的图片模型映射。`response_format` 由本地控制返回 URL 或 Base64，不决定 PNG/JPEG/WebP 编码。`output_format` 等额外参数会透传给实际会话上游，不在本地强制转码，上游是否支持和生效以实际返回为准。
+
+### 额外参数透传
+
+JSON 文生图、JSON 图生图和 multipart 图生图均接收额外参数（如 `negative_prompt`、`moderation`、`output_format`、`background`、`seed` 及未来参数），不再因未知的普通表单字段返回 `unsupported_form_field`，也不静默丢弃 JSON 额外参数。额外参数作为原名顶层字段发送到实际 ChatGPT 会话上游的 prepare 和生成请求；这不是标准 OpenAI 图片 API 的直接转发，接收不代表上游一定支持或执行，也不会关闭安全审核拒绝识别。
+
+- JSON 额外参数保留字符串、数值、布尔、对象、数组与 `null` 类型，包括大整数精度。
+- multipart 普通文本参数保留字符串；带 `Content-Type: application/json` 的额外 part 保留 JSON 类型。重名额外字段按顺序组成数组；已知核心字段重复仍会报错，避免歧义。
+- `prompt/model/n/size/quality/response_format/async/stream` 继续走现有映射、校验及本地处理；图片和遮罩继续走上传流程，不直接把 Base64 或本地路径塞入会话信封。`upstream_model` 不能绕过模型映射。
+- 系统构造的会话协议字段（例如 `messages`、`partial_query`、`model`、`action`、会话 ID、附件元数据）不会被额外参数覆盖；请求体参数不会变成鉴权请求头、代理或服务配置。
+- 请求大小、单个表单字段长度及文件格式等限制保持不变；任意二进制文件字段并不因此开放，文件仍只接受 `image`/`image[]`、`mask`/`mask[]`。
+- 原始请求日志仍保留调用方报文。额外参数进入任务存储和幂等指纹，修改额外参数后不能用旧幂等键错误重放旧结果。
 
 遮罩沿用旧 Python 项目的处理方式：RGBA PNG 取透明通道，透明处允许编辑，不透明处保留；灰度/RGB PNG 取灰度值。多图按顺序配对，缺少的遮罩复用最后一张；遮罩尺寸不同时缩放到参考图尺寸，再合成为 PNG 上传。Go 使用 Catmull-Rom 缩放，旧版使用 Lanczos，边缘插值不会逐像素相同。上游生成仍受模型行为影响，不能保证保留区域逐像素不变。
 

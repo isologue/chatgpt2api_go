@@ -155,7 +155,7 @@ func (a *API) createExport(w http.ResponseWriter, r *http.Request, kind string) 
 	c := e.CurrentConfig()
 	accepted := time.Now()
 	identity, _ := r.Context().Value(apiIdentityKey{}).(managedAPIKey)
-	req := Request{Model: "gpt-6", Async: true, apiKeyID: identity.ID, apiKeyName: identity.Name, keyConcurrency: identity.Concurrency}
+	req := Request{requestKind: "file", Model: "gpt-6", Async: true, apiKeyID: identity.ID, apiKeyName: identity.Name, keyConcurrency: identity.Concurrency}
 	// 准入只持短锁。大请求读取、base64 解码、落盘和数据库 I/O 均不持 admission 锁。
 	e.admission.RLock()
 	if e.closing.Load() {

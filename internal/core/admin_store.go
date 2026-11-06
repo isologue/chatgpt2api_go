@@ -116,7 +116,7 @@ func (s *Postgres) AccountIDs(ctx context.Context, after string, limit int) ([]s
 	return ids, rows.Err()
 }
 func (s *Postgres) AccountIDsMatching(ctx context.Context, after string, limit int, search, status string) ([]string, error) {
-	rows, err := s.db.Query(ctx, `SELECT id FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%') AND ($3='' OR COALESCE(managed_enabled,(data->>'enabled')::boolean,false)=($3='enabled')) ORDER BY id LIMIT $4`, after, search, status, limit)
+	rows, err := s.db.Query(ctx, `SELECT id FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%')`+availabilitySQL("3")+` ORDER BY id LIMIT $4`, after, search, status, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +133,7 @@ func (s *Postgres) AccountIDsMatching(ctx context.Context, after string, limit i
 }
 func (s *Postgres) AccountCountMatching(ctx context.Context, search, status string) (int, error) {
 	var count int
-	err := s.db.QueryRow(ctx, `SELECT count(*) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%') AND ($2='' OR COALESCE(managed_enabled,(data->>'enabled')::boolean,false)=($2='enabled'))`, search, status).Scan(&count)
+	err := s.db.QueryRow(ctx, `SELECT count(*) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%')`+availabilitySQL("2"), search, status).Scan(&count)
 	return count, err
 }
 func (s *Postgres) DeleteManagedAccounts(ctx context.Context, ids []string) ([]string, error) {
