@@ -291,3 +291,7 @@ python3 scripts/backup.py restore --directory /your/backup/path/new-backup --pro
 备份短暂停止 core，完成或失败后恢复其原运行状态，保存数据库、图片及原始报文卷、Compose 和环境文件。备份目录应在持久化磁盘上并限制访问；包含完整账号凭据与密钥。恢复先校验 SHA256 与压缩包路径，默认拒绝非空目标；不会覆盖当前 Compose 或环境文件。独立恢复演练建议使用独立项目/数据卷，--no-start 保持 core 停止，便于检查数据库和图片，避免克隆账号触发后台远程刷新。WebDAV 远端数据由图床服务单独备份。
 
 本轮 WebDAV 降级、监控持久化、Linux 恢复演练与线上负载结果见 [2026-11-03 验收报告](docs/webdav-monitor-recovery-validation-2026-11-03.md)。
+
+### 账号分组与多个推送 Key
+
+账号池支持分组增删改、按组查看、单个/批量移动及按筛选导入导出。账号推送支持多 Key，每条 Key 绑定一个分组，保留原推送接口和旧 Key。分组不改变全局生图调度。规则、接口及升级说明见 [账号分组与推送 Key](docs/account-groups-and-push-keys.md)。

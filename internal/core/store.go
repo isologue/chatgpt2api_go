@@ -96,7 +96,10 @@ ALTER TABLE core_request_payloads ADD COLUMN IF NOT EXISTS request_bytes bigint 
 
 `
 
-func (s *Postgres) Migrate(ctx context.Context) error { _, err := s.db.Exec(ctx, schema); return err }
+func (s *Postgres) Migrate(ctx context.Context) error {
+	_, err := s.db.Exec(ctx, schema+accountGroupsSchema)
+	return err
+}
 
 // 一个原型实例独占调度池，避免多实例分别计算槽位。以后用分片/租约扩展。
 func (s *Postgres) AcquireInstance(ctx context.Context) error {

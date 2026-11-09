@@ -19,23 +19,36 @@ func (s *Postgres) InsertManagedAccounts(ctx context.Context, accounts []Account
 	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(782471902632)"); err != nil {
 		return nil, err
 	}
+	scope := importScopeFrom(ctx)
+	if err = lockImportScope(ctx, tx, scope); err != nil {
+		return nil, err
+	}
+	groups := make([]string, len(accounts))
+	for i, account := range accounts {
+		groups[i], err = importedGroup(ctx, tx, scope, account)
+		if err != nil {
+			return nil, err
+		}
+	}
 	batch := &pgx.Batch{}
-	for _, a := range accounts {
+	for i, a := range accounts {
 		a.IdentityID = accountIdentity(a.AccessToken)
 		raw, err := json.Marshal(a)
 		if err != nil {
 			return nil, err
 		}
-		batch.Queue("INSERT INTO core_accounts(id,access_fingerprint,identity_key,data) VALUES($1,$2,NULLIF($3,''),$4) ON CONFLICT DO NOTHING RETURNING id", a.ID, Fingerprint(a.AccessToken), a.IdentityID, raw)
+		batch.Queue("INSERT INTO core_accounts(id,access_fingerprint,identity_key,data,group_id) VALUES($1,$2,NULLIF($3,''),$4,$5) ON CONFLICT DO NOTHING RETURNING id", a.ID, Fingerprint(a.AccessToken), a.IdentityID, raw, groups[i])
 	}
 	results := tx.SendBatch(ctx, batch)
 	inserted := []Account{}
 	duplicates := []Account{}
-	for _, a := range accounts {
+	duplicateGroups := []string{}
+	for i, a := range accounts {
 		var id string
 		err := results.QueryRow().Scan(&id)
 		if err == pgx.ErrNoRows {
 			duplicates = append(duplicates, a)
+			duplicateGroups = append(duplicateGroups, groups[i])
 			continue
 		}
 		if err != nil {
@@ -48,16 +61,25 @@ func (s *Postgres) InsertManagedAccounts(ctx context.Context, accounts []Account
 	if err = results.Close(); err != nil {
 		return nil, err
 	}
-	for _, a := range duplicates {
+	for i, a := range duplicates {
 		identity := accountIdentity(a.AccessToken)
 		var existing []byte
-		err = tx.QueryRow(ctx, "SELECT data FROM core_accounts WHERE identity_key=NULLIF($1,'') OR access_fingerprint=$2 OR id=$3 ORDER BY id LIMIT 1 FOR UPDATE", identity, Fingerprint(a.AccessToken), a.ID).Scan(&existing)
+		var currentGroup string
+		err = tx.QueryRow(ctx, "SELECT data,group_id FROM core_accounts WHERE identity_key=NULLIF($1,'') OR access_fingerprint=$2 OR id=$3 ORDER BY id LIMIT 1 FOR UPDATE", identity, Fingerprint(a.AccessToken), a.ID).Scan(&existing, &currentGroup)
 		if err != nil {
 			return nil, err
 		}
 		var canonical Account
 		if err = json.Unmarshal(existing, &canonical); err != nil {
 			return nil, err
+		}
+		targetGroup := duplicateGroups[i]
+		if currentGroup == defaultAccountGroup && targetGroup != currentGroup {
+			if _, err = tx.Exec(ctx, "UPDATE core_accounts SET group_id=$2,updated_at=now() WHERE id=$1", canonical.ID, targetGroup); err != nil {
+				return nil, err
+			}
+		} else if currentGroup != targetGroup && scope != nil && scope.Stats != nil {
+			scope.Stats.Conflicts++
 		}
 		if canonical.AccessToken == a.AccessToken && sameImportRecord(canonical, a) {
 			continue
@@ -71,6 +93,16 @@ func (s *Postgres) InsertManagedAccounts(ctx context.Context, accounts []Account
 			return nil, err
 		}
 		if _, err = tx.Exec(ctx, "UPDATE core_accounts SET data=data || $2::jsonb,updated_at=now() WHERE id=$1", canonical.ID, raw); err != nil {
+			return nil, err
+		}
+	}
+	if scope != nil && scope.PushID != "" {
+		if scope.PushID == "default" {
+			_, err = tx.Exec(ctx, "UPDATE core_account_push SET last_push_at=now() WHERE id=1")
+		} else {
+			_, err = tx.Exec(ctx, "UPDATE core_account_push_keys SET last_push_at=now() WHERE id=$1", scope.PushID)
+		}
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -116,7 +148,7 @@ func (s *Postgres) AccountIDs(ctx context.Context, after string, limit int) ([]s
 	return ids, rows.Err()
 }
 func (s *Postgres) AccountIDsMatching(ctx context.Context, after string, limit int, search, status string) ([]string, error) {
-	rows, err := s.db.Query(ctx, `SELECT id FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%')`+availabilitySQL("3")+` ORDER BY id LIMIT $4`, after, search, status, limit)
+	rows, err := s.db.Query(ctx, `SELECT id FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%')`+availabilitySQL("3")+accountGroupSQL(selectionGroup(ctx), "5")+` ORDER BY id LIMIT $4`, after, search, status, limit, selectionGroup(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +165,7 @@ func (s *Postgres) AccountIDsMatching(ctx context.Context, after string, limit i
 }
 func (s *Postgres) AccountCountMatching(ctx context.Context, search, status string) (int, error) {
 	var count int
-	err := s.db.QueryRow(ctx, `SELECT count(*) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%')`+availabilitySQL("2"), search, status).Scan(&count)
+	err := s.db.QueryRow(ctx, `SELECT count(*) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%')`+availabilitySQL("2")+accountGroupSQL(selectionGroup(ctx), "3"), search, status, selectionGroup(ctx)).Scan(&count)
 	return count, err
 }
 func (s *Postgres) DeleteManagedAccounts(ctx context.Context, ids []string) ([]string, error) {
@@ -193,7 +225,7 @@ func (s *Postgres) ListAdminJobs(ctx context.Context) ([]adminJob, error) {
 	return s.listAdminJobs(ctx, "SELECT data FROM core_admin_jobs ORDER BY created_at DESC,id DESC LIMIT 20")
 }
 func (s *Postgres) ListAccountJobs(ctx context.Context) ([]adminJob, error) {
-	return s.listAdminJobs(ctx, "SELECT data FROM core_admin_jobs WHERE kind IN ('import','push','verify','refresh_at','delete') ORDER BY created_at DESC,id DESC LIMIT 20")
+	return s.listAdminJobs(ctx, "SELECT data FROM core_admin_jobs WHERE kind IN ('import','push','verify','refresh_at','delete','move_group','delete_group') ORDER BY created_at DESC,id DESC LIMIT 20")
 }
 func (s *Postgres) latestCleanupJobs(ctx context.Context) ([]adminJob, error) {
 	return s.listAdminJobs(ctx, "SELECT DISTINCT ON (kind) data FROM core_admin_jobs WHERE kind IN ('cleanup_images','cleanup_logs') ORDER BY kind,created_at DESC,id DESC")
@@ -227,7 +259,7 @@ func (s *Postgres) RecoverAdminJobs(ctx context.Context) error {
 // does not redact credentials: this endpoint is protected by CORE_ADMIN_KEY and
 // is intended for an operator-controlled backup/migration download.
 func (s *Postgres) ExportAccounts(ctx context.Context, w io.Writer) error {
-	rows, err := s.db.Query(ctx, "SELECT data || jsonb_build_object('enabled',COALESCE(managed_enabled,(data->>'enabled')::boolean,false)) FROM core_accounts ORDER BY id")
+	rows, err := s.db.Query(ctx, `SELECT data || jsonb_build_object('enabled',COALESCE(managed_enabled,(data->>'enabled')::boolean,false),'group_id',group_id,'group_name',(SELECT name FROM core_account_groups WHERE id=group_id),'group_description',(SELECT description FROM core_account_groups WHERE id=group_id)) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%')`+availabilitySQL("2")+accountGroupSQL(exportSelection(ctx).GroupID, "3")+` ORDER BY id`, exportSelection(ctx).Search, exportSelection(ctx).Status, exportSelection(ctx).GroupID)
 	if err != nil {
 		return err
 	}

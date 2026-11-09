@@ -1,16 +1,20 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	httpx "github.com/bogdanfinn/fhttp"
 	"image"
+	"image/color"
+	"image/gif"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -178,5 +182,65 @@ func TestDownloadAppliesRequestedImageResize(t *testing.T) {
 	}
 	if n.validationWaiting.Load() != 0 || n.validationActive.Load() != 0 {
 		t.Fatal("image validation permit leaked after resize")
+	}
+}
+
+func TestDownloadPreservesGIFWithResizeEnabled(t *testing.T) {
+	for _, frames := range []int{1, 2} {
+		t.Run(strconv.Itoa(frames)+"-frames", func(t *testing.T) {
+			palette := color.Palette{color.Black, color.White}
+			source := &gif.GIF{LoopCount: 3}
+			for i := 0; i < frames; i++ {
+				frame := image.NewPaletted(image.Rect(0, 0, 4, 2), palette)
+				frame.SetColorIndex(i, 0, 1)
+				source.Image = append(source.Image, frame)
+				source.Delay = append(source.Delay, 7+i)
+			}
+			var encoded bytes.Buffer
+			if err := gif.EncodeAll(&encoded, source); err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "image/gif")
+				w.Write(encoded.Bytes())
+			}))
+			defer server.Close()
+			c := testConfig(t)
+			c.ImageResizeEnabled = true
+			c.DownloadRetries = 0
+			n, err := NewNative(c, NewPool(nil, 1), newMemoryStore())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer n.Close()
+			ctx := context.WithValue(context.Background(), imageResizeTargetKey{}, imageSize{48, 32})
+			stages := map[string]float64{}
+			artifact, err := n.download(ctx, server.URL+"/image.gIF", stages, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			actual, err := os.ReadFile(filepath.Join(c.ImageDir, artifact.Name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(actual, encoded.Bytes()) || artifact.Bytes != int64(encoded.Len()) || !strings.HasSuffix(artifact.Name, ".gif") {
+				t.Fatal("GIF bytes, size or extension changed")
+			}
+			decoded, err := gif.DecodeAll(bytes.NewReader(actual))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(decoded.Image) != frames || decoded.Config.Width != 4 || decoded.Config.Height != 2 {
+				t.Fatal("GIF frames or dimensions changed")
+			}
+			for _, stage := range []string{"图片缩放排队", "图片尺寸缩放"} {
+				if _, ok := stages[stage]; ok {
+					t.Fatalf("GIF unexpectedly entered resize stage: %s", stage)
+				}
+			}
+			if n.validationWaiting.Load() != 0 || n.validationActive.Load() != 0 || n.downloadActive.Load() != 0 {
+				t.Fatal("download/validation permit leaked")
+			}
+		})
 	}
 }

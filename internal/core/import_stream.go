@@ -114,6 +114,7 @@ func scanAccountValue(d *json.Decoder, visit func(json.RawMessage) error, depth 
 }
 
 type accountImportFile struct {
+	scope *accountImportScope
 	file  *os.File
 	meta  map[string]json.RawMessage
 	total int

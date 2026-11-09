@@ -161,7 +161,8 @@ func (n *Native) transfer(ctx context.Context, link string, stages map[string]fl
 	if ctx.Err() != nil {
 		return artifact, ctx.Err()
 	}
-	if target, ok := ctx.Value(imageResizeTargetKey{}).(imageSize); ok && target.Width > 0 {
+	// GIF 保留原始文件与动画帧，不进入缩放队列或重新编码。
+	if target, ok := ctx.Value(imageResizeTargetKey{}).(imageSize); ok && target.Width > 0 && format != "gif" {
 		queueStart := time.Now()
 		n.validationWaiting.Add(1)
 		if err := n.validation.Acquire(ctx); err != nil {

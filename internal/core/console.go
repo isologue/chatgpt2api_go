@@ -158,6 +158,7 @@ type consoleQuery struct {
 	Limit                  int
 	Search, Status, Cursor string
 	Async, Format          string
+	GroupID                string
 	KeyID                  string
 	From, To               *time.Time
 }
@@ -175,6 +176,10 @@ func readConsoleQuery(r *http.Request) (consoleQuery, error) {
 			return q, Err(400, "invalid_limit", "每页数量必须为 1 到 100")
 		}
 		q.Limit = n
+	}
+	q.GroupID = r.URL.Query().Get("group_id")
+	if len(q.GroupID) > 256 {
+		return q, Err(400, "invalid_group", "分组 ID 过长")
 	}
 	q.KeyID = r.URL.Query().Get("api_key_id")
 	if len(q.KeyID) > 256 {

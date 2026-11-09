@@ -23,19 +23,23 @@ type adminJobError struct {
 	Message   string `json:"message"`
 }
 type adminJob struct {
-	Message    string          `json:"message,omitempty"`
-	ID         string          `json:"id"`
-	Kind       string          `json:"kind"`
-	Status     string          `json:"status"`
-	Total      int             `json:"total"`
-	Processed  int             `json:"processed"`
-	Imported   int             `json:"imported"`
-	Duplicates int             `json:"duplicates"`
-	Succeeded  int             `json:"succeeded"`
-	Failed     int             `json:"failed"`
-	Errors     []adminJobError `json:"errors"`
-	Created    time.Time       `json:"created_at"`
-	Updated    time.Time       `json:"updated_at"`
+	GroupID        string          `json:"group_id,omitempty"`
+	SourceGroupID  string          `json:"source_group_id,omitempty"`
+	PushKeyID      string          `json:"push_key_id,omitempty"`
+	GroupConflicts int             `json:"group_conflicts"`
+	Message        string          `json:"message,omitempty"`
+	ID             string          `json:"id"`
+	Kind           string          `json:"kind"`
+	Status         string          `json:"status"`
+	Total          int             `json:"total"`
+	Processed      int             `json:"processed"`
+	Imported       int             `json:"imported"`
+	Duplicates     int             `json:"duplicates"`
+	Succeeded      int             `json:"succeeded"`
+	Failed         int             `json:"failed"`
+	Errors         []adminJobError `json:"errors"`
+	Created        time.Time       `json:"created_at"`
+	Updated        time.Time       `json:"updated_at"`
 }
 type accountExporter interface {
 	ExportAccounts(context.Context, io.Writer) error
@@ -60,6 +64,7 @@ type filteredAccountManager interface {
 func (a *API) registerAccountManagement(m *http.ServeMux) {
 	m.HandleFunc("POST /admin/accounts/import", a.admin(a.importAccounts))
 	a.registerAccountPush(m)
+	a.registerAccountGroups(m)
 	m.HandleFunc("GET /admin/accounts/export", a.admin(a.exportAccounts))
 	m.HandleFunc("POST /admin/accounts/verify", a.admin(a.verifyAccounts))
 	m.HandleFunc("POST /admin/accounts/refresh-token", a.admin(a.verifyAccounts))
@@ -129,7 +134,7 @@ func (a *API) deleteAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func validAccountSelection(search, status string) bool {
-	return len(search) <= 256 && (status == "" || status == "enabled" || status == "disabled")
+	return len(search) <= 256 && (status == "" || status == "enabled" || status == "disabled" || status == "available" || status == "rate_limited" || status == "cooling")
 }
 
 func (a *API) deleteAccounts(w http.ResponseWriter, r *http.Request) {
@@ -147,11 +152,12 @@ func (a *API) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 		AllMatching bool     `json:"all_matching"`
 		Search      string   `json:"q"`
 		Status      string   `json:"status"`
+		GroupID     string   `json:"group_id"`
 	}
 	if !decodeAdmin(w, r, &input, 4<<20) {
 		return
 	}
-	if input.AllMatching == (len(input.IDs) > 0) || len(input.IDs) > 10000 || !validAccountSelection(input.Search, input.Status) {
+	if input.AllMatching == (len(input.IDs) > 0) || len(input.IDs) > 10000 || (!validAccountSelection(input.Search, input.Status) || len(input.GroupID) > 256) {
 		sendError(w, Err(400, "invalid_selection", "请选择账号，或指定 all_matching:true 及有效筛选条件"))
 		return
 	}
@@ -181,7 +187,7 @@ func (a *API) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 	j.Total = len(ids)
 	if input.AllMatching {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		total, err := store.AccountCountMatching(ctx, input.Search, input.Status)
+		total, err := store.AccountCountMatching(withSelectionGroup(ctx, input.GroupID), input.Search, input.Status)
 		cancel()
 		if err != nil {
 			managementError(w, err)
@@ -242,7 +248,7 @@ func (a *API) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 		} else {
 			for {
 				ctx, cancel := context.WithTimeout(a.Engine.root, 5*time.Second)
-				page, err := store.AccountIDsMatching(ctx, cursor, 100, input.Search, input.Status)
+				page, err := store.AccountIDsMatching(withSelectionGroup(ctx, input.GroupID), cursor, 100, input.Search, input.Status)
 				cancel()
 				if err != nil {
 					j.Status = "failed"
@@ -349,6 +355,29 @@ func (a *API) importAccounts(w http.ResponseWriter, r *http.Request) {
 		sendError(w, AsError(err))
 		return
 	}
+	f.scope = &accountImportScope{}
+	groupID := r.URL.Query().Get("group_id")
+	if groupID != "" {
+		pg, ok := s.(*Postgres)
+		if !ok || len(groupID) > 256 {
+			f.Close()
+			sendError(w, Err(400, "invalid_group", "分组无效"))
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		tx, e := pg.db.Begin(ctx)
+		if e == nil {
+			e = lockActiveGroup(ctx, tx, groupID)
+			_ = tx.Rollback(ctx)
+		}
+		cancel()
+		if e != nil {
+			f.Close()
+			groupError(w, e)
+			return
+		}
+		f.scope = &accountImportScope{GroupID: groupID}
+	}
 	job, _, err := a.launchAccountImport(r.Context(), s, f, "import")
 	if err != nil {
 		f.Close()
@@ -363,6 +392,10 @@ func (a *API) importAccounts(w http.ResponseWriter, r *http.Request) {
 func (a *API) launchAccountImport(ctx context.Context, s accountManager, f *accountImportFile, kind string) (adminJob, <-chan adminJob, error) {
 	j := newAdminJob(kind)
 	j.Total = f.total
+	if f.scope != nil {
+		j.GroupID = f.scope.GroupID
+		j.PushKeyID = f.scope.PushID
+	}
 	save, cancel := context.WithTimeout(ctx, 5*time.Second)
 	err := s.SaveAdminJob(save, j)
 	cancel()
@@ -400,6 +433,12 @@ func (a *API) runAccountImport(s accountManager, f *accountImportFile, j *adminJ
 		if len(batch) > 0 {
 			ctx, cancel := context.WithTimeout(a.Engine.root, 15*time.Second)
 			a.Engine.accountOps.Lock()
+			stats := &importGroupStats{}
+			if f.scope != nil {
+				scope := *f.scope
+				scope.Stats = stats
+				ctx = context.WithValue(ctx, importScopeKey{}, &scope)
+			}
 			inserted, err := s.InsertManagedAccounts(ctx, batch)
 			if err == nil {
 				a.Engine.Pool.Add(inserted)
@@ -409,6 +448,7 @@ func (a *API) runAccountImport(s accountManager, f *accountImportFile, j *adminJ
 			if err != nil {
 				return err
 			}
+			j.GroupConflicts += stats.Conflicts
 			j.Imported += len(inserted)
 			j.Duplicates += len(batch) - len(inserted)
 			j.Processed += len(batch)
@@ -448,6 +488,10 @@ func (a *API) runAccountImport(s accountManager, f *accountImportFile, j *adminJ
 	if err != nil {
 		j.Status = "failed"
 		j.Message = "导入中断，已完成批次保留，可重试导入"
+		var api *APIError
+		if errors.As(err, &api) {
+			j.Message = api.Message
+		}
 	} else {
 		j.Status = "completed"
 	}
@@ -464,11 +508,16 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 		AllMatching bool     `json:"all_matching"`
 		Search      string   `json:"q"`
 		Status      string   `json:"status"`
+		GroupID     string   `json:"group_id"`
 	}
 	if !decodeAdmin(w, r, &input, 4<<20) {
 		return
 	}
-	if input.All && (len(input.IDs) > 0 || input.AllMatching) || input.AllMatching && len(input.IDs) > 0 || !input.All && !input.AllMatching && len(input.IDs) == 0 || !validAccountSelection(input.Search, input.Status) || len(input.IDs) > 10000 {
+	if input.All && input.GroupID != "" {
+		input.All = false
+		input.AllMatching = true
+	}
+	if input.All && (len(input.IDs) > 0 || input.AllMatching) || input.AllMatching && len(input.IDs) > 0 || !input.All && !input.AllMatching && len(input.IDs) == 0 || (!validAccountSelection(input.Search, input.Status) || len(input.GroupID) > 256) || len(input.IDs) > 10000 {
 		sendError(w, Err(400, "invalid_selection", "请选择账号，或指定 all:true / all_matching:true 及有效筛选条件"))
 		return
 	}
@@ -524,7 +573,7 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 		if input.All {
 			total, err = s.AccountCount(ctx)
 		} else {
-			total, err = store.AccountCountMatching(ctx, input.Search, input.Status)
+			total, err = store.AccountCountMatching(withSelectionGroup(ctx, input.GroupID), input.Search, input.Status)
 		}
 		cancel()
 		if err != nil {
@@ -608,7 +657,7 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 				if input.All {
 					page, err = s.AccountIDs(ctx, cursor, 100)
 				} else {
-					page, err = store.AccountIDsMatching(ctx, cursor, 100, input.Search, input.Status)
+					page, err = store.AccountIDsMatching(withSelectionGroup(ctx, input.GroupID), cursor, 100, input.Search, input.Status)
 				}
 				cancel()
 				if err != nil {
@@ -712,7 +761,16 @@ func (a *API) exportAccounts(w http.ResponseWriter, r *http.Request) {
 		sendError(w, Err(503, "export_unavailable", "当前存储不支持账号导出"))
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	q, err := readConsoleQuery(r)
+	if err != nil {
+		sendError(w, AsError(err))
+		return
+	}
+	if !validAccountSelection(q.Search, q.Status) {
+		sendError(w, Err(400, "invalid_selection", "账号筛选无效"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithValue(r.Context(), exportSelectionKey{}, q), 5*time.Minute)
 	defer cancel()
 	controller := http.NewResponseController(w)
 	_ = controller.SetWriteDeadline(time.Now().Add(5 * time.Minute))

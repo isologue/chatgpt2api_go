@@ -1,0 +1,12 @@
+/* Account groups reuse the existing console palette, typography and controls. */
+.account-group-bar{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin:0 0 1rem;padding:.9rem 0;border-bottom:1px solid var(--line,#e4e1db)}
+.group-navigation,.group-row-actions,.group-push-toolbar{display:flex;align-items:center;gap:.65rem;flex-wrap:wrap}
+.group-navigation>label{font-size:.8rem;font-weight:600;color:var(--muted,#777)}
+.group-input{min-height:2.6rem;max-width:100%;padding:.55rem .75rem;border:1px solid var(--line,#ddd);border-radius:.6rem;background:var(--surface,#fff);color:inherit;font:inherit}
+select.group-input{min-width:12rem;max-width:24rem}
+.group-management-list{margin-top:1rem}
+.group-management-row{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:1rem 0;border-bottom:1px solid var(--line,#e4e1db)}
+.group-management-row:last-child{border-bottom:0}.group-management-row p{margin:.35rem 0 0}.group-management-row .group-row-actions{flex-shrink:0}
+.group-description{min-height:6rem}.group-push-toolbar{margin:1rem 0}.push-key-info{min-width:0;flex:1}.push-key-info>.key-input{display:block;width:100%;margin:.65rem 0 .3rem}.push-key-row{align-items:flex-start}.empty-group{padding:2rem 0;color:var(--muted,#777)}
+.group-input:focus-visible{outline:2px solid var(--coral,#e96b56);outline-offset:2px}
+@media(max-width:760px){.group-management-row{align-items:stretch;flex-direction:column}.group-navigation{width:100%}.group-navigation select{flex:1;min-width:8rem}.group-input{width:100%}.group-management-row .group-row-actions{justify-content:flex-start}.account-group-bar>span{width:100%}}
