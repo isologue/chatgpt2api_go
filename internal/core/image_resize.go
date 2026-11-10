@@ -66,15 +66,15 @@ func resizeDecodedImage(src image.Image, target imageSize, format string, dst io
 	} else {
 		w = max(1, int(int64(sw)*int64(target.Height)/int64(sh)))
 	}
+	// 请求尺寸只作为外接边界；直接输出等比例缩放后的尺寸，不扩画布或补边。
 	var canvas draw.Image
 	if format == "jpeg" {
-		canvas = image.NewRGBA(image.Rect(0, 0, target.Width, target.Height))
+		canvas = image.NewRGBA(image.Rect(0, 0, w, h))
 		draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: color.White}, image.Point{}, draw.Src)
 	} else {
-		canvas = image.NewNRGBA(image.Rect(0, 0, target.Width, target.Height))
+		canvas = image.NewNRGBA(image.Rect(0, 0, w, h))
 	}
-	inner := image.Rect((target.Width-w)/2, (target.Height-h)/2, (target.Width-w)/2+w, (target.Height-h)/2+h)
-	draw.CatmullRom.Scale(canvas, inner, src, bounds, draw.Over, nil)
+	draw.CatmullRom.Scale(canvas, canvas.Bounds(), src, bounds, draw.Over, nil)
 	limited := &imageLimitWriter{writer: dst, max: maxBytes}
 	switch format {
 	case "png":

@@ -95,6 +95,8 @@ docker compose up -d core
 
 同步返回 `{"created":...,"data":[{"url":"..."}]}`。返回格式支持 `url` 和 `b64_json`，兼容 `base64`、`b64`、`base64_json`。系统默认值与是否接受用户指定格式分别由两个配置项控制。
 
+在设置中开启 `CORE_IMAGE_RESIZE_ENABLED` 后，静态 PNG、JPEG、WebP 保持完整画面，等比例缩放至 `size` 指定的宽高范围内，直接返回实际缩放尺寸，不扩画布、不补边、不裁剪。例如上游返回 `1536×1024`、请求 `3840×2160`，最终返回 `3240×2160`。原图已有的透明区域仍会保留；GIF、`size=auto` 或未指定尺寸不缩放。
+
 图片 URL 使用随机 UUID，持有 URL 即可访问，不额外要求 API key。`/healthz` 只检测进程；`/readyz` 检查服务状态及数据库。`GET /v1/models` 返回当前支持的模型。
 
 ## 手动模型目录与公开映射

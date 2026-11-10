@@ -170,7 +170,7 @@ func TestDownloadAppliesRequestedImageResize(t *testing.T) {
 	}
 	defer f.Close()
 	config, _, err := image.DecodeConfig(f)
-	if err != nil || config.Width != 48 || config.Height != 32 {
+	if err != nil || config.Width != 32 || config.Height != 32 {
 		t.Fatalf("resized image dimensions=%dx%d err=%v", config.Width, config.Height, err)
 	}
 	stat, err := f.Stat()

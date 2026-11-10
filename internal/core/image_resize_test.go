@@ -8,8 +8,6 @@ import (
 	"image/png"
 	"os"
 	"testing"
-
-	"github.com/HugoSmits86/nativewebp"
 )
 
 func TestParseImageSize(t *testing.T) {
@@ -58,36 +56,109 @@ func TestNearestImageRatio(t *testing.T) {
 	}
 }
 
-func TestResizeDecodedImagePreservesCanvasAndFormat(t *testing.T) {
-	source := image.NewNRGBA(image.Rect(0, 0, 4, 2))
-	for y := 0; y < 2; y++ {
-		for x := 0; x < 4; x++ {
-			source.Set(x, y, color.NRGBA{R: 240, A: 255})
+// 不透明原图在缩放后应铺满实际输出，不增加透明条或白边。
+func TestResizeDecodedImageFitsWithoutPadding(t *testing.T) {
+	for _, format := range []string{"png", "webp", "jpeg"} {
+		for _, tc := range []struct {
+			name                 string
+			source, target, want imageSize
+		}{
+			{"landscape-to-square", imageSize{4, 2}, imageSize{2, 2}, imageSize{2, 1}},
+			{"portrait-to-square", imageSize{2, 4}, imageSize{8, 8}, imageSize{4, 8}},
+			{"same-ratio", imageSize{4, 2}, imageSize{8, 4}, imageSize{8, 4}},
+			{"mixed-up-and-down", imageSize{6, 4}, imageSize{4, 8}, imageSize{4, 2}},
+			{"integer-rounding", imageSize{7, 3}, imageSize{5, 5}, imageSize{5, 2}},
+			{"minimum-dimension", imageSize{8, 1}, imageSize{1, 4}, imageSize{1, 1}},
+		} {
+			t.Run(format+"/"+tc.name, func(t *testing.T) {
+				// 非零原点同时验证源图坐标映射。
+				source := image.NewNRGBA(image.Rect(3, 5, 3+tc.source.Width, 5+tc.source.Height))
+				for y := source.Bounds().Min.Y; y < source.Bounds().Max.Y; y++ {
+					for x := source.Bounds().Min.X; x < source.Bounds().Max.X; x++ {
+						source.SetNRGBA(x, y, color.NRGBA{R: 240, A: 255})
+					}
+				}
+				var encoded bytes.Buffer
+				if err := resizeDecodedImage(source, tc.target, format, &encoded, 1<<20); err != nil {
+					t.Fatal(err)
+				}
+				decoded, gotFormat, err := image.Decode(bytes.NewReader(encoded.Bytes()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if gotFormat != format || decoded.Bounds().Dx() != tc.want.Width || decoded.Bounds().Dy() != tc.want.Height {
+					t.Fatalf("got %s %v, want %s %dx%d", gotFormat, decoded.Bounds(), format, tc.want.Width, tc.want.Height)
+				}
+				for y := 0; y < tc.want.Height; y++ {
+					for x := 0; x < tc.want.Width; x++ {
+						r, g, b, a := decoded.At(x, y).RGBA()
+						if a != 0xffff || r < 200*257 || g > 20*257 || b > 20*257 {
+							t.Fatalf("introduced padding or lost content at %d,%d: rgba=%d,%d,%d,%d", x, y, r, g, b, a)
+						}
+					}
+				}
+			})
 		}
 	}
+}
 
-	var pngBytes bytes.Buffer
-	if err := resizeDecodedImage(source, imageSize{2, 2}, "png", &pngBytes, 1<<20); err != nil {
+func TestResizeDecodedImageFitsRequested4KExample(t *testing.T) {
+	source := image.NewNRGBA(image.Rect(0, 0, 1536, 1024))
+	// 左右两侧分别着色，确保完整图像保留，没有居中裁剪。
+	for y := 0; y < 1024; y++ {
+		for x := 0; x < 1536; x++ {
+			pixel := color.NRGBA{R: 240, A: 255}
+			if x >= 768 {
+				pixel = color.NRGBA{B: 240, A: 255}
+			}
+			source.SetNRGBA(x, y, pixel)
+		}
+	}
+	var encoded bytes.Buffer
+	if err := resizeDecodedImage(source, imageSize{3840, 2160}, "png", &encoded, 1<<20); err != nil {
 		t.Fatal(err)
 	}
-	decoded, err := png.Decode(bytes.NewReader(pngBytes.Bytes()))
-	if err != nil || decoded.Bounds().Dx() != 2 || decoded.Bounds().Dy() != 2 {
-		t.Fatalf("resized PNG invalid: bounds=%v err=%v", decoded, err)
-	}
-	if _, _, _, alpha := decoded.At(0, 1).RGBA(); alpha != 0 {
-		t.Fatalf("PNG padding should stay transparent, got alpha=%d", alpha)
-	}
-	if _, _, _, alpha := decoded.At(0, 0).RGBA(); alpha == 0 {
-		t.Fatal("scaled image content was lost")
-	}
-
-	var webpBytes bytes.Buffer
-	if err := resizeDecodedImage(source, imageSize{8, 4}, "webp", &webpBytes, 1<<20); err != nil {
+	decoded, err := png.Decode(bytes.NewReader(encoded.Bytes()))
+	if err != nil {
 		t.Fatal(err)
 	}
-	webpImage, err := nativewebp.Decode(bytes.NewReader(webpBytes.Bytes()))
-	if err != nil || webpImage.Bounds().Dx() != 8 || webpImage.Bounds().Dy() != 4 {
-		t.Fatalf("resized WebP invalid: bounds=%v err=%v", webpImage, err)
+	if decoded.Bounds() != image.Rect(0, 0, 3240, 2160) {
+		t.Fatalf("example output=%v, want 3240x2160", decoded.Bounds())
+	}
+	for _, point := range []image.Point{{0, 0}, {0, 2159}, {3239, 0}, {3239, 2159}} {
+		r, _, b, a := decoded.At(point.X, point.Y).RGBA()
+		if a != 0xffff || (point.X == 0 && r < 200*257) || (point.X == 3239 && b < 200*257) {
+			t.Fatalf("source edge lost or transparent at %v", point)
+		}
+	}
+}
+
+func TestResizeDecodedImagePreservesExistingTransparency(t *testing.T) {
+	for _, format := range []string{"png", "webp"} {
+		t.Run(format, func(t *testing.T) {
+			source := image.NewNRGBA(image.Rect(0, 0, 8, 4))
+			for y := 0; y < 4; y++ {
+				for x := 4; x < 8; x++ {
+					source.SetNRGBA(x, y, color.NRGBA{R: 240, A: 255})
+				}
+			}
+			var encoded bytes.Buffer
+			if err := resizeDecodedImage(source, imageSize{16, 16}, format, &encoded, 1<<20); err != nil {
+				t.Fatal(err)
+			}
+			decoded, _, err := image.Decode(bytes.NewReader(encoded.Bytes()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decoded.Bounds() != image.Rect(0, 0, 16, 8) {
+				t.Fatalf("unexpected canvas: %v", decoded.Bounds())
+			}
+			_, _, _, leftAlpha := decoded.At(0, 0).RGBA()
+			_, _, _, rightAlpha := decoded.At(15, 7).RGBA()
+			if leftAlpha != 0 || rightAlpha != 0xffff {
+				t.Fatalf("source transparency altered: left=%d right=%d", leftAlpha, rightAlpha)
+			}
+		})
 	}
 }
 
