@@ -9,6 +9,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -293,42 +294,93 @@ func (s *session) stream(ctx context.Context, payload any, headers map[string]st
 func (s *session) poll(ctx context.Context, state *streamState) error {
 	parent := ctx
 	ctx, cancel := context.WithTimeout(ctx, s.n.config(ctx).PollTimeout)
-	defer cancel()
+	type result struct {
+		tasks bool
+		data  map[string]any
+		raw   []byte
+		err   error
+	}
+	// 两个来源分别轮询，避免慢会话查询耗尽预算后，任务接口一次也查不到。
+	// 每个来源最多一个在途请求；返回前取消并收拢，不能遗留后台补查。
+	results := make(chan result, 2)
+	var queries sync.WaitGroup
+	for _, path := range []string{"/backend-api/conversation/" + state.ConversationID, "/backend-api/tasks"} {
+		queries.Go(func() {
+			for ctx.Err() == nil {
+				data, raw, err := s.jsonWithRaw(ctx, "GET", path, nil, nil)
+				select {
+				case results <- result{tasks: path == "/backend-api/tasks", data: data, raw: raw, err: err}:
+				case <-ctx.Done():
+					return
+				}
+				timer := time.NewTimer(500 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
+		})
+	}
+	defer func() {
+		cancel()
+		queries.Wait()
+	}()
 	for {
-		data, raw, err := s.jsonWithRaw(ctx, "GET", "/backend-api/conversation/"+state.ConversationID, nil, nil)
-		if err == nil {
-			state.conversation(data)
+		select {
+		case <-ctx.Done():
+			if parent.Err() != nil {
+				return parent.Err()
+			}
+			return uncertainImageResult("结果补查预算耗尽，未拿到图片标识")
+		case result := <-results:
+			if ctx.Err() != nil || result.err != nil {
+				continue
+			}
+			if result.tasks {
+				// 错误和图片都必须匹配当前会话，不能串入其它任务的结果。
+				if err := matchingTaskError(result.data, state.ConversationID); err != nil {
+					err.rawResponse, err.rawResponseTruncated = boundedRawResponse(result.raw)
+					return err
+				}
+				state.taskImages(result.data)
+			} else {
+				state.conversation(result.data)
+			}
 			if state.Blocked {
 				apiErr := Err(400, "content_policy_violation", contentPolicyMessage)
-				apiErr.rawResponse, apiErr.rawResponseTruncated = boundedRawResponse(raw)
+				apiErr.rawResponse, apiErr.rawResponseTruncated = boundedRawResponse(result.raw)
 				return apiErr
 			}
 			if len(state.Refs) > 0 {
 				return nil
 			}
 		}
-		// 只使用匹配当前会话的任务错误，避免把其它请求的审核失败串入本次请求。
-		if ctx.Err() == nil {
-			tasks, raw, e := s.jsonWithRaw(ctx, "GET", "/backend-api/tasks", nil, nil)
-			if e == nil {
-				if error := matchingTaskError(tasks, state.ConversationID); error != nil {
-					error.rawResponse, error.rawResponseTruncated = boundedRawResponse(raw)
-					return error
-				}
-			}
+	}
+}
+
+func (s *streamState) taskImages(v any) {
+	if s.ConversationID == "" {
+		return
+	}
+	switch x := v.(type) {
+	case map[string]any:
+		if str(x["conversation_id"]) == s.ConversationID || str(x["original_conversation_id"]) == s.ConversationID {
+			// 共用角色检查和输入附件排除规则，防止把参考图当成生成结果。
+			s.consumeImageMessage(obj(x["image_gen_message"]))
+			return
 		}
-		timer := time.NewTimer(500 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			if parent.Err() != nil {
-				return parent.Err()
-			}
-			return uncertainImageResult("结果补查预算耗尽，未拿到图片标识")
-		case <-timer.C:
+		for _, value := range x {
+			s.taskImages(value)
+		}
+	case []any:
+		for _, value := range x {
+			s.taskImages(value)
 		}
 	}
 }
+
 func matchingTaskError(v any, cid string) *APIError {
 	switch x := v.(type) {
 	case map[string]any:
