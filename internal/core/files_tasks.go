@@ -76,6 +76,7 @@ func (a *API) publicExport(r *http.Request, t exportTask) exportTask {
 func (a *API) registerExports(m *http.ServeMux) {
 	m.HandleFunc("POST /v1/ppt/generations", a.auth(func(w http.ResponseWriter, r *http.Request) { a.createExport(w, r, "ppt") }))
 	m.HandleFunc("POST /v1/psd/generations", a.auth(func(w http.ResponseWriter, r *http.Request) { a.createExport(w, r, "psd") }))
+	m.HandleFunc("POST /v1/svg/generations", a.auth(func(w http.ResponseWriter, r *http.Request) { a.createExport(w, r, "svg") }))
 	m.HandleFunc("GET /v1/editable-file-tasks", a.auth(a.exportTasks))
 	m.HandleFunc("GET /v1/editable-file-tasks/{id}", a.auth(a.exportTask))
 	m.HandleFunc("GET /files/{name}", a.exportFile)
@@ -454,7 +455,7 @@ func (a *API) exportTasks(w http.ResponseWriter, r *http.Request) {
 func (a *API) exportFile(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	ext := filepath.Ext(name)
-	if len(name) < 36 || filepath.Base(name) != name || strings.ContainsAny(name, "/\\") || (ext != ".pptx" && ext != ".psd" && ext != ".zip") {
+	if len(name) < 36 || filepath.Base(name) != name || strings.ContainsAny(name, "/\\") || (ext != ".pptx" && ext != ".psd" && ext != ".zip" && ext != ".svg") {
 		sendError(w, Err(404, "file_not_found", "文件不存在"))
 		return
 	}
@@ -476,6 +477,9 @@ func (a *API) exportFile(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
-	w.Header().Set("Content-Type", map[string]string{".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation", ".psd": "image/vnd.adobe.photoshop", ".zip": "application/zip"}[ext])
+	w.Header().Set("Content-Type", map[string]string{".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation", ".psd": "image/vnd.adobe.photoshop", ".zip": "application/zip", ".svg": "image/svg+xml"}[ext])
+	if ext == ".svg" {
+		w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'")
+	}
 	http.ServeContent(w, r, name, stat.ModTime(), file)
 }

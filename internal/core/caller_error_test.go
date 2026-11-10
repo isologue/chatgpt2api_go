@@ -44,6 +44,24 @@ func TestCallerFacingErrorLeavesOtherUncertainErrorsAlone(t *testing.T) {
 	}
 }
 
+func TestTotalTimeoutUsesFriendlyCallerError(t *testing.T) {
+	internal := Err(504, "image_total_timeout", "图片请求总预算已耗尽")
+	internal.rawResponse = []byte(`{"error":{"code":"upstream_timeout"}}`)
+	public := callerFacingError(internal)
+	if public.Status != 400 || public.Code != "image_generation_failed" || public.Message != "很抱歉，未能生成图片，请重试" {
+		t.Fatalf("unexpected public error: %+v", public)
+	}
+	if internal.Status != 504 || internal.Code != "image_total_timeout" || internal.Message != "图片请求总预算已耗尽" {
+		t.Fatalf("internal error was mutated: %+v", internal)
+	}
+
+	w := httptest.NewRecorder()
+	sendError(w, public)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "很抱歉，未能生成图片，请重试") {
+		t.Fatalf("unexpected response: %d %s", w.Code, w.Body.String())
+	}
+}
+
 func TestContentPolicyCallerMessageSyncAndStoredAsync(t *testing.T) {
 	const want = "非常抱歉，该提示可能违反了我们的内容政策。如果你认为此判断有误，请重试或修改提示语。"
 	internal := Err(400, "content_policy_violation", "上游安全审核拒绝")

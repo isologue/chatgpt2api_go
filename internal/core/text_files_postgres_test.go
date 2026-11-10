@@ -27,7 +27,69 @@ func (g *fileTestGenerator) Export(ctx context.Context, a Account, kind, prompt 
 	case <-ctx.Done():
 		return fileResult{}, ctx.Err()
 	}
+	if kind == "svg" {
+		return fileResult{ConversationID: "mock-conversation", Primary: "fixture.svg"}, nil
+	}
 	return fileResult{ConversationID: "mock-conversation", Primary: "fixture.pptx", Zip: "fixture.zip"}, nil
+}
+func TestPostgresSVGExportCreateQueryAndIdempotency(t *testing.T) {
+	db := featureDB(t)
+	if _, err := db.db.Exec(context.Background(), "TRUNCATE core_file_tasks"); err != nil {
+		t.Fatal(err)
+	}
+	c := testConfig(t)
+	c.FileConcurrency, c.FileQueueSize = 1, 2
+	c.FileTimeout = 3 * time.Second
+	accounts := testAccounts(1)
+	accounts[0].Extra = map[string]json.RawMessage{"plan_type": json.RawMessage(`"plus"`)}
+	g := &fileTestGenerator{entered: make(chan struct{}, 4), gate: make(chan struct{})}
+	e := NewEngine(c, NewPool(accounts, 1), db, g)
+	defer e.Close()
+	defer close(g.gate)
+	h := NewHandler(e)
+	body := `{"prompt":"a vector diagram","client_task_id":"svg-client-id"}`
+	w := requestJSON(t, h, "POST", "/v1/svg/generations", body, c.APIKey)
+	var task exportTask
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &task) != nil || task.ID == "" || task.Kind != "svg" || task.Status != "queued" {
+		t.Fatal("SVG creation failed", w.Code, w.Body.String())
+	}
+	select {
+	case <-g.entered:
+	case <-time.After(time.Second):
+		t.Fatal("SVG job not started")
+	}
+	w = requestJSON(t, h, "POST", "/v1/svg/generations", body, c.APIKey)
+	if w.Code != 200 || w.Header().Get("Idempotency-Replayed") != "true" || !strings.Contains(w.Body.String(), task.ID) {
+		t.Fatal("SVG task replay failed", w.Code, w.Body.String())
+	}
+	w = requestJSON(t, h, "POST", "/v1/ppt/generations", body, c.APIKey)
+	if w.Code != 409 {
+		t.Fatal("different file kind must conflict", w.Code, w.Body.String())
+	}
+	w = requestJSON(t, h, "GET", "/v1/editable-file-tasks/"+task.ID, "", c.APIKey)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"status":"running"`) {
+		t.Fatal("SVG running status unavailable", w.Code, w.Body.String())
+	}
+	g.gate <- struct{}{}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		w = requestJSON(t, h, "GET", "/v1/editable-file-tasks/"+task.ID, "", c.APIKey)
+		if strings.Contains(w.Body.String(), `"status":"success"`) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var done exportTask
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &done) != nil || done.Status != "success" || done.Result == nil || done.Result.Primary != c.PublicURL+"/files/fixture.svg" || done.Result.Zip != "" || strings.Contains(w.Body.String(), `"zip_url"`) {
+		t.Fatal("SVG completion result invalid", w.Code, w.Body.String())
+	}
+	persisted, err := scanExport(db.db.QueryRow(context.Background(), "SELECT "+exportColumns+" FROM core_file_tasks WHERE id=$1", task.ID))
+	if err != nil || persisted.Kind != "svg" || persisted.Result == nil || persisted.Result.Primary != "fixture.svg" || persisted.Result.Zip != "" {
+		t.Fatal("SVG result not persisted", persisted, err)
+	}
+	if g.calls.Load() != 1 {
+		t.Fatal("SVG idempotency created duplicate jobs", g.calls.Load())
+	}
 }
 func TestPostgresExportQueueIsolationIdempotencyAndRecovery(t *testing.T) {
 	db := featureDB(t)

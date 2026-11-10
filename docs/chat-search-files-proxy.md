@@ -19,6 +19,7 @@ Content-Type: application/json
 | POST /v1/messages | 基础文本 Messages 样式，可用 X-Api-Key；不是完整 Anthropic SDK 兼容实现 |
 | POST /v1/ppt/generations | 创建 PPTX + 素材 ZIP 异步任务 |
 | POST /v1/psd/generations | 创建 PSD + 素材 ZIP 异步任务，必需参考图 |
+| POST /v1/svg/generations | 创建 SVG 矢量文件异步任务，可选参考图，不要求 ZIP |
 | GET /v1/editable-file-tasks/{id} | 查询当前 Key 创建的文件任务 |
 | GET /v1/editable-file-tasks?ids=id1,id2 | 批量查询文件任务，最多 100 个 |
 | GET /v1/editable-file-tasks?before=id | 按创建时间倒序分页，最多 100 条，next_before 是下一页游标 |
@@ -58,7 +59,7 @@ Responses 示例：
 
 /v1/chat/completions 或 /v1/responses 也可传 tools:[{"type":"web_search"}] 开启搜索；web_search_options 同样作为搜索开关，目前不实现其细项。来源根据上游可用 metadata 提取，仅接受 HTTP(S)，去重最多 100 个，缺失时不伪造来源。Sources 位于非流式响应和流式完成事件，不保证内联 citation 标注。搜索会在总预算内进行最终会话补查，补查另受 CORE_METADATA_TIMEOUT 约束。
 
-### PPTX / PSD
+### PPTX / PSD / SVG
 
 ```json
 {"prompt":"做一份关于城市低碳出行的6页演示文稿","client_task_id":"my-ppt-001","base64_images":[]}
@@ -74,7 +75,21 @@ Responses 示例：
 
 同 Key 下 client_task_id 相同且请求内容相同可复用任务（响应 Idempotency-Replayed:true），内容不同返回 409；这是文件接口的幂等字段，和图片 Idempotency-Key 独立。并发准入先于解析与幂等查找，满载时幂等重放也可能返回 429。没有该字段时每次创建新任务。任务所有权隔离，别的 Key 查询不到。文件 URL 跟随公开地址配置/当前请求地址，文件不走 ImageDAV。
 
-生成要求上游实际返回主文件及 ZIP；只返回文字不算成功。下载时有单文件大小限制和 PPTX ZIP 结构/PSD 文件头等基础校验，**不等价于完整验证每页可编辑或每个 PSD 图层质量**。一旦上游已给出会话 ID，失败不切号重新创建长任务，避免重复生成。
+SVG 使用 `POST /v1/svg/generations`，默认模型 `gpt-6`，所选公开模型必须启用 `file` 能力。请求示例：
+
+```json
+{"model":"gpt-6","prompt":"制作320×180的SVG矢量图，浅色背景，一个蓝色圆和一个橙色三角形","client_task_id":"my-svg-001","base64_images":[]}
+```
+
+创建和查询沿用上述文件任务协议，使用 `GET /v1/editable-file-tasks/{id}` 轮询。SVG 成功结果示例（省略时间等公共字段）：
+
+```json
+{"id":"filetask_...","taskId":"filetask_...","kind":"svg","status":"success","result":{"conversation_id":"...","primary_url":"https://your-host/files/uuid.svg"}}
+```
+
+SVG 不要求生成或等待素材 ZIP，结果没有 `zip_url`。只有上游实际生成可下载的 `.svg` 文件并通过完整 XML 解析、SVG 根元素及命名空间校验才算成功；仅返回源码不会假装文件已生成。文件按 `image/svg+xml` 及附件方式下载，并附带限制脚本和外部资源的 CSP。可选 `base64_images` 沿用上述参考图限制，文件任务复用现有并发、队列、超时、单文件大小和账号选择配置，无需新增参数。图片接口传 `output_format:"svg"` 不等价于 SVG 文件接口，仍可能得到位图。
+
+PPTX/PSD 生成要求上游实际返回主文件及 ZIP；只返回文字不算成功。下载时有单文件大小限制和 PPTX ZIP 结构/PSD 文件头等基础校验，**不等价于完整验证每页可编辑或每个 PSD 图层质量**。一旦上游已给出会话 ID，失败不切号重新创建长任务，避免重复生成。
 
 任务状态写 PostgreSQL，输出文件位于图片数据卷的 .exports 目录；重启时未完成任务标记为 server_restarted，不自动重复上游长任务。终态写入会有限重试，数据库持续不可用时可能暂时保持 running，下一次启动恢复会将其标错。文件任务当前记录阶段/切号日志，但不记录原始创建/查询报文。**当前尚无导出文件自动清理，图片保留策略不会清理 .exports，请监控磁盘**。
 

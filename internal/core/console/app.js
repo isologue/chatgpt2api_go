@@ -358,7 +358,8 @@ POST /v1/search
 POST /v1/messages
 POST /v1/ppt/generations
 POST /v1/psd/generations
-GET /v1/editable-file-tasks/{id}</pre></div><p>聊天/Responses 仅支持文本，支持 stream:true SSE；/v1/search 传 prompt，返回 answer 和 sources。PPT/PSD 使用付费账号，传 prompt、可选 client_task_id 和 base64_images 数组（PSD 必填参考图）。文件任务状态为 queued/running/success/error，成功 result 包含 primary_url、zip_url；按任务 ID 轮询，下载链接持有者可直接访问。文件工具和搜索已完成真实上游基础验证；不保证文件最终可编辑质量。</p><p>聊天与文件的并发/预算在「设置 → 聊天与文件生成」调整。独立执行名额仍共享账号槽位、下载、PoW 等资源。代理在「设置 → 代理设置」配置，支持全部直连或全部走代理，可批量填写并测试；同一会话保持所选代理，代理商仍需配置粘性出口。详情见项目 docs/chat-search-files-proxy.md。</p><p>管理员首次登录使用 CORE_ADMIN_KEY；后续可在「设置 → 访问与密钥」修改。图片调用 Key 也在该处管理，首次启动会导入 CORE_API_KEY。管理界面的可在线调整项可直接保存；数据库连接池更改在重启后生效。</p>`,'API REFERENCE');});
+POST /v1/svg/generations
+GET /v1/editable-file-tasks/{id}</pre></div><p>聊天/Responses 仅支持文本，支持 stream:true SSE；/v1/search 传 prompt，返回 answer 和 sources。PPT/PSD/SVG 使用付费账号，传 prompt、可选 client_task_id 和 base64_images 数组（PSD 必填参考图）。文件任务状态为 queued/running/success/error，成功 result 包含 primary_url；PPT/PSD 另含 zip_url，SVG 无需 ZIP；按任务 ID 轮询，下载链接持有者可直接访问。文件结果取决于上游工具执行能力，不保证文件最终可编辑质量。</p><p>聊天与文件的并发/预算在「设置 → 聊天与文件生成」调整。独立执行名额仍共享账号槽位、下载、PoW 等资源。代理在「设置 → 代理设置」配置，支持全部直连或全部走代理，可批量填写并测试；同一会话保持所选代理，代理商仍需配置粘性出口。详情见项目 docs/chat-search-files-proxy.md。</p><p>管理员首次登录使用 CORE_ADMIN_KEY；后续可在「设置 → 访问与密钥」修改。图片调用 Key 也在该处管理，首次启动会导入 CORE_API_KEY。管理界面的可在线调整项可直接保存；数据库连接池更改在重启后生效。</p>`,'API REFERENCE');});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){refreshMetrics();refreshJobs();}});
 window.addEventListener('beforeunload',event=>{if(JSON.stringify(state.draft)!==state.saved&&state.settings.length){event.preventDefault();event.returnValue='';}});
 setText('current-date',new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',month:'long',day:'numeric',weekday:'long'}).format(new Date()));
@@ -781,7 +782,7 @@ async function renderModels(){
  clearTimeout(modelTimer);target.textContent='正在读取模型配置…';
  const current=()=>version===modelVersion&&session===state.sessionVersion&&state.page==='settings'&&state.group==='models'&&state.connected;
  let data,dirty=false;
- const capLabels={image:'图片',chat:'对话',search:'搜索',file:'PPT / PSD'};
+ const capLabels={image:'图片',chat:'对话',search:'搜索',file:'PPT / PSD / SVG'};
  const changeLabels={added:'新增',restored:'已恢复',updated:'已变更',missing:'本次未发现'};
  function status(message,error=false){const el=$('#models-status');if(el){el.textContent=message;el.classList.toggle('model-error',error);}}
  function poll(){clearTimeout(modelTimer);if(current()&&data.refreshing)modelTimer=setTimeout(load,1500);}

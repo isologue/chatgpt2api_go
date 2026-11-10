@@ -24,7 +24,34 @@ type streamState struct {
 	Refs                 []imageRef
 	Blocked, ToolInvoked bool
 	seen                 map[string]bool
+	inputRefs            map[string]bool
 	messageStream        textStream
+}
+
+// 输入附件在 SSE 和会话补查中都可能被回显，整次生成尝试共用排除集合。
+func newImageStreamState(payload any) streamState {
+	s := streamState{inputRefs: map[string]bool{}}
+	for _, value := range array(obj(payload)["messages"]) {
+		message := obj(value)
+		for _, value := range array(obj(message["metadata"])["attachments"]) {
+			attachment := obj(value)
+			for _, key := range []string{"id", "file_id", "library_file_id"} {
+				if id := str(attachment[key]); id != "" {
+					s.inputRefs[id] = true
+				}
+			}
+		}
+		// 只读取图片指针，不把提示词中提及的文件 ID 当成上传附件。
+		for _, value := range array(obj(message["content"])["parts"]) {
+			part := obj(value)
+			var inputs streamState
+			inputs.addRefs(part["asset_pointer"])
+			for _, ref := range inputs.Refs {
+				s.inputRefs[ref.ID] = true
+			}
+		}
+	}
+	return s
 }
 
 const rawResponseLimit = 64 << 10
@@ -58,6 +85,16 @@ func (c *responseCapture) Write(p []byte) (int, error) {
 
 var fileRef = regexp.MustCompile(`file-service://([A-Za-z0-9_-]+)|\b(file_00000000[a-f0-9]{24})\b|sediment://([A-Za-z0-9_-]+)`)
 
+func (s *streamState) isInputRef(id string) bool {
+	for input := range s.inputRefs {
+		// 分段 SSE 可能先回显半个 ID，不能让早期片段残留为候选结果。
+		if strings.HasPrefix(input, id) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *streamState) addRefs(v any) {
 	if s.seen == nil {
 		s.seen = map[string]bool{}
@@ -71,13 +108,25 @@ func (s *streamState) addRefs(v any) {
 			ref = imageRef{ID: m[3], Sediment: true}
 		}
 		key := ref.ID
-		if !s.seen[key] {
+		if !s.isInputRef(key) && !s.seen[key] {
 			s.seen[key] = true
 			s.Refs = append(s.Refs, ref)
 		}
 	}
 }
 func (s *streamState) consume(e map[string]any) {
+	var messages []map[string]any
+	s.applyImageEvent(e, 0, &messages)
+	// 先完整应用同一批补丁，再按最终角色读取正文，避免读到用户附件或元数据。
+	for _, message := range messages {
+		s.consumeImageMessage(message)
+	}
+}
+
+func (s *streamState) applyImageEvent(e map[string]any, depth int, messages *[]map[string]any) {
+	if depth > 32 {
+		return
+	}
 	if id := str(e["conversation_id"]); id != "" {
 		s.ConversationID = id
 	}
@@ -87,19 +136,33 @@ func (s *streamState) consume(e map[string]any) {
 	if str(e["type"]) == "server_ste_metadata" && yes(obj(e["metadata"])["tool_invoked"]) {
 		s.ToolInvoked = true
 	}
+	if str(e["o"]) == "patch" {
+		for _, item := range array(e["v"]) {
+			s.applyImageEvent(obj(item), depth+1, messages)
+		}
+		return
+	}
 	message := obj(e["message"])
 	v := obj(e["v"])
 	if len(message) == 0 {
 		message = obj(v["message"])
 	}
+	replaced := len(message) > 0 || (str(e["p"]) == "/message" && len(v) > 0)
 	// 与文本链路共用 v1 补丁拼装，兼容拒绝文案分段 append / patch 的返回。
 	_ = s.messageStream.applyEvent(e, 0)
-	if len(message) == 0 && (strings.HasPrefix(str(e["p"]), "/message") || str(e["o"]) == "patch" || str(e["v"]) != "") {
+	if len(message) == 0 && (strings.HasPrefix(str(e["p"]), "/message") || str(e["v"]) != "") {
 		message = s.messageStream.message
 	}
 	if id := str(v["conversation_id"]); id != "" {
 		s.ConversationID = id
 	}
+	// 同一消息的所有补丁共享 map，只登记一次，避免重复序列化完整正文。
+	if len(message) > 0 && (replaced || len(*messages) == 0) {
+		*messages = append(*messages, message)
+	}
+}
+
+func (s *streamState) consumeImageMessage(message map[string]any) {
 	role := str(obj(message["author"])["role"])
 	if messagePolicyRejection(message) {
 		s.Blocked = true
@@ -121,25 +184,26 @@ func (s *streamState) consume(e map[string]any) {
 	}
 	if role == "tool" {
 		s.ToolInvoked = true
-		s.addRefs(message)
-	} else if s.ToolInvoked || str(e["o"]) == "patch" {
-		s.addRefs(e)
+	}
+	if role == "tool" || role == "assistant" {
+		s.addRefs(message["content"])
 	}
 }
 func (s *streamState) conversation(v any) {
 	switch x := v.(type) {
 	case map[string]any:
-		if str(obj(x["author"])["role"]) == "user" {
+		if str(obj(x["author"])["role"]) != "" {
+			s.consumeImageMessage(x)
 			return
 		}
-		if messagePolicyRejection(x) {
-			s.Blocked = true
+		if message := obj(x["message"]); len(message) > 0 {
+			s.consumeImageMessage(message)
+			return
 		}
-		if str(obj(x["author"])["role"]) == "tool" {
-			s.addRefs(x)
-		}
-		s.consume(x)
-		for _, v := range x {
+		for key, v := range x {
+			if key == "metadata" || key == "attachments" || key == "content" {
+				continue
+			}
 			s.conversation(v)
 		}
 	case []any:
@@ -149,6 +213,7 @@ func (s *streamState) conversation(v any) {
 	}
 }
 func (s *session) stream(ctx context.Context, payload any, headers map[string]string) (state streamState, resultErr error) {
+	state = newImageStreamState(payload)
 	parent := ctx
 	ctx, cancel := context.WithTimeoutCause(ctx, s.n.config(ctx).SSETimeout, errSSEHardTimeout)
 	defer cancel()

@@ -403,7 +403,17 @@ func callerFacingError(e *APIError) *APIError {
 		public.Message = contentPolicyMessage
 		return &public
 	}
-	if e == nil || e.Code != "image_result_uncertain" || e.Message != "结果补查预算耗尽，未拿到图片标识" {
+	if e == nil {
+		return e
+	}
+	if e.Code == "image_total_timeout" {
+		public := *e
+		public.Status = http.StatusBadRequest
+		public.Code = "image_generation_failed"
+		public.Message = "很抱歉，未能生成图片，请重试"
+		return &public
+	}
+	if e.Code != "image_result_uncertain" || e.Message != "结果补查预算耗尽，未拿到图片标识" {
 		return e
 	}
 	public := *e

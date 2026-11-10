@@ -20,15 +20,15 @@ import (
 type fileResult struct {
 	ConversationID string `json:"conversation_id"`
 	Primary        string `json:"primary_url"`
-	Zip            string `json:"zip_url"`
+	Zip            string `json:"zip_url,omitempty"`
 }
 type fileGenerator interface {
 	Export(context.Context, Account, string, string, []editInput, map[string]float64) (fileResult, error)
 }
 type exportRef struct{ ID, MessageID, Sandbox, Name string }
 
-var sandboxFileRE = regexp.MustCompile(`sandbox:(/mnt/data/[^\s"<>\[\]]+?\.(?:pptx|psd|zip))`)
-var namedAssetFileRE = regexp.MustCompile(`\[([^\]\r\n]+\.(?:pptx|psd|zip))\]\((?:file-service|sediment)://([a-zA-Z0-9_-]+)\)`)
+var sandboxFileRE = regexp.MustCompile(`(?i)sandbox:(/mnt/data/[^\s"<>\[\]]+?\.(?:pptx|psd|zip|svg))`)
+var namedAssetFileRE = regexp.MustCompile(`(?i)\[([^\]\r\n]+\.(?:pptx|psd|zip|svg))\]\((?:file-service|sediment)://([a-zA-Z0-9_-]+)\)`)
 
 func exportRefs(v any) []exportRef {
 	var refs []exportRef
@@ -36,7 +36,7 @@ func exportRefs(v any) []exportRef {
 	var walk func(any, string, int)
 	add := func(r exportRef) {
 		ext := strings.ToLower(filepath.Ext(r.Name))
-		if ext != ".pptx" && ext != ".psd" && ext != ".zip" {
+		if ext != ".pptx" && ext != ".psd" && ext != ".zip" && ext != ".svg" {
 			return
 		}
 		key := r.ID + "|" + r.MessageID + "|" + r.Sandbox
@@ -133,6 +133,19 @@ func (s *session) resolveExport(ctx context.Context, cid string, r exportRef) (s
 }
 func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inputs []editInput, stages map[string]float64) (fileResult, error) {
 	result := fileResult{}
+	extension := ".pptx"
+	instruction := "生成5至6页精美的产品介绍PPT。先设计各页，拆分图像与形状素材为独立透明PNG，再还原为可编辑PPTX，文字必须可编辑。必须使用工具实际生成并提供可下载的 .pptx 主文件与包含全部素材的 .zip 文件，不能仅提供制作说明。"
+	switch kind {
+	case "ppt":
+	case "psd":
+		extension = ".psd"
+		instruction = "将参考图片还原为分层可编辑的PSD。图像、背景、文字等元素保持原位置，各图层去掉多余白底。必须使用工具实际生成并提供可下载的 .psd 主文件与图层素材 .zip 文件，不能仅提供制作说明。"
+	case "svg":
+		extension = ".svg"
+		instruction = "根据用户需求制作 SVG 矢量图，可以使用参考图片。必须使用工具实际创建 UTF-8 编码、以 svg 为根元素且带有 http://www.w3.org/2000/svg 命名空间的 .svg 文件，并在最终回复中提供该文件的下载链接，不能仅返回 SVG 源码或制作说明。使用可编辑的矢量形状、路径和文字，不要用嵌入的位图代替矢量图，不要包含脚本或外部资源。只需要 .svg 主文件，无需生成 ZIP。"
+	default:
+		return result, Err(400, "invalid_file_kind", "不支持的文件生成类型")
+	}
 	start := time.Now()
 	a, err := n.checkAccount(ctx, a, false)
 	n.measure(stages, "账号校验", start)
@@ -141,10 +154,6 @@ func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inp
 	}
 	s := n.session(a)
 	defer s.close()
-	instruction := "生成5至6页精美的产品介绍PPT。先设计各页，拆分图像与形状素材为独立透明PNG，再还原为可编辑PPTX，文字必须可编辑。必须使用工具实际生成并提供可下载的 .pptx 主文件与包含全部素材的 .zip 文件，不能仅提供制作说明。"
-	if kind == "psd" {
-		instruction = "将参考图片还原为分层可编辑的PSD。图像、背景、文字等元素保持原位置，各图层去掉多余白底。必须使用工具实际生成并提供可下载的 .psd 主文件与图层素材 .zip 文件，不能仅提供制作说明。"
-	}
 	prompt = instruction + "\n\n用户需求：\n" + prompt
 	target, _ := ctx.Value(fileModelKey{}).(string)
 	in := textInput{UpstreamModel: target, Model: "gpt-6", Messages: []textMessage{{Role: "user", Content: prompt}}, File: true, Inputs: inputs}
@@ -199,10 +208,6 @@ func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inp
 	}
 	start = time.Now()
 	defer n.measure(stages, "文件结果补查与下载", start)
-	extension := ".pptx"
-	if kind == "psd" {
-		extension = ".psd"
-	}
 	for {
 		v, err := s.json(ctx, "GET", "/backend-api/conversation/"+url.PathEscape(result.ConversationID), nil, nil)
 		if err != nil {
@@ -219,7 +224,7 @@ func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inp
 				archive = &refs[i]
 			}
 		}
-		if primary != nil && archive != nil {
+		if primary != nil && (kind == "svg" || archive != nil) {
 			target, err := s.resolveExport(ctx, result.ConversationID, *primary)
 			if err != nil {
 				return result, err
@@ -227,6 +232,9 @@ func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inp
 			result.Primary, err = s.downloadExport(ctx, target, extension)
 			if err != nil {
 				return result, err
+			}
+			if kind == "svg" {
+				return result, nil
 			}
 			keep := false
 			defer func() {
@@ -336,6 +344,9 @@ func (s *session) downloadExport(ctx context.Context, target, extension string) 
 	return name, nil
 }
 func validateExport(path, extension string) error {
+	if extension == ".svg" {
+		return validateSVG(path)
+	}
 	if extension == ".psd" {
 		f, e := os.Open(path)
 		if e != nil {
