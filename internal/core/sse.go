@@ -21,9 +21,13 @@ type streamState struct {
 	Text                 string
 	RawResponse          string
 	RawResponseTruncated bool
+	Diagnostics          *StreamDiagnostics
+	PollDiagnostics      *PollDiagnostics
 	ConversationID       string
 	Refs                 []imageRef
 	Blocked, ToolInvoked bool
+	ToolError            *APIError
+	toolErrorPending     bool
 	seen                 map[string]bool
 	inputRefs            map[string]bool
 	messageStream        textStream
@@ -67,9 +71,11 @@ func boundedRawResponse(raw []byte) ([]byte, bool) {
 type responseCapture struct {
 	data      bytes.Buffer
 	truncated bool
+	total     int64
 }
 
 func (c *responseCapture) Write(p []byte) (int, error) {
+	c.total += int64(len(p))
 	remaining := rawResponseLimit - c.data.Len()
 	if remaining > 0 {
 		if len(p) > remaining {
@@ -186,6 +192,11 @@ func (s *streamState) consumeImageMessage(message map[string]any) {
 	if role == "tool" {
 		s.ToolInvoked = true
 	}
+	if err := imageToolRateLimit(message); err != nil {
+		s.ToolError = err
+		// 分段错误先等待消息完成，避免只收到错误名就丢失后续的恢复时间。
+		s.toolErrorPending = str(message["status"]) == "in_progress"
+	}
 	if role == "tool" || role == "assistant" {
 		s.addRefs(message["content"])
 	}
@@ -215,6 +226,24 @@ func (s *streamState) conversation(v any) {
 }
 func (s *session) stream(ctx context.Context, payload any, headers map[string]string) (state streamState, resultErr error) {
 	state = newImageStreamState(payload)
+	diagnostics := &StreamDiagnostics{StartedAt: time.Now(), EndReason: "eof"}
+	state.Diagnostics = diagnostics
+	defer func() {
+		diagnostics.DurationMS = float64(time.Since(diagnostics.StartedAt).Microseconds()) / 1000
+		diagnostics.HasConversation = state.ConversationID != ""
+		diagnostics.ImageRefs = len(state.Refs)
+		diagnostics.ToolInvoked, diagnostics.PolicyRejected = state.ToolInvoked, state.Blocked
+		switch {
+		case errors.Is(resultErr, errSSEHardTimeout):
+			diagnostics.EndReason = "hard_timeout"
+		case errors.Is(resultErr, context.Canceled):
+			diagnostics.EndReason = "request_cancelled"
+		case errors.Is(resultErr, context.DeadlineExceeded):
+			diagnostics.EndReason = "parent_timeout"
+		case resultErr != nil:
+			diagnostics.EndReason = AsError(resultErr).Code
+		}
+	}()
 	parent := ctx
 	ctx, cancel := context.WithTimeoutCause(ctx, s.n.config(ctx).SSETimeout, errSSEHardTimeout)
 	defer cancel()
@@ -229,6 +258,7 @@ func (s *session) stream(ctx context.Context, payload any, headers map[string]st
 		return state, RetryError("sse_transport_failed", "上游生成流连接失败")
 	}
 	defer resp.Body.Close()
+	diagnostics.HTTPStatus = resp.StatusCode
 	if resp.StatusCode != 200 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return state, upstreamError(resp.StatusCode, raw)
@@ -241,6 +271,7 @@ func (s *session) stream(ctx context.Context, payload any, headers map[string]st
 	defer func() {
 		state.RawResponse = capture.data.String()
 		state.RawResponseTruncated = capture.truncated
+		diagnostics.Bytes = capture.total
 	}()
 	scanner := bufio.NewScanner(io.LimitReader(io.TeeReader(resp.Body, capture), 32<<20))
 	scanner.Buffer(make([]byte, 4096), 2<<20)
@@ -249,12 +280,21 @@ func (s *session) stream(ctx context.Context, payload any, headers map[string]st
 		data := strings.TrimSpace(event.String())
 		event.Reset()
 		if data == "[DONE]" {
+			diagnostics.EndReason = "done"
+			diagnostics.event(nil, &state, len(data), "done")
 			return true
 		}
 		if data != "" {
 			var value map[string]any
 			if json.Unmarshal([]byte(data), &value) == nil {
 				state.consume(value)
+				diagnostics.event(value, &state, len(data), "")
+				if state.ToolError != nil && !state.toolErrorPending && !state.Blocked && len(state.Refs) == 0 {
+					return true
+				}
+			} else {
+				diagnostics.InvalidEvents++
+				diagnostics.event(nil, &state, len(data), "invalid_json")
 			}
 		}
 		return false
@@ -263,6 +303,9 @@ func (s *session) stream(ctx context.Context, payload any, headers map[string]st
 		line := strings.TrimSuffix(scanner.Text(), "\r")
 		if line == "" {
 			if consume() {
+				if state.ToolError != nil && !state.Blocked && len(state.Refs) == 0 {
+					return state, state.ToolError
+				}
 				return state, nil
 			}
 			continue
@@ -280,6 +323,9 @@ func (s *session) stream(ctx context.Context, payload any, headers map[string]st
 	if event.Len() > 0 {
 		consume()
 	}
+	if state.ToolError != nil && !state.Blocked && len(state.Refs) == 0 {
+		return state, state.ToolError
+	}
 	if ctx.Err() != nil || scanner.Err() != nil {
 		if errors.Is(context.Cause(ctx), errSSEHardTimeout) {
 			return state, errSSEHardTimeout
@@ -291,26 +337,43 @@ func (s *session) stream(ctx context.Context, payload any, headers map[string]st
 	}
 	return state, nil
 }
-func (s *session) poll(ctx context.Context, state *streamState) error {
+func (s *session) poll(ctx context.Context, state *streamState) (resultErr error) {
 	parent := ctx
-	ctx, cancel := context.WithTimeout(ctx, s.n.config(ctx).PollTimeout)
+	timeout := s.n.config(ctx).PollTimeout
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	diagnostics := &PollDiagnostics{StartedAt: time.Now(), ConfiguredTimeoutMS: timeout.Milliseconds()}
+	state.PollDiagnostics = diagnostics
+	conversationID := state.ConversationID
 	type result struct {
-		tasks bool
-		data  map[string]any
-		raw   []byte
-		err   error
+		tasks  bool
+		source string
+		data   map[string]any
+		raw    []byte
+		err    error
 	}
 	// 两个来源分别轮询，避免慢会话查询耗尽预算后，任务接口一次也查不到。
 	// 每个来源最多一个在途请求；返回前取消并收拢，不能遗留后台补查。
 	results := make(chan result, 2)
 	var queries sync.WaitGroup
 	for _, path := range []string{"/backend-api/conversation/" + state.ConversationID, "/backend-api/tasks"} {
+		source := &PollSourceDiagnostics{Source: "conversation"}
+		if path == "/backend-api/tasks" {
+			source.Source = "tasks"
+		}
+		diagnostics.Sources = append(diagnostics.Sources, source)
 		queries.Go(func() {
 			for ctx.Err() == nil {
-				data, raw, err := s.jsonWithRaw(ctx, "GET", path, nil, nil)
+				source.Requests++
+				started := time.Now()
+				data, raw, status, err := s.jsonWithStatus(ctx, "GET", path, nil, nil)
+				source.record(ctx, started, status, raw, data, err, conversationID)
 				select {
-				case results <- result{tasks: path == "/backend-api/tasks", data: data, raw: raw, err: err}:
+				case results <- result{tasks: path == "/backend-api/tasks", source: source.Source, data: data, raw: raw, err: err}:
 				case <-ctx.Done():
+					return
+				}
+				// 已明确限流的查询来源停止重试，仍允许另一个来源找回已生成的图。
+				if err != nil && AsError(err).RateLimited {
 					return
 				}
 				timer := time.NewTimer(500 * time.Millisecond)
@@ -326,22 +389,61 @@ func (s *session) poll(ctx context.Context, state *streamState) error {
 	defer func() {
 		cancel()
 		queries.Wait()
+		diagnostics.DurationMS = float64(time.Since(diagnostics.StartedAt).Microseconds()) / 1000
+		diagnostics.ImageRefs = len(state.Refs)
+		switch {
+		case resultErr == nil:
+			diagnostics.Outcome = "image_found"
+		case errors.Is(resultErr, context.Canceled):
+			diagnostics.Outcome = "request_cancelled"
+		case errors.Is(resultErr, context.DeadlineExceeded):
+			diagnostics.Outcome = "parent_timeout"
+		case AsError(resultErr).Code == "image_result_uncertain":
+			diagnostics.Outcome = "timeout"
+		default:
+			diagnostics.Outcome = AsError(resultErr).Code
+		}
+		// 各来源仅由各自的查询协程写入；退出并收拢后才补最终命中类型。
+		for _, source := range diagnostics.Sources {
+			if source.Source == diagnostics.ImageSource && source.LastResponse != nil {
+				source.LastResponse.ResultType = "image_found"
+			}
+		}
 	}()
+	var rateLimit *APIError
+	limitedSources := 0
 	for {
 		select {
 		case <-ctx.Done():
 			if parent.Err() != nil {
 				return parent.Err()
 			}
+			if rateLimit != nil {
+				return rateLimit
+			}
 			return uncertainImageResult("结果补查预算耗尽，未拿到图片标识")
 		case result := <-results:
-			if ctx.Err() != nil || result.err != nil {
+			if ctx.Err() != nil {
+				continue
+			}
+			if result.err != nil {
+				if ae := AsError(result.err); ae.RateLimited {
+					if rateLimit == nil || ae.RateLimitedUntil.After(rateLimit.RateLimitedUntil) {
+						rateLimit = ae
+					}
+					limitedSources++
+					if limitedSources == len(diagnostics.Sources) {
+						return rateLimit
+					}
+				}
 				continue
 			}
 			if result.tasks {
 				// 错误和图片都必须匹配当前会话，不能串入其它任务的结果。
 				if err := matchingTaskError(result.data, state.ConversationID); err != nil {
-					err.rawResponse, err.rawResponseTruncated = boundedRawResponse(result.raw)
+					if len(err.rawResponse) == 0 {
+						err.rawResponse, err.rawResponseTruncated = boundedRawResponse(result.raw)
+					}
 					return err
 				}
 				state.taskImages(result.data)
@@ -354,7 +456,11 @@ func (s *session) poll(ctx context.Context, state *streamState) error {
 				return apiErr
 			}
 			if len(state.Refs) > 0 {
+				diagnostics.ImageSource = result.source
 				return nil
+			}
+			if state.ToolError != nil && !state.toolErrorPending {
+				return state.ToolError
 			}
 		}
 	}
@@ -388,6 +494,9 @@ func matchingTaskError(v any, cid string) *APIError {
 			m := obj(x["image_gen_message"])
 			if messagePolicyRejection(m) || policyError(x["error"]) || policyError(x["metadata"]) {
 				return Err(400, "content_policy_violation", contentPolicyMessage)
+			}
+			if err := imageToolRateLimit(m); err != nil && str(m["status"]) != "in_progress" {
+				return err
 			}
 			if yes(obj(m["metadata"])["is_error"]) && str(obj(m["author"])["role"]) == "assistant" {
 				content := obj(m["content"])

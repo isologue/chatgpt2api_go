@@ -154,6 +154,8 @@ func TestJSONEditValidationAndCleanup(t *testing.T) {
 		{"empty URL", `{"prompt":"edit","images":[{}]}`, "invalid_image_url", 400, false},
 		{"local file", `{"prompt":"edit","images":[{"image_url":"file:///tmp/test.png"}]}`, "invalid_image_url", 400, false},
 		{"userinfo URL", `{"prompt":"edit","images":[{"image_url":"http://name:pass@example.invalid/test.png"}]}`, "invalid_image_url", 400, false},
+		{"nested local file", `{"prompt":"edit","images":[{"image_url":{"url":"file:///tmp/test.png"}}]}`, "invalid_image_url", 400, false},
+		{"nested userinfo URL", `{"prompt":"edit","images":[{"image_url":{"url":"http://name:pass@example.invalid/test.png"}}]}`, "invalid_image_url", 400, false},
 		{"bad n", `{"n":0,"prompt":"edit","images":[` + validImage + `]}`, "invalid_n", 400, false},
 		{"unknown model", `{"model":"unknown","prompt":"edit","images":[` + validImage + `]}`, "unsupported_model", 400, false},
 		{"empty prompt", `{"images":[` + validImage + `]}`, "invalid_prompt", 400, false},

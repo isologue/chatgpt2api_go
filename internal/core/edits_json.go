@@ -30,6 +30,39 @@ type editJSONImage struct {
 	MIMEType2 string `json:"mimeType"`
 }
 
+// 兼容 OpenAI 风格的 image_url 对象；只读取 url，不接收调用方提供的鉴权信息。
+func (i *editJSONImage) UnmarshalJSON(raw []byte) error {
+	type plain editJSONImage
+	var value struct {
+		*plain
+		ImageURL json.RawMessage `json:"image_url"`
+	}
+	decoded := plain{}
+	value.plain = &decoded
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	link := bytes.TrimSpace(value.ImageURL)
+	if len(link) > 0 && !bytes.Equal(link, []byte("null")) {
+		if link[0] == '{' {
+			var nested struct {
+				URL string `json:"url"`
+			}
+			if err := json.Unmarshal(link, &nested); err != nil {
+				return err
+			}
+			if strings.TrimSpace(nested.URL) == "" {
+				return errors.New("image_url object requires a non-empty url string")
+			}
+			decoded.ImageURL = nested.URL
+		} else if err := json.Unmarshal(link, &decoded.ImageURL); err != nil {
+			return err
+		}
+	}
+	*i = editJSONImage(decoded)
+	return nil
+}
+
 func (i editJSONImage) link() string {
 	if value := strings.TrimSpace(i.ImageURL); value != "" {
 		return value

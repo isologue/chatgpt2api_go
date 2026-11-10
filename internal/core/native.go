@@ -477,6 +477,11 @@ func (n *Native) generateOnce(ctx context.Context, a Account, r Request, stages 
 	payload["messages"] = []any{map[string]any{"id": message, "author": map[string]string{"role": "user"}, "create_time": float64(time.Now().UnixMilli()) / 1000, "content": content, "metadata": metadata}}
 	start = time.Now()
 	state, streamErr := s.stream(ctx, payload, headers)
+	// 本地持有指针，流硬超时恢复预算后也不丢失当前尝试的诊断。
+	if diagnostics, ok := ctx.Value(imageDiagnosticsKey{}).(*ImageDiagnostics); ok {
+		diagnostics.Stream = state.Diagnostics
+		defer func() { diagnostics.Poll = state.PollDiagnostics }()
+	}
 	n.measure(stages, "上游生成流", start)
 	hardTimeout := errors.Is(streamErr, errSSEHardTimeout)
 	if hardTimeout {
@@ -492,6 +497,15 @@ func (n *Native) generateOnce(ctx context.Context, a Account, r Request, stages 
 	}
 	if state.Blocked {
 		return nil, withRawResponse(Err(400, "content_policy_violation", contentPolicyMessage), state)
+	}
+	if len(state.Refs) == 0 {
+		if state.ToolError != nil {
+			return nil, withRawResponse(state.ToolError, state)
+		}
+		// HTTP 层的明确限流同样无需补查，直接交由账号池结算和切号。
+		if streamErr != nil && AsError(streamErr).RateLimited {
+			return nil, withRawResponse(streamErr, state)
+		}
 	}
 	// 先补查原会话；只有实际生成流硬超时才豁免总预算，阶段时限与取消继续生效。
 	if len(state.Refs) == 0 && state.ConversationID != "" {

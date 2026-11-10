@@ -90,6 +90,19 @@ func TestPollIndependentSourcesRecoverAndCancelSlowQuery(t *testing.T) {
 			if slow == "conversation" && taskQueries.Load() < 2 {
 				t.Fatal("task source did not keep polling independently")
 			}
+			diagnostics := attempts[0].Diagnostics
+			if diagnostics == nil || diagnostics.Stream == nil || diagnostics.Stream.EndReason != "done" || diagnostics.Poll == nil || diagnostics.Poll.Outcome != "image_found" || diagnostics.Poll.ImageSource == slow {
+				t.Fatalf("missing successful recovery diagnostics: %+v", diagnostics)
+			}
+			for _, source := range diagnostics.Poll.Sources {
+				if source.Source == slow {
+					if source.Requests != 1 || source.CanceledRequests != 1 || source.Errors != 0 {
+						t.Fatalf("successful recovery cancellation misreported: %+v", source)
+					}
+				} else if source.SuccessfulResponses == 0 || source.LastHTTPStatus != 200 || source.LastResponse.ResultType != "image_found" {
+					t.Fatalf("missing successful source response: %+v", source)
+				}
+			}
 			select {
 			case <-slowFinished:
 			case <-time.After(time.Second):
@@ -126,7 +139,8 @@ func TestPollCancelsAllQueriesOnBudgetAndCallerCancellation(t *testing.T) {
 			s := n.session(testAccounts(1)[0])
 			defer s.close()
 			done := make(chan error, 1)
-			go func() { done <- s.poll(ctx, &streamState{ConversationID: "current"}) }()
+			state := streamState{ConversationID: "current"}
+			go func() { done <- s.poll(ctx, &state) }()
 			for i := 0; i < 2; i++ {
 				select {
 				case <-started:
@@ -148,6 +162,18 @@ func TestPollCancelsAllQueriesOnBudgetAndCallerCancellation(t *testing.T) {
 				}
 			case <-time.After(time.Second):
 				t.Fatal("polling did not stop within its budget")
+			}
+			wantOutcome := "timeout"
+			if cancelCaller {
+				wantOutcome = "request_cancelled"
+			}
+			if state.PollDiagnostics == nil || state.PollDiagnostics.Outcome != wantOutcome {
+				t.Fatalf("wrong final cancellation diagnostics: %+v", state.PollDiagnostics)
+			}
+			for _, source := range state.PollDiagnostics.Sources {
+				if source.Requests != 1 || source.CanceledRequests != 1 || source.Errors != 0 {
+					t.Fatalf("canceled source not accounted: %+v", source)
+				}
 			}
 			for i := 0; i < 2; i++ {
 				select {

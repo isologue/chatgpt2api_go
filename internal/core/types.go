@@ -234,6 +234,7 @@ type Attempt struct {
 	Code                    string             `json:"code,omitempty"`
 	RawResponse             string             `json:"raw_response,omitempty"`
 	RawResponseTruncated    bool               `json:"raw_response_truncated,omitempty"`
+	Diagnostics             *ImageDiagnostics  `json:"diagnostics,omitempty"`
 	Stages                  map[string]float64 `json:"stages_ms,omitempty"`
 }
 type Task struct {

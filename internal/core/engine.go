@@ -452,7 +452,8 @@ func (e *Engine) generate(ctx context.Context, r Request) (*Generation, []Attemp
 			excluded[a.ID] = true
 			start := time.Now()
 			stages := map[string]float64{}
-			images, err := e.safeGenerate(ctx, a, r, stages)
+			diagnostics := &ImageDiagnostics{}
+			images, err := e.safeGenerate(context.WithValue(ctx, imageDiagnosticsKey{}, diagnostics), a, r, stages)
 			if e.resources != nil && len(images) > 0 {
 				names := make([]string, 0, len(images))
 				for _, im := range images {
@@ -477,6 +478,9 @@ func (e *Engine) generate(ctx context.Context, r Request) (*Generation, []Attemp
 				ae = RetryError("no_image_generated", "上游未生成图片")
 			}
 			at := Attempt{AccountID: a.ID, Email: a.Email, Started: start, DurationMS: time.Since(start).Milliseconds(), Stages: stages, TotalBudgetExemptReason: imageBudgetExemptReason(ctx)}
+			if diagnostics.Stream != nil || diagnostics.Poll != nil {
+				at.Diagnostics = diagnostics
+			}
 			if ae != nil {
 				at.Code = ae.Code
 				at.HTTPStatus = ae.Status

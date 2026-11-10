@@ -198,38 +198,44 @@ func (s *session) json(ctx context.Context, method, path string, payload any, ex
 }
 
 func (s *session) jsonWithRaw(ctx context.Context, method, path string, payload any, extra map[string]string) (map[string]any, []byte, error) {
+	data, raw, _, err := s.jsonWithStatus(ctx, method, path, payload, extra)
+	return data, raw, err
+}
+
+// 状态码取自真实上游响应，不能用映射后的 APIError.Status 代替。
+func (s *session) jsonWithStatus(ctx context.Context, method, path string, payload any, extra map[string]string) (map[string]any, []byte, int, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.n.config(ctx).MetadataTimeout)
 	defer cancel()
 	resp, err := s.request(ctx, method, path, payload, extra)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, nil, RetryError("upstream_metadata_timeout", "上游元数据请求超时")
+			return nil, nil, 0, RetryError("upstream_metadata_timeout", "上游元数据请求超时")
 		}
 		if ae, ok := err.(*APIError); ok {
-			return nil, nil, ae
+			return nil, nil, 0, ae
 		}
-		return nil, nil, RetryError("upstream_transport_failed", "上游连接失败")
+		return nil, nil, 0, RetryError("upstream_transport_failed", "上游连接失败")
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20+1))
 	if err != nil {
-		return nil, nil, RetryError("upstream_read_failed", "读取上游响应失败")
+		return nil, nil, resp.StatusCode, RetryError("upstream_read_failed", "读取上游响应失败")
 	}
 	if len(raw) > 8<<20 {
 		apiErr := RetryError("upstream_response_too_large", "上游响应过大")
 		apiErr.rawResponse, apiErr.rawResponseTruncated = boundedRawResponse(raw)
-		return nil, raw, apiErr
+		return nil, raw, resp.StatusCode, apiErr
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, raw, upstreamError(resp.StatusCode, raw, resp.Header)
+		return nil, raw, resp.StatusCode, upstreamError(resp.StatusCode, raw, resp.Header)
 	}
 	var data map[string]any
 	if json.Unmarshal(raw, &data) != nil {
 		apiErr := RetryError("upstream_invalid_json", "上游返回了无效 JSON")
 		apiErr.rawResponse, apiErr.rawResponseTruncated = boundedRawResponse(raw)
-		return nil, raw, apiErr
+		return nil, raw, resp.StatusCode, apiErr
 	}
-	return data, raw, nil
+	return data, raw, resp.StatusCode, nil
 }
 func upstreamError(status int, raw []byte, headers ...http.Header) *APIError {
 	var data map[string]any
