@@ -97,7 +97,7 @@ ALTER TABLE core_request_payloads ADD COLUMN IF NOT EXISTS request_bytes bigint 
 `
 
 func (s *Postgres) Migrate(ctx context.Context) error {
-	_, err := s.db.Exec(ctx, schema+accountGroupsSchema)
+	_, err := s.db.Exec(ctx, schema+accountGroupsSchema+accountImportTimeSchema)
 	return err
 }
 

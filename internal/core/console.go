@@ -155,12 +155,13 @@ func (a *API) consoleConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 type consoleQuery struct {
-	Limit                  int
-	Search, Status, Cursor string
-	Async, Format          string
-	GroupID                string
-	KeyID                  string
-	From, To               *time.Time
+	Limit                    int
+	Search, Status, Cursor   string
+	Async, Format            string
+	GroupID                  string
+	KeyID                    string
+	From, To                 *time.Time
+	ImportedFrom, ImportedTo *time.Time
 }
 type consoleReader interface {
 	ConsoleAccounts(context.Context, consoleQuery) (map[string]any, error)
@@ -177,6 +178,11 @@ func readConsoleQuery(r *http.Request) (consoleQuery, error) {
 		}
 		q.Limit = n
 	}
+	imported, err := parseAccountImportRange(r.URL.Query().Get("imported_from"), r.URL.Query().Get("imported_to"))
+	if err != nil {
+		return q, err
+	}
+	q.ImportedFrom, q.ImportedTo = imported.From, imported.To
 	q.GroupID = r.URL.Query().Get("group_id")
 	if len(q.GroupID) > 256 {
 		return q, Err(400, "invalid_group", "分组 ID 过长")

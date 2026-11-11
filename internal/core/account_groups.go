@@ -311,7 +311,7 @@ func (a *API) runGroupMove(s *Postgres, j *adminJob, ids []string, all bool, q c
 			break
 		}
 		page := []string{}
-		ctx, cancel := context.WithTimeout(withSelectionGroup(a.Engine.root, q.GroupID), 15*time.Second)
+		ctx, cancel := context.WithTimeout(withAccountQuery(a.Engine.root, q), 15*time.Second)
 		var err error
 		if all {
 			page, err = s.AccountIDsMatching(ctx, cursor, 200, q.Search, q.Status)
@@ -373,19 +373,25 @@ func (a *API) moveAccountGroup(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		IDs         []string `json:"ids"`
 		AllMatching bool     `json:"all_matching"`
-		Search      string   `json:"q"`
-		Status      string   `json:"status"`
-		GroupID     string   `json:"group_id"`
-		Target      string   `json:"target_group_id"`
+		accountImportDates
+		Search  string `json:"q"`
+		Status  string `json:"status"`
+		GroupID string `json:"group_id"`
+		Target  string `json:"target_group_id"`
 	}
 	if !decodeAdmin(w, r, &in, 4<<20) {
+		return
+	}
+	imported, importErr := parseAccountImportRange(in.ImportedFrom, in.ImportedTo)
+	if importErr != nil {
+		sendError(w, AsError(importErr))
 		return
 	}
 	if in.Target == "" || len(in.Target) > 256 || !validGroupSelection(in.IDs, in.AllMatching, in.Search, in.Status, in.GroupID) {
 		sendError(w, Err(400, "invalid_selection", "请选择账号和目标分组，或选择全部筛选结果"))
 		return
 	}
-	ctx, cancel := context.WithTimeout(withSelectionGroup(r.Context(), in.GroupID), 5*time.Second)
+	ctx, cancel := context.WithTimeout(withAccountImportRange(withSelectionGroup(r.Context(), in.GroupID), imported), 5*time.Second)
 	defer cancel()
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -412,7 +418,7 @@ func (a *API) moveAccountGroup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a.startAdminJob(w, r, s, j, func(j *adminJob) {
-		a.runGroupMove(s, j, uniqueAccountIDs(in.IDs), in.AllMatching, consoleQuery{Search: in.Search, Status: in.Status, GroupID: in.GroupID}, in.Target, "")
+		a.runGroupMove(s, j, uniqueAccountIDs(in.IDs), in.AllMatching, consoleQuery{Search: in.Search, Status: in.Status, GroupID: in.GroupID, ImportedFrom: imported.From, ImportedTo: imported.To}, in.Target, "")
 	})
 }
 func (a *API) deleteAccountGroup(w http.ResponseWriter, r *http.Request) {
@@ -505,7 +511,7 @@ func (a *API) countAccountSelection(w http.ResponseWriter, r *http.Request) {
 		sendError(w, Err(400, "invalid_selection", "账号筛选无效"))
 		return
 	}
-	ctx, cancel := context.WithTimeout(withSelectionGroup(r.Context(), q.GroupID), 5*time.Second)
+	ctx, cancel := context.WithTimeout(withAccountQuery(r.Context(), q), 5*time.Second)
 	defer cancel()
 	total, err := s.AccountCountMatching(ctx, q.Search, q.Status)
 	if err != nil {

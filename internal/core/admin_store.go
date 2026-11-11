@@ -148,7 +148,9 @@ func (s *Postgres) AccountIDs(ctx context.Context, after string, limit int) ([]s
 	return ids, rows.Err()
 }
 func (s *Postgres) AccountIDsMatching(ctx context.Context, after string, limit int, search, status string) ([]string, error) {
-	rows, err := s.db.Query(ctx, `SELECT id FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%')`+availabilitySQL("3")+accountGroupSQL(selectionGroup(ctx), "5")+` ORDER BY id LIMIT $4`, after, search, status, limit, selectionGroup(ctx))
+	args := []any{after, search, status, limit, selectionGroup(ctx)}
+	importClause := accountImportSQL(selectedAccountImportRange(ctx), &args)
+	rows, err := s.db.Query(ctx, `SELECT id FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%')`+availabilitySQL("3")+accountGroupSQL(selectionGroup(ctx), "5")+importClause+` ORDER BY id LIMIT $4`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -164,8 +166,10 @@ func (s *Postgres) AccountIDsMatching(ctx context.Context, after string, limit i
 	return ids, rows.Err()
 }
 func (s *Postgres) AccountCountMatching(ctx context.Context, search, status string) (int, error) {
+	args := []any{search, status, selectionGroup(ctx)}
+	importClause := accountImportSQL(selectedAccountImportRange(ctx), &args)
 	var count int
-	err := s.db.QueryRow(ctx, `SELECT count(*) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%')`+availabilitySQL("2")+accountGroupSQL(selectionGroup(ctx), "3"), search, status, selectionGroup(ctx)).Scan(&count)
+	err := s.db.QueryRow(ctx, `SELECT count(*) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%')`+availabilitySQL("2")+accountGroupSQL(selectionGroup(ctx), "3")+importClause, args...).Scan(&count)
 	return count, err
 }
 func (s *Postgres) DeleteManagedAccounts(ctx context.Context, ids []string) ([]string, error) {
@@ -259,7 +263,10 @@ func (s *Postgres) RecoverAdminJobs(ctx context.Context) error {
 // does not redact credentials: this endpoint is protected by CORE_ADMIN_KEY and
 // is intended for an operator-controlled backup/migration download.
 func (s *Postgres) ExportAccounts(ctx context.Context, w io.Writer) error {
-	rows, err := s.db.Query(ctx, `SELECT data || jsonb_build_object('enabled',COALESCE(managed_enabled,(data->>'enabled')::boolean,false),'group_id',group_id,'group_name',(SELECT name FROM core_account_groups WHERE id=group_id),'group_description',(SELECT description FROM core_account_groups WHERE id=group_id)) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%')`+availabilitySQL("2")+accountGroupSQL(exportSelection(ctx).GroupID, "3")+` ORDER BY id`, exportSelection(ctx).Search, exportSelection(ctx).Status, exportSelection(ctx).GroupID)
+	q := exportSelection(ctx)
+	args := []any{q.Search, q.Status, q.GroupID}
+	importClause := accountImportSQL(accountImportRange{q.ImportedFrom, q.ImportedTo}, &args)
+	rows, err := s.db.Query(ctx, `SELECT data || jsonb_build_object('imported_at',imported_at,'enabled',COALESCE(managed_enabled,(data->>'enabled')::boolean,false),'group_id',group_id,'group_name',(SELECT name FROM core_account_groups WHERE id=group_id),'group_description',(SELECT description FROM core_account_groups WHERE id=group_id)) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%')`+availabilitySQL("2")+accountGroupSQL(q.GroupID, "3")+importClause+` ORDER BY id`, args...)
 	if err != nil {
 		return err
 	}

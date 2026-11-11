@@ -150,11 +150,17 @@ func (a *API) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		IDs         []string `json:"ids"`
 		AllMatching bool     `json:"all_matching"`
-		Search      string   `json:"q"`
-		Status      string   `json:"status"`
-		GroupID     string   `json:"group_id"`
+		accountImportDates
+		Search  string `json:"q"`
+		Status  string `json:"status"`
+		GroupID string `json:"group_id"`
 	}
 	if !decodeAdmin(w, r, &input, 4<<20) {
+		return
+	}
+	imported, importErr := parseAccountImportRange(input.ImportedFrom, input.ImportedTo)
+	if importErr != nil {
+		sendError(w, AsError(importErr))
 		return
 	}
 	if input.AllMatching == (len(input.IDs) > 0) || len(input.IDs) > 10000 || (!validAccountSelection(input.Search, input.Status) || len(input.GroupID) > 256) {
@@ -187,7 +193,7 @@ func (a *API) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 	j.Total = len(ids)
 	if input.AllMatching {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		total, err := store.AccountCountMatching(withSelectionGroup(ctx, input.GroupID), input.Search, input.Status)
+		total, err := store.AccountCountMatching(withAccountImportRange(withSelectionGroup(ctx, input.GroupID), imported), input.Search, input.Status)
 		cancel()
 		if err != nil {
 			managementError(w, err)
@@ -248,7 +254,7 @@ func (a *API) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 		} else {
 			for {
 				ctx, cancel := context.WithTimeout(a.Engine.root, 5*time.Second)
-				page, err := store.AccountIDsMatching(withSelectionGroup(ctx, input.GroupID), cursor, 100, input.Search, input.Status)
+				page, err := store.AccountIDsMatching(withAccountImportRange(withSelectionGroup(ctx, input.GroupID), imported), cursor, 100, input.Search, input.Status)
 				cancel()
 				if err != nil {
 					j.Status = "failed"
@@ -506,14 +512,20 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 		IDs         []string `json:"ids"`
 		All         bool     `json:"all"`
 		AllMatching bool     `json:"all_matching"`
-		Search      string   `json:"q"`
-		Status      string   `json:"status"`
-		GroupID     string   `json:"group_id"`
+		accountImportDates
+		Search  string `json:"q"`
+		Status  string `json:"status"`
+		GroupID string `json:"group_id"`
 	}
 	if !decodeAdmin(w, r, &input, 4<<20) {
 		return
 	}
-	if input.All && input.GroupID != "" {
+	imported, importErr := parseAccountImportRange(input.ImportedFrom, input.ImportedTo)
+	if importErr != nil {
+		sendError(w, AsError(importErr))
+		return
+	}
+	if input.All && (input.GroupID != "" || imported.From != nil || imported.To != nil) {
 		input.All = false
 		input.AllMatching = true
 	}
@@ -573,7 +585,7 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 		if input.All {
 			total, err = s.AccountCount(ctx)
 		} else {
-			total, err = store.AccountCountMatching(withSelectionGroup(ctx, input.GroupID), input.Search, input.Status)
+			total, err = store.AccountCountMatching(withAccountImportRange(withSelectionGroup(ctx, input.GroupID), imported), input.Search, input.Status)
 		}
 		cancel()
 		if err != nil {
@@ -657,7 +669,7 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 				if input.All {
 					page, err = s.AccountIDs(ctx, cursor, 100)
 				} else {
-					page, err = store.AccountIDsMatching(withSelectionGroup(ctx, input.GroupID), cursor, 100, input.Search, input.Status)
+					page, err = store.AccountIDsMatching(withAccountImportRange(withSelectionGroup(ctx, input.GroupID), imported), cursor, 100, input.Search, input.Status)
 				}
 				cancel()
 				if err != nil {
