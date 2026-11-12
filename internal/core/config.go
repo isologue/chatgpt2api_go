@@ -16,7 +16,7 @@ type Config struct {
 	MaxFileBytes                                                                                                                                                           int64
 	MonitorIntervalSeconds, MonitorRetentionHours                                                                                                                          int
 	WebDAV                                                                                                                                                                 webDAVConfig
-	EditMaxMiB, EditMaxImages                                                                                                                                              int
+	PromptMaxKB, EditMaxMiB, EditMaxImages                                                                                                                                 int
 	PowConcurrency, ThumbnailConcurrency                                                                                                                                   int
 	ValidationConcurrency                                                                                                                                                  int
 	OAuthURL                                                                                                                                                               string
@@ -56,7 +56,7 @@ func LoadConfig() (Config, error) {
 	}{
 		{"CORE_MONITOR_INTERVAL_SECONDS", &c.MonitorIntervalSeconds, 10, false}, {"CORE_MONITOR_RETENTION_HOURS", &c.MonitorRetentionHours, 168, false},
 		{"CORE_TEXT_CONCURRENCY", &c.TextConcurrency, 100, false}, {"CORE_FILE_CONCURRENCY", &c.FileConcurrency, 4, false}, {"CORE_FILE_QUEUE_SIZE", &c.FileQueueSize, 16, true},
-		{"CORE_EDIT_MAX_MIB", &c.EditMaxMiB, 32, false}, {"CORE_EDIT_MAX_IMAGES", &c.EditMaxImages, 4, false},
+		{"CORE_PROMPT_MAX_KB", &c.PromptMaxKB, 128, false}, {"CORE_EDIT_MAX_MIB", &c.EditMaxMiB, 32, false}, {"CORE_EDIT_MAX_IMAGES", &c.EditMaxImages, 4, false},
 		{"CORE_POW_CONCURRENCY", &c.PowConcurrency, 0, true}, {"CORE_THUMBNAIL_CONCURRENCY", &c.ThumbnailConcurrency, 1, false},
 		{"CORE_LOG_WRITERS", &c.LogWriters, 2, false}, {"CORE_LOG_QUEUE_SIZE", &c.LogQueueSize, 2048, false}, {"CORE_VALIDATION_CONCURRENCY", &c.ValidationConcurrency, 10, false}, {"CORE_IMAGE_WORKERS", &c.Workers, 1000, false}, {"CORE_IMAGE_QUEUE_SIZE", &c.QueueSize, 1000, true}, {"CORE_DOWNLOAD_CONCURRENCY", &c.DownloadConcurrency, 100, false}, {"CORE_ACCOUNT_SLOTS", &c.AccountSlots, 1, false}, {"CORE_SWITCH_RETRIES", &c.SwitchRetries, 2, true}, {"CORE_DOWNLOAD_RETRIES", &c.DownloadRetries, 1, true}, {"CORE_DB_CONNECTIONS", &c.DBConnections, 32, false}, {"CORE_VERIFY_CONCURRENCY", &c.VerifyConcurrency, 50, false}, {"CORE_RESPONSE_CONCURRENCY", &c.ResponseConcurrency, 32, false}, {"CORE_HOT_POOL_SIZE", &c.HotPoolSize, 500, false}, {"CORE_IMPORT_MAX_MIB", &c.ImportMaxMiB, 128, false},
 	}
@@ -117,3 +117,24 @@ func (c Config) powLimit() int {
 	return max(1, runtime.GOMAXPROCS(0)/2)
 }
 func (c Config) thumbnailLimit() int { return max(1, c.ThumbnailConcurrency) }
+
+// KB 按 1024 字节计算；旧配置和未显式赋值的测试沿用 128 KB。
+func (c Config) promptMaxKB() int {
+	if c.PromptMaxKB < 1 {
+		return 128
+	}
+	return c.PromptMaxKB
+}
+func (c Config) promptMaxBytes() int64 { return int64(c.promptMaxKB()) * 1024 }
+func (c Config) validatePrompt(prompt string) *APIError {
+	if strings.TrimSpace(prompt) == "" {
+		return Err(400, "invalid_prompt", "prompt 不能为空")
+	}
+	if int64(len(prompt)) > c.promptMaxBytes() {
+		return Err(400, "invalid_prompt", fmt.Sprintf("prompt 过长：当前 %d 字节，上限 %d KB（%d 字节）", len(prompt), c.promptMaxKB(), c.promptMaxBytes()))
+	}
+	return nil
+}
+
+// JSON 的 Unicode 转义最多将一个 UTF-8 字节展开为六字节，另留字段开销。
+func (c Config) generationBodyLimit() int64 { return max(1<<20, c.promptMaxBytes()*6+(64<<10)) }

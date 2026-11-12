@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"io"
 	"mime"
@@ -189,11 +190,18 @@ func parseEdit(ctx context.Context, reader *multipart.Reader, dir string, c Conf
 				return req, Err(400, "duplicate_form_field", "表单参数不能重复")
 			}
 			seen[name] = true
-			data, err := io.ReadAll(io.LimitReader(part, 128*1024+1))
+			fieldLimit := int64(128 * 1024)
+			if name == "prompt" {
+				fieldLimit = c.promptMaxBytes()
+			}
+			data, err := io.ReadAll(io.LimitReader(part, fieldLimit+1))
 			if err != nil {
 				return req, err
 			}
-			if len(data) > 128*1024 {
+			if int64(len(data)) > fieldLimit {
+				if name == "prompt" {
+					return req, Err(400, "invalid_prompt", fmt.Sprintf("prompt 过长：上限 %d KB（%d 字节）", c.promptMaxKB(), c.promptMaxBytes()))
+				}
 				return req, Err(400, "form_field_too_large", "表单参数过长")
 			}
 			v := string(data)

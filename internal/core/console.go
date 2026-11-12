@@ -70,6 +70,7 @@ func settingsFor(c Config) []consoleSetting {
 		{Key: "CORE_MAX_FILE_BYTES", Label: "导出单文件大小上限", Group: "textfiles", Value: c.fileMax(), Default: 268435456, Unit: "字节", Description: "PPTX、PSD、素材ZIP逐个限流落盘，不把整份文件读入内存。默认256MiB；内容头和文件结构会校验。", Related: []string{"CORE_DOWNLOAD_TIMEOUT", "CORE_FILE_TIMEOUT", "CORE_DOWNLOAD_CONCURRENCY"}},
 		{Key: "CORE_MONITOR_INTERVAL_SECONDS", Label: "监控持久化采样间隔", Group: "output", Value: c.monitorIntervalSeconds(), Default: 10, Unit: "秒", Description: "服务端独立采集并写入 PostgreSQL，关闭页面后仍采样。越小越精细，数据库写入和存储越多；短于采样间隔的尖峰可能未被记录。", Related: []string{"CORE_MONITOR_RETENTION_HOURS"}},
 		{Key: "CORE_MONITOR_RETENTION_HOURS", Label: "监控历史保留时间", Group: "output", Value: c.monitorRetentionHours(), Default: 168, Unit: "小时", Description: "仅清理过期监控采样，不删除调用日志、任务或图片。默认保留 7 天，每小时分批清理。", Related: []string{"CORE_MONITOR_INTERVAL_SECONDS"}},
+		{Key: "CORE_PROMPT_MAX_KB", Label: "提示词大小上限", Group: "output", Value: c.promptMaxKB(), Default: 128, Unit: "KB", Description: "文生图、图生图及 PPT/PSD 的 prompt 上限，按 UTF-8 字节计算，1 KB = 1024 字节；不是字符数或 token 数。保存后对新请求立即生效。调大仅放宽本地限制，上游仍可能拒绝；图生图还受整个编辑请求大小限制。", Related: []string{"CORE_EDIT_MAX_MIB", "CORE_TOTAL_TIMEOUT"}},
 		{Key: "CORE_EDIT_MAX_MIB", Label: "图片编辑请求大小", Group: "output", Value: c.editMaxMiB(), Default: 32, Unit: "MiB", Description: "图生图 multipart 请求总大小；JSON 模式分别限制请求体和下载后参考图/遮罩合计大小。输入先落私有临时磁盘；过大返回 413。提高后临时磁盘和上传带宽增加。", Related: []string{"CORE_EDIT_MAX_IMAGES", "CORE_METADATA_TIMEOUT"}},
 		{Key: "CORE_EDIT_MAX_IMAGES", Label: "图片编辑输入张数", Group: "output", Value: c.editMaxImages(), Default: 4, Description: "单次图生图允许上传的参考图片数量；与输出张数 n 独立。每次切号需重新上传全部参考图。", Related: []string{"CORE_EDIT_MAX_MIB", "CORE_SWITCH_RETRIES"}},
 		{Key: "CORE_IMPORT_MAX_MIB", Label: "账号导入大小上限", Group: "output", Value: int(c.importLimit() >> 20), Default: 128, Unit: "MiB", Description: "管理页与推送入口共享的单次文件上限。文件先写临时磁盘，再逐条解析、每批 100 条入库；提高上限会增加临时磁盘和处理时间。", Related: []string{}},
@@ -150,7 +151,7 @@ func (a *API) consoleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	sendJSON(w, 200, map[string]any{"settings": items, "revision": revision, "apply_mode": "server_persisted", "limits": []map[string]any{
 		{"label": "单次请求图片数量", "value": "1–4 张", "description": "当前接口固定范围；一个请求内依次生成。"},
-		{"label": "请求体大小", "value": "1 MiB", "description": "当前 HTTP 接口的固定上限。"},
+		{"label": "文生图 JSON 请求体", "value": strconv.FormatInt(config.generationBodyLimit()/1024, 10) + " KB", "description": "随提示词上限自动调整，预留 JSON 转义和其他字段开销；图生图总大小由图片编辑请求大小控制。"},
 	}})
 }
 

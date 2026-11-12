@@ -14,19 +14,22 @@ type ImageDiagnostics struct {
 }
 
 type StreamDiagnostics struct {
-	StartedAt       time.Time            `json:"started_at"`
-	DurationMS      float64              `json:"duration_ms"`
-	HTTPStatus      int                  `json:"http_status,omitempty"`
-	EndReason       string               `json:"end_reason"`
-	Bytes           int64                `json:"bytes"`
-	Events          int                  `json:"events"`
-	InvalidEvents   int                  `json:"invalid_events"`
-	HasConversation bool                 `json:"has_conversation"`
-	ImageRefs       int                  `json:"image_refs"`
-	ToolInvoked     bool                 `json:"tool_invoked"`
-	PolicyRejected  bool                 `json:"policy_rejected"`
-	FirstEvents     []StreamEventSummary `json:"first_events,omitempty"`
-	LastEvents      []StreamEventSummary `json:"last_events,omitempty"`
+	StartedAt         time.Time            `json:"started_at"`
+	DurationMS        float64              `json:"duration_ms"`
+	HTTPStatus        int                  `json:"http_status,omitempty"`
+	EndReason         string               `json:"end_reason"`
+	Bytes             int64                `json:"bytes"`
+	Events            int                  `json:"events"`
+	InvalidEvents     int                  `json:"invalid_events"`
+	HasConversation   bool                 `json:"has_conversation"`
+	ImageRefs         int                  `json:"image_refs"`
+	ToolInvoked       bool                 `json:"tool_invoked"`
+	ServerToolInvoked *bool                `json:"server_tool_invoked,omitempty"`
+	TurnUseCase       string               `json:"turn_use_case,omitempty"`
+	OutputState       string               `json:"output_state,omitempty"`
+	PolicyRejected    bool                 `json:"policy_rejected"`
+	FirstEvents       []StreamEventSummary `json:"first_events,omitempty"`
+	LastEvents        []StreamEventSummary `json:"last_events,omitempty"`
 }
 
 type StreamEventSummary struct {

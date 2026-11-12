@@ -41,7 +41,8 @@ func TestPostgresSVGExportCreateQueryAndIdempotency(t *testing.T) {
 	c.FileConcurrency, c.FileQueueSize = 1, 2
 	c.FileTimeout = 3 * time.Second
 	accounts := testAccounts(1)
-	accounts[0].Extra = map[string]json.RawMessage{"plan_type": json.RawMessage(`"plus"`)}
+	// 免费账号也必须进入文件生成链路，由上游判断能力。
+	accounts[0].Extra = map[string]json.RawMessage{"plan_type": json.RawMessage(`"free"`)}
 	g := &fileTestGenerator{entered: make(chan struct{}, 4), gate: make(chan struct{})}
 	e := NewEngine(c, NewPool(accounts, 1), db, g)
 	defer e.Close()
@@ -102,9 +103,7 @@ func TestPostgresExportQueueIsolationIdempotencyAndRecovery(t *testing.T) {
 	c.FileQueueSize = 1
 	c.FileTimeout = 3 * time.Second
 	accounts := testAccounts(4)
-	for i := range accounts {
-		accounts[i].Extra = map[string]json.RawMessage{"plan_type": json.RawMessage(`"plus"`)}
-	}
+	// 套餐未知的账号不应被本地筛选排除。
 	g := &fileTestGenerator{entered: make(chan struct{}, 4), gate: make(chan struct{})}
 	e := NewEngine(c, NewPool(accounts, 1), db, g)
 	defer e.Close()

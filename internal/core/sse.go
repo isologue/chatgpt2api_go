@@ -68,26 +68,58 @@ func boundedRawResponse(raw []byte) ([]byte, bool) {
 	return append([]byte(nil), raw[:rawResponseLimit]...), true
 }
 
+// 总缓存仍为 64 KiB；超限后保存开头和末尾，避免大段用户回显挤掉流结束原因。
+// 环形末尾缓冲区按字节写入，不随事件数或上游总响应大小增长。
 type responseCapture struct {
-	data      bytes.Buffer
-	truncated bool
-	total     int64
+	data             bytes.Buffer
+	tail             []byte
+	tailPos, tailLen int
+	truncated        bool
+	total            int64
 }
 
+const streamExcerptMarker = "\n[... stream middle omitted ...]\n"
+
 func (c *responseCapture) Write(p []byte) (int, error) {
-	c.total += int64(len(p))
-	remaining := rawResponseLimit - c.data.Len()
-	if remaining > 0 {
-		if len(p) > remaining {
-			_, _ = c.data.Write(p[:remaining])
-			c.truncated = true
-		} else {
-			_, _ = c.data.Write(p)
-		}
-	} else if len(p) > 0 {
-		c.truncated = true
+	size := len(p)
+	c.total += int64(size)
+	c.truncated = c.total > rawResponseLimit
+	headSpace := rawResponseLimit/2 - c.data.Len()
+	if headSpace > 0 {
+		n := min(headSpace, len(p))
+		_, _ = c.data.Write(p[:n])
+		p = p[n:]
 	}
-	return len(p), nil
+	if len(p) > 0 {
+		if c.tail == nil {
+			c.tail = make([]byte, rawResponseLimit/2)
+		}
+		if len(p) >= len(c.tail) {
+			p = p[len(p)-len(c.tail):]
+		}
+		n := copy(c.tail[c.tailPos:], p)
+		copy(c.tail, p[n:])
+		c.tailPos = (c.tailPos + len(p)) % len(c.tail)
+		c.tailLen = min(len(c.tail), c.tailLen+len(p))
+	}
+	return size, nil
+}
+func (c *responseCapture) String() string {
+	var out strings.Builder
+	out.Grow(min(int(c.total), rawResponseLimit))
+	out.Write(c.data.Bytes())
+	keep := c.tailLen
+	if c.truncated {
+		out.WriteString(streamExcerptMarker)
+		keep -= len(streamExcerptMarker)
+	}
+	if keep > 0 {
+		start := (c.tailPos - keep + len(c.tail)) % len(c.tail)
+		n := min(keep, len(c.tail)-start)
+		out.Write(c.tail[start : start+n])
+		out.Write(c.tail[:keep-n])
+	}
+	return out.String()
 }
 
 var fileRef = regexp.MustCompile(`file-service://([A-Za-z0-9_-]+)|\b(file_00000000[a-f0-9]{24})\b|sediment://([A-Za-z0-9_-]+)`)
@@ -140,8 +172,27 @@ func (s *streamState) applyImageEvent(e map[string]any, depth int, messages *[]m
 	if policyError(e) {
 		s.Blocked = true
 	}
-	if str(e["type"]) == "server_ste_metadata" && yes(obj(e["metadata"])["tool_invoked"]) {
-		s.ToolInvoked = true
+	if err := imageStreamFailure(e); err != nil {
+		if err.Code == "content_policy_violation" {
+			s.Blocked = true
+		} else {
+			s.ToolError = err
+			s.toolErrorPending = false
+		}
+	}
+	if str(e["type"]) == "server_ste_metadata" {
+		metadata := obj(e["metadata"])
+		if invoked, ok := metadata["tool_invoked"].(bool); ok {
+			if invoked {
+				s.ToolInvoked = true
+			}
+			if s.Diagnostics != nil {
+				s.Diagnostics.ServerToolInvoked = &invoked
+			}
+		}
+		if s.Diagnostics != nil {
+			s.Diagnostics.TurnUseCase = diagnosticLabel(str(metadata["turn_use_case"]))
+		}
 	}
 	if str(e["o"]) == "patch" {
 		for _, item := range array(e["v"]) {
@@ -192,7 +243,7 @@ func (s *streamState) consumeImageMessage(message map[string]any) {
 	if role == "tool" {
 		s.ToolInvoked = true
 	}
-	if err := imageToolRateLimit(message); err != nil {
+	if err := imageToolFailure(message); err != nil {
 		s.ToolError = err
 		// 分段错误先等待消息完成，避免只收到错误名就丢失后续的恢复时间。
 		s.toolErrorPending = str(message["status"]) == "in_progress"
@@ -234,6 +285,20 @@ func (s *session) stream(ctx context.Context, payload any, headers map[string]st
 		diagnostics.ImageRefs = len(state.Refs)
 		diagnostics.ToolInvoked, diagnostics.PolicyRejected = state.ToolInvoked, state.Blocked
 		switch {
+		case state.Blocked:
+			diagnostics.OutputState = "policy_rejected"
+		case len(state.Refs) > 0:
+			diagnostics.OutputState = "image_found"
+		case state.ToolError != nil:
+			diagnostics.OutputState = state.ToolError.Code
+		case state.ToolInvoked:
+			diagnostics.OutputState = "tool_without_image"
+		case state.Text != "":
+			diagnostics.OutputState = "text_only"
+		default:
+			diagnostics.OutputState = "no_generation_observed"
+		}
+		switch {
 		case errors.Is(resultErr, errSSEHardTimeout):
 			diagnostics.EndReason = "hard_timeout"
 		case errors.Is(resultErr, context.Canceled):
@@ -269,7 +334,7 @@ func (s *session) stream(ctx context.Context, payload any, headers map[string]st
 	// 限制总字节与单事件大小，不持有整个生成流；取消由传输层 context 直接打断。
 	capture := &responseCapture{}
 	defer func() {
-		state.RawResponse = capture.data.String()
+		state.RawResponse = capture.String()
 		state.RawResponseTruncated = capture.truncated
 		diagnostics.Bytes = capture.total
 	}()
@@ -284,12 +349,17 @@ func (s *session) stream(ctx context.Context, payload any, headers map[string]st
 			diagnostics.event(nil, &state, len(data), "done")
 			return true
 		}
+		// delta_encoding 的 "v1" 是合法控制帧，不计入坏 JSON。
+		if data == `"v1"` {
+			diagnostics.event(nil, &state, len(data), "delta_encoding")
+			return false
+		}
 		if data != "" {
 			var value map[string]any
 			if json.Unmarshal([]byte(data), &value) == nil {
 				state.consume(value)
 				diagnostics.event(value, &state, len(data), "")
-				if state.ToolError != nil && !state.toolErrorPending && !state.Blocked && len(state.Refs) == 0 {
+				if state.ToolError != nil && state.ToolError.Code != "image_target_missing" && !state.toolErrorPending && !state.Blocked && len(state.Refs) == 0 {
 					return true
 				}
 			} else {
@@ -439,14 +509,14 @@ func (s *session) poll(ctx context.Context, state *streamState) (resultErr error
 				continue
 			}
 			if result.tasks {
+				state.taskImages(result.data)
 				// 错误和图片都必须匹配当前会话，不能串入其它任务的结果。
-				if err := matchingTaskError(result.data, state.ConversationID); err != nil {
+				if err := matchingTaskError(result.data, state.ConversationID); err != nil && (err.Code != "image_target_missing" || len(state.Refs) == 0) {
 					if len(err.rawResponse) == 0 {
 						err.rawResponse, err.rawResponseTruncated = boundedRawResponse(result.raw)
 					}
 					return err
 				}
-				state.taskImages(result.data)
 			} else {
 				state.conversation(result.data)
 			}
@@ -495,7 +565,7 @@ func matchingTaskError(v any, cid string) *APIError {
 			if messagePolicyRejection(m) || policyError(x["error"]) || policyError(x["metadata"]) {
 				return Err(400, "content_policy_violation", contentPolicyMessage)
 			}
-			if err := imageToolRateLimit(m); err != nil && str(m["status"]) != "in_progress" {
+			if err := imageToolFailure(m); err != nil && str(m["status"]) != "in_progress" {
 				return err
 			}
 			if yes(obj(m["metadata"])["is_error"]) && str(obj(m["author"])["role"]) == "assistant" {

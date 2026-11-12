@@ -76,11 +76,8 @@ func NormalizeFormat(s string) (string, error) {
 	return "", Err(400, "invalid_response_format", "response_format 仅支持 url 或 b64_json/base64")
 }
 func (r *Request) Validate(c Config) error {
-	if strings.TrimSpace(r.Prompt) == "" {
-		return Err(400, "invalid_prompt", "prompt 不能为空")
-	}
-	if len(r.Prompt) > 128*1024 {
-		return Err(400, "invalid_prompt", "prompt 过长")
+	if err := c.validatePrompt(r.Prompt); err != nil {
+		return err
 	}
 	if r.Model == "" {
 		r.Model = "gpt-image-2"
@@ -132,7 +129,7 @@ func parseImageSize(value string) (imageSize, error) {
 	}
 	parts := strings.Split(value, "x")
 	invalid := func() (imageSize, error) {
-		return imageSize{}, Err(400, "invalid_image_size", "启用图片缩放时 size 必须为宽x高（单边1–8192、总像素不超过3200万）或 auto")
+		return imageSize{}, Err(400, "invalid_image_size", "size 必须为宽x高（单边1–8192、总像素不超过3200万）或 auto")
 	}
 	if len(parts) != 2 {
 		return invalid()

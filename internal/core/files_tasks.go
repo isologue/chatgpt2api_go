@@ -192,7 +192,7 @@ func (a *API) createExport(w http.ResponseWriter, r *http.Request, kind string) 
 	defer inputCancel()
 	stopBody := context.AfterFunc(inputCtx, func() { _ = r.Body.Close() })
 	defer stopBody()
-	body, raw, err := readObject(w, r, int64(c.editMaxMiB())*2<<20)
+	body, raw, err := readObject(w, r, max(int64(c.editMaxMiB())*2<<20, c.generationBodyLimit()))
 	if err != nil {
 		sendError(w, AsError(err))
 		return
@@ -210,8 +210,12 @@ func (a *API) createExport(w http.ResponseWriter, r *http.Request, kind string) 
 		return
 	}
 	prompt, err := rawString(body["prompt"])
-	if err != nil || strings.TrimSpace(prompt) == "" || len(prompt) > 128<<10 {
-		sendError(w, Err(400, "invalid_prompt", "prompt 不能为空且不能超过128KiB"))
+	if err != nil {
+		sendError(w, Err(400, "invalid_prompt", "prompt 必须为字符串"))
+		return
+	}
+	if err := c.validatePrompt(prompt); err != nil {
+		sendError(w, err)
 		return
 	}
 	client, err := rawString(body["client_task_id"])
@@ -338,12 +342,13 @@ func (e *Engine) runExport(db *Postgres, g fileGenerator, task exportTask, req R
 			ae = fileAPIError(ctx, ctx.Err())
 			return
 		}
-		account, ok := e.Pool.AcquireText(exclude, true)
+		// 不以本地套餐信息限制文件生成，实际权限由上游决定。
+		account, ok := e.Pool.AcquireText(exclude, false)
 		if !ok {
 			if ae != nil {
 				return
 			} // 没有其它账号时保留上一次真实失败原因。
-			ae = Err(503, "no_available_paid_account", "暂无可用的付费账号槽位，文件生成需要 Plus/Pro/Team 等账号")
+			ae = Err(503, "no_available_account", "暂无可用文件生成账号槽位")
 			return
 		}
 		exclude[account.ID] = true

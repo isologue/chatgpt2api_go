@@ -99,9 +99,11 @@ func (w *wireWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 func (w *wireWriter) Flush()                      { _ = http.NewResponseController(w.ResponseWriter).Flush() }
 func (a *API) payloadDir() string                 { return filepath.Join(a.Engine.Config.ImageDir, ".request-logs") }
 func (a *API) captureCreate(w http.ResponseWriter, r *http.Request) {
-	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1024*1024))
+	config := a.Engine.CurrentConfig()
+	r = r.WithContext(context.WithValue(r.Context(), configKey{}, config))
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, config.generationBodyLimit()))
 	if err != nil {
-		sendError(w, Err(400, "invalid_json", "请求 JSON 无效或超过 1 MiB"))
+		sendError(w, Err(400, "invalid_json", "请求 JSON 无效或超过当前提示词配置对应的请求体上限"))
 		return
 	}
 	r.Body = io.NopCloser(bytes.NewReader(raw))

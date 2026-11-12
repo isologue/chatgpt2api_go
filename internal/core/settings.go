@@ -151,6 +151,8 @@ func applySettingValues(base Config, values map[string]json.RawMessage) (Config,
 			c.ResponseConcurrency = v
 		case "CORE_VERIFY_CONCURRENCY":
 			c.VerifyConcurrency = v
+		case "CORE_PROMPT_MAX_KB":
+			c.PromptMaxKB = v
 		case "CORE_EDIT_MAX_MIB":
 			c.EditMaxMiB = v
 		case "CORE_EDIT_MAX_IMAGES":

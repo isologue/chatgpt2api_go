@@ -463,9 +463,16 @@ func (n *Native) generateOnce(ctx context.Context, a Account, r Request, stages 
 	if err != nil {
 		return nil, err
 	}
-	if conduit := str(cp["conduit_token"]); conduit != "" {
-		headers["X-Conduit-Token"] = conduit
+	if err := imageStreamFailure(cp); err != nil {
+		return nil, err
 	}
+	conduit := str(cp["conduit_token"])
+	if conduit == "" {
+		err := &APIError{Status: 502, Code: "image_prepare_failed", Message: "上游会话准备未返回 conduit_token，未提交生成请求", Retry: true}
+		err.rawResponse, err.rawResponseTruncated = boundedRawResponse(compactJSON(cp))
+		return nil, err
+	}
+	headers["X-Conduit-Token"] = conduit
 	headers["X-Oai-Turn-Trace-Id"] = uuid.NewString()
 	headers["Accept"] = "text/event-stream"
 	delete(payload, "partial_query")

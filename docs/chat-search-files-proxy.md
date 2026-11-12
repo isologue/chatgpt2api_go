@@ -65,7 +65,7 @@ Responses 示例：
 {"prompt":"做一份关于城市低碳出行的6页演示文稿","client_task_id":"my-ppt-001","base64_images":[]}
 ```
 
-发送到 /v1/ppt/generations。PSD 使用 /v1/psd/generations，并提供非空 base64_images 数组（纯 Base64 或 data:image/...;base64,...）。输入图片数量/解码后大小沿用图片编辑限制和解码并发配置。文件任务使用账号中已识别的 Plus/Pro/Team/Enterprise/Business 付费信息；账号导入或 JWT 没有套餐信息时不会盲目当作付费账号。
+发送到 /v1/ppt/generations。PSD 使用 /v1/psd/generations，并提供非空 base64_images 数组（纯 Base64 或 data:image/...;base64,...）。输入图片数量/解码后大小沿用图片编辑限制和解码并发配置。文件任务不以本地套餐信息限制选号，免费账号和套餐未知的账号也可尝试，实际文件生成权限由上游决定。账号启停、冷却、槽位及切号上限仍生效。
 
 创建返回 HTTP 200 和任务对象，状态 queued；查询状态为 queued、running、success 或 error，**不是图片任务的 processing/succeeded/failed 协议**。id 与 taskId 是同一任务 ID。成功结果包含：
 

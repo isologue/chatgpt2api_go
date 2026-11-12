@@ -104,12 +104,13 @@ func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, 200, snapshot)
 }
 func (a *API) create(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
+	config := configIn(r.Context(), a.Engine.CurrentConfig())
+	r.Body = http.MaxBytesReader(w, r.Body, config.generationBodyLimit())
 	decoder := json.NewDecoder(r.Body)
 	req := Request{N: 1}
 	var raw json.RawMessage
 	if err := decoder.Decode(&raw); err != nil {
-		sendError(w, Err(400, "invalid_json", "请求 JSON 无效或超过 1 MiB"))
+		sendError(w, Err(400, "invalid_json", "请求 JSON 无效或超过当前提示词配置对应的请求体上限"))
 		return
 	}
 	var extra any
@@ -127,7 +128,6 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 		sendError(w, Err(400, "invalid_json", "请求 JSON 必须是一个对象"))
 		return
 	}
-	config := a.Engine.CurrentConfig()
 	r = r.WithContext(context.WithValue(r.Context(), configKey{}, config))
 	if err := req.Validate(config); err != nil {
 		sendError(w, AsError(err))
@@ -405,6 +405,13 @@ func callerFacingError(e *APIError) *APIError {
 	}
 	if e == nil {
 		return e
+	}
+	if e.Code == "image_target_missing" {
+		public := *e
+		public.Status = http.StatusBadRequest
+		public.Code = "image_generation_failed"
+		public.Message = imageTargetMissingMessage
+		return &public
 	}
 	if e.Code == "image_total_timeout" {
 		public := *e
