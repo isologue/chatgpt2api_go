@@ -88,16 +88,18 @@ func cleanText(s string) string {
 }
 
 type textStream struct {
-	inputIDs map[string]bool
-	result   textResult
-	message  map[string]any
-	texts    map[string]string
-	order    []string
-	emitted  string
-	lastPath string
-	done     bool
-	finished bool
-	events   int
+	inputIDs       map[string]bool
+	result         textResult
+	message        map[string]any
+	texts          map[string]string
+	order          []string
+	emitted        string
+	lastPath       string
+	done           bool
+	finished       bool
+	complete       bool
+	messageChanged bool
+	events         int
 }
 
 func (t *textStream) updateMessage(m map[string]any, emit func(string) error) error {
@@ -201,6 +203,7 @@ func applyTextPatch(root any, segments []string, op string, value any) bool {
 func (t *textStream) consume(e map[string]any, emit func(string) error) error {
 	// 同一个 patch 事件必须原子应用，再依据最终 role/channel/recipient 判断是否可见。
 	// 否则 content 在 channel=analysis 之前到达时可能泄露隐藏内容。
+	t.messageChanged = false
 	if err := t.applyEvent(e, 0); err != nil {
 		return err
 	}
@@ -214,11 +217,14 @@ func (t *textStream) applyEvent(e map[string]any, depth int) error {
 		return Err(502, "text_patch_too_deep", "上游文本补丁嵌套过深")
 	}
 	t.events++
+	if str(e["type"]) == "message_stream_complete" {
+		t.complete = true
+	}
 	if v := str(e["conversation_id"]); v != "" {
 		t.result.ConversationID = v
 	}
-	if ev, ok := e["error"]; ok && ev != nil {
-		return upstreamError(502, compactJSON(map[string]any{"error": ev}))
+	if err := imageStreamFailure(e); err != nil {
+		return err
 	}
 	v := obj(e["v"])
 	if cid := str(v["conversation_id"]); cid != "" {
@@ -226,17 +232,20 @@ func (t *textStream) applyEvent(e map[string]any, depth int) error {
 	}
 	if m := obj(e["message"]); len(m) > 0 {
 		t.message = m
+		t.messageChanged = true
 		t.lastPath = ""
 		return nil
 	}
 	if m := obj(v["message"]); len(m) > 0 {
 		t.message = m
+		t.messageChanged = true
 		t.lastPath = ""
 		return nil
 	}
 	if str(e["p"]) == "/message" {
 		if m := obj(e["v"]); len(m) > 0 {
 			t.message = m
+			t.messageChanged = true
 			t.lastPath = ""
 		}
 		return nil
@@ -259,6 +268,7 @@ func (t *textStream) applyEvent(e map[string]any, depth int) error {
 	}
 	if t.message != nil && strings.HasPrefix(p, "/message/") {
 		if applyTextPatch(t.message, strings.Split(strings.TrimPrefix(p, "/message/"), "/"), op, e["v"]) {
+			t.messageChanged = true
 			t.lastPath = ""
 			if op == "append" && strings.HasPrefix(p, "/message/content/") {
 				if _, ok := e["v"].(string); ok {
@@ -308,8 +318,40 @@ func findSources(v any) []textSource {
 	walk(v, 0)
 	return mergeSources(nil, found)
 }
-func (s *session) textStream(ctx context.Context, route string, payload any, headers map[string]string, emit func(string) error) (textStream, error) {
-	state := textStream{inputIDs: map[string]bool{}}
+func (s *session) textStream(ctx context.Context, route string, payload any, headers map[string]string, emit func(string) error) (state textStream, streamErr error) {
+	state = textStream{inputIDs: map[string]bool{}}
+	diagnostics := fileDiagnosticsFrom(ctx)
+	if diagnostics != nil {
+		diagnostics.StreamStartedAt = time.Now()
+		defer func() {
+			diagnostics.StreamEvents = state.events
+			diagnostics.StreamDone = state.done
+			diagnostics.StreamFinished = state.finished
+			diagnostics.StreamComplete = state.complete
+			diagnostics.HasConversation = state.result.ConversationID != ""
+			diagnostics.ConversationID = state.result.ConversationID
+			diagnostics.StreamIdleMS = time.Since(diagnostics.StreamStartedAt).Milliseconds()
+			diagnostics.MessageIdleMS = diagnostics.StreamIdleMS
+			if !diagnostics.LastByteAt.IsZero() {
+				diagnostics.StreamIdleMS = time.Since(diagnostics.LastByteAt).Milliseconds()
+			}
+			if !diagnostics.LastMessageAt.IsZero() {
+				diagnostics.MessageIdleMS = time.Since(diagnostics.LastMessageAt).Milliseconds()
+			}
+			switch {
+			case ctx.Err() != nil:
+				diagnostics.StreamEndReason = ctx.Err().Error()
+			case streamErr != nil:
+				diagnostics.StreamEndReason = AsError(streamErr).Code
+			case state.done:
+				diagnostics.StreamEndReason = "done"
+			case state.complete:
+				diagnostics.StreamEndReason = "message_stream_complete"
+			default:
+				diagnostics.StreamEndReason = "eof"
+			}
+		}()
+	}
 	for _, message := range array(obj(payload)["messages"]) {
 		if id := str(obj(message)["id"]); id != "" {
 			state.inputIDs[id] = true
@@ -321,11 +363,19 @@ func (s *session) textStream(ctx context.Context, route string, payload any, hea
 		return state, err
 	}
 	defer resp.Body.Close()
+	if diagnostics != nil {
+		diagnostics.StreamHTTPStatus = resp.StatusCode
+		diagnostics.HeadersAt = time.Now()
+	}
 	if resp.StatusCode != 200 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return state, upstreamError(resp.StatusCode, raw)
 	}
-	scan := bufio.NewScanner(io.LimitReader(resp.Body, (32<<20)+1))
+	var reader io.Reader = resp.Body
+	if diagnostics != nil {
+		reader = fileActivityReader{Reader: reader, d: diagnostics}
+	}
+	scan := bufio.NewScanner(io.LimitReader(reader, (32<<20)+1))
 	scan.Buffer(make([]byte, 4096), 2<<20)
 	var data strings.Builder
 	total := 0
@@ -344,7 +394,27 @@ func (s *session) textStream(ctx context.Context, route string, payload any, hea
 		if json.Unmarshal([]byte(raw), &event) != nil {
 			return RetryError("text_invalid_sse", "上游返回无效文本事件")
 		}
-		return state.consume(event, emit)
+		err := state.consume(event, emit)
+		if diagnostics != nil {
+			diagnostics.LastEventAt = time.Now()
+			if state.messageChanged {
+				diagnostics.LastMessageAt = diagnostics.LastEventAt
+			}
+		}
+		if observer, ok := ctx.Value(fileStreamObserverKey{}).(func(string)); ok && state.result.ConversationID != "" {
+			observer(state.result.ConversationID)
+		}
+		diagnostics.observe(state.message)
+		if err == nil && diagnostics != nil {
+			if messagePolicyRejection(state.message) {
+				policy := Err(400, "content_policy_violation", contentPolicyMessage)
+				policy.rawResponse, policy.rawResponseTruncated = boundedRawResponse(compactJSON(state.message))
+				err = policy
+			} else if quota := imageToolRateLimit(state.message); quota != nil {
+				err = quota
+			}
+		}
+		return err
 	}
 	for scan.Scan() {
 		line := strings.TrimSuffix(scan.Text(), "\r")
@@ -356,7 +426,7 @@ func (s *session) textStream(ctx context.Context, route string, payload any, hea
 			if err := consume(); err != nil {
 				return state, err
 			}
-			if state.done {
+			if state.done || (diagnostics != nil && state.complete) {
 				break
 			}
 			continue
@@ -382,7 +452,7 @@ func (s *session) textStream(ctx context.Context, route string, payload any, hea
 	if scan.Err() != nil {
 		return state, RetryError("text_stream_interrupted", "上游文本流读取中断")
 	}
-	if !state.done && !state.finished {
+	if !state.done && !state.finished && !(diagnostics != nil && state.complete) {
 		return state, RetryError("text_stream_interrupted", "上游文本流提前结束")
 	}
 	return state, nil
@@ -416,6 +486,11 @@ func (s *session) prepareText(ctx context.Context, in textInput) (string, error)
 		}
 	}
 	v, e := s.json(ctx, "POST", "/backend-api/f/conversation/prepare", p, map[string]string{"X-Conduit-Token": "no-token"})
+	if e == nil {
+		if failure := imageStreamFailure(v); failure != nil {
+			e = failure
+		}
+	}
 	return str(v["conduit_token"]), e
 }
 func (n *Native) Text(ctx context.Context, a Account, in textInput, stages map[string]float64, emit func(string) error) (textResult, error) {

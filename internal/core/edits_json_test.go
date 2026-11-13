@@ -161,7 +161,7 @@ func TestJSONEditValidationAndCleanup(t *testing.T) {
 		{"empty prompt", `{"images":[` + validImage + `]}`, "invalid_prompt", 400, false},
 		{"too many images", `{"prompt":"edit","images":[` + validImage + `,` + validImage + `,` + validImage + `]}`, "too_many_input_images", 400, false},
 		{"too many masks", `{"prompt":"edit","images":[` + validImage + `],"mask":[` + validImage + `,` + validImage + `]}`, "too_many_masks", 400, false},
-		{"ambiguous images", `{"prompt":"edit","images":[` + validImage + `],"image":[` + validImage + `]}`, "invalid_image_field", 400, false},
+		{"ambiguous images", `{"prompt":"edit","images":[` + validImage + `],"image":["https://different.example.test/ref.png"]}`, "invalid_image_field", 400, false},
 	}
 	for _, tail := range []struct {
 		path, code string

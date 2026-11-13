@@ -67,7 +67,19 @@ type requestCursor struct {
 	ID      string    `json:"id"`
 }
 
+// 历史日志不依赖当前模型映射推断类型，也不读取原始请求/响应；搜索请求属于对话。
+const consoleRequestKindSQL = `CASE
+ WHEN request_kind IN ('text','search') THEN 'text'
+ WHEN request_kind IN ('image','file') THEN request_kind
+ WHEN request_kind='' AND left(id,5)='chat_' THEN 'text'
+ WHEN request_kind='' AND left(id,9)='filetask_' THEN 'file'
+ WHEN request_kind='' AND (left(id,5)='task_' OR model='gpt-image-2' OR image_count>0) THEN 'image'
+ ELSE 'unknown' END`
+
 func (s *Postgres) ConsoleRequests(ctx context.Context, q consoleQuery) (map[string]any, error) {
+	if q.Kind != "" && q.Kind != "image" && q.Kind != "file" && q.Kind != "text" {
+		return nil, Err(400, "invalid_request_kind", "无效的调用类型")
+	}
 	if q.Status != "" && q.Status != "succeeded" && q.Status != "failed" && q.Status != "safety_rejected" {
 		return nil, Err(400, "invalid_status", "无效的日志状态")
 	}
@@ -80,7 +92,7 @@ func (s *Postgres) ConsoleRequests(ctx context.Context, q consoleQuery) (map[str
 			return nil, Err(400, "invalid_cursor", "分页游标无效")
 		}
 	}
-	rows, err := s.db.Query(ctx, `SELECT id, created_at, model, is_async, response_format, status, duration_ms, started_at,finished_at,queue_ms,COALESCE(switch_count,(SELECT count(*) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(attempts)='array' THEN attempts ELSE '[]'::jsonb END) WITH ORDINALITY AS a(item, ord) WHERE COALESCE(item->>'code','')<>'' AND ord < CASE WHEN jsonb_typeof(attempts)='array' THEN jsonb_array_length(attempts) ELSE 0 END)),api_key_id,api_key_name FROM core_requests WHERE (created_at,id)<($1,$2) AND ($3='' OR id ILIKE '%'||$3||'%') AND ($4='' OR status=$4) AND ($6='' OR is_async=($6='true')) AND ($7='' OR response_format=$7) AND ($8::timestamptz IS NULL OR created_at >= $8) AND ($9::timestamptz IS NULL OR created_at < $9) AND ($10='' OR api_key_id=$10) ORDER BY created_at DESC,id DESC LIMIT $5`, cursor.Created, cursor.ID, q.Search, q.Status, q.Limit+1, q.Async, q.Format, q.From, q.To, q.KeyID)
+	rows, err := s.db.Query(ctx, `SELECT id, created_at, model, is_async, response_format, status, duration_ms, started_at,finished_at,queue_ms,COALESCE(switch_count,(SELECT count(*) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(attempts)='array' THEN attempts ELSE '[]'::jsonb END) WITH ORDINALITY AS a(item, ord) WHERE COALESCE(item->>'code','')<>'' AND ord < CASE WHEN jsonb_typeof(attempts)='array' THEN jsonb_array_length(attempts) ELSE 0 END)),api_key_id,api_key_name,upstream_model,`+consoleRequestKindSQL+` FROM core_requests WHERE (created_at,id)<($1,$2) AND ($3='' OR id ILIKE '%'||$3||'%' OR model ILIKE '%'||$3||'%' OR upstream_model ILIKE '%'||$3||'%') AND ($4='' OR status=$4) AND ($6='' OR is_async=($6='true')) AND ($7='' OR response_format=$7) AND ($8::timestamptz IS NULL OR created_at >= $8) AND ($9::timestamptz IS NULL OR created_at < $9) AND ($10='' OR api_key_id=$10) AND ($11='' OR (`+consoleRequestKindSQL+`)=$11) ORDER BY created_at DESC,id DESC LIMIT $5`, cursor.Created, cursor.ID, q.Search, q.Status, q.Limit+1, q.Async, q.Format, q.From, q.To, q.KeyID, q.Kind)
 	if err != nil {
 		return nil, err
 	}
@@ -89,21 +101,21 @@ func (s *Postgres) ConsoleRequests(ctx context.Context, q consoleQuery) (map[str
 	next := ""
 	var last requestCursor
 	for rows.Next() {
-		var id, model, format, status, keyID, keyName string
+		var id, model, upstreamModel, kind, format, status, keyID, keyName string
 		var created time.Time
 		var async bool
 		var duration int64
 		var started, finished *time.Time
 		var queue *int64
 		var switches int
-		if err := rows.Scan(&id, &created, &model, &async, &format, &status, &duration, &started, &finished, &queue, &switches, &keyID, &keyName); err != nil {
+		if err := rows.Scan(&id, &created, &model, &async, &format, &status, &duration, &started, &finished, &queue, &switches, &keyID, &keyName, &upstreamModel, &kind); err != nil {
 			return nil, err
 		}
 		if len(items) == q.Limit {
 			next = encodeConsoleCursor(last)
 			break
 		}
-		items = append(items, map[string]any{"id": id, "created_at": created, "model": model, "is_async": async, "response_format": format, "status": status, "duration_ms": duration, "started_at": started, "finished_at": finished, "queue_ms": queue, "switch_count": switches, "api_key_id": keyID, "api_key_name": keyName})
+		items = append(items, map[string]any{"id": id, "created_at": created, "model": model, "upstream_model": upstreamModel, "request_kind": kind, "is_async": async, "response_format": format, "status": status, "duration_ms": duration, "started_at": started, "finished_at": finished, "queue_ms": queue, "switch_count": switches, "api_key_id": keyID, "api_key_name": keyName})
 		last = requestCursor{Created: created, ID: id}
 	}
 	if rows.Err() != nil {
@@ -112,7 +124,7 @@ func (s *Postgres) ConsoleRequests(ctx context.Context, q consoleQuery) (map[str
 	return map[string]any{"items": items, "next_cursor": next}, nil
 }
 func (s *Postgres) ConsoleRequest(ctx context.Context, id string) (map[string]any, error) {
-	var upstreamModel string
+	var upstreamModel, kind string
 	var reqID, model, format, status, keyID, keyName string
 	var created time.Time
 	var async bool
@@ -120,7 +132,7 @@ func (s *Postgres) ConsoleRequest(ctx context.Context, id string) (map[string]an
 	var attempts, errorBytes []byte
 	var started, finished *time.Time
 	var queue *int64
-	err := s.db.QueryRow(ctx, `SELECT id,created_at,model,is_async,response_format,status,duration_ms,attempts,error,started_at,finished_at,queue_ms,api_key_id,api_key_name,upstream_model FROM core_requests WHERE id=$1`, id).Scan(&reqID, &created, &model, &async, &format, &status, &duration, &attempts, &errorBytes, &started, &finished, &queue, &keyID, &keyName, &upstreamModel)
+	err := s.db.QueryRow(ctx, `SELECT id,created_at,model,is_async,response_format,status,duration_ms,attempts,error,started_at,finished_at,queue_ms,api_key_id,api_key_name,upstream_model,`+consoleRequestKindSQL+` FROM core_requests WHERE id=$1`, id).Scan(&reqID, &created, &model, &async, &format, &status, &duration, &attempts, &errorBytes, &started, &finished, &queue, &keyID, &keyName, &upstreamModel, &kind)
 	if err != nil {
 		return nil, err
 	}
@@ -134,5 +146,5 @@ func (s *Postgres) ConsoleRequest(ctx context.Context, id string) (map[string]an
 			return nil, err
 		}
 	}
-	return map[string]any{"id": reqID, "created_at": created, "model": model, "upstream_model": upstreamModel, "is_async": async, "response_format": format, "status": status, "duration_ms": duration, "attempts": aa, "error": ae, "started_at": started, "finished_at": finished, "queue_ms": queue, "api_key_id": keyID, "api_key_name": keyName}, nil
+	return map[string]any{"id": reqID, "created_at": created, "model": model, "upstream_model": upstreamModel, "request_kind": kind, "is_async": async, "response_format": format, "status": status, "duration_ms": duration, "attempts": aa, "error": ae, "started_at": started, "finished_at": finished, "queue_ms": queue, "api_key_id": keyID, "api_key_name": keyName}, nil
 }

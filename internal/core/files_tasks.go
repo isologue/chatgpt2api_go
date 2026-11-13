@@ -354,7 +354,9 @@ func (e *Engine) runExport(db *Postgres, g fileGenerator, task exportTask, req R
 		exclude[account.ID] = true
 		started := time.Now()
 		stages := map[string]float64{}
-		result, err = g.Export(context.WithValue(ctx, fileModelKey{}, req.UpstreamModel), account, task.Kind, req.Prompt, inputs, stages)
+		diagnostics := &FileDiagnostics{Phase: "账号校验"}
+		attemptCtx := context.WithValue(context.WithValue(ctx, fileModelKey{}, req.UpstreamModel), fileDiagnosticsKey{}, diagnostics)
+		result, err = g.Export(attemptCtx, account, task.Kind, req.Prompt, inputs, stages)
 		ae = nil
 		if err != nil {
 			ae = fileAPIError(ctx, err)
@@ -365,9 +367,15 @@ func (e *Engine) runExport(db *Postgres, g fileGenerator, task exportTask, req R
 			e.Stats.PersistenceErrors.Add(1)
 		}
 		done()
-		attempt := Attempt{AccountID: account.ID, Email: account.Email, Started: started, DurationMS: time.Since(started).Milliseconds(), Stages: stages}
+		attempt := Attempt{AccountID: account.ID, Email: account.Email, Started: started, DurationMS: time.Since(started).Milliseconds(), Stages: stages, FileDiagnostics: diagnostics}
+		diagnostics.EndReason = "succeeded"
 		if ae != nil {
 			attempt.Code = ae.Code
+			attempt.HTTPStatus = ae.Status
+			attempt.Error = Err(ae.Status, ae.Code, ae.Message)
+			attempt.RawResponse = string(ae.rawResponse)
+			attempt.RawResponseTruncated = ae.rawResponseTruncated
+			diagnostics.EndReason = ae.Code
 		}
 		attempts = append(attempts, attempt)
 		if ae == nil || !ae.Retry || ctx.Err() != nil {

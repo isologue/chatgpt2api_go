@@ -133,6 +133,17 @@ func (s *session) resolveExport(ctx context.Context, cid string, r exportRef) (s
 }
 func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inputs []editInput, stages map[string]float64) (fileResult, error) {
 	result := fileResult{}
+	diagnostics := fileDiagnosticsFrom(ctx)
+	if diagnostics == nil {
+		diagnostics = &FileDiagnostics{}
+		ctx = context.WithValue(ctx, fileDiagnosticsKey{}, diagnostics)
+	}
+	phase := func(name string) {
+		if diagnostics != nil {
+			diagnostics.Phase = name
+		}
+	}
+	phase("账号校验")
 	extension := ".pptx"
 	instruction := "生成5至6页精美的产品介绍PPT。先设计各页，拆分图像与形状素材为独立透明PNG，再还原为可编辑PPTX，文字必须可编辑。必须使用工具实际生成并提供可下载的 .pptx 主文件与包含全部素材的 .zip 文件，不能仅提供制作说明。"
 	switch kind {
@@ -161,6 +172,7 @@ func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inp
 	message := obj(array(payload["messages"])[0])
 	start = time.Now()
 	var attachments, parts []any
+	phase("参考图片上传")
 	for _, input := range inputs {
 		v, err := s.uploadEdit(ctx, input, nil)
 		if err != nil {
@@ -175,6 +187,7 @@ func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inp
 		message["content"] = map[string]any{"content_type": "multimodal_text", "parts": parts}
 		message["metadata"] = map[string]any{"attachments": attachments}
 	}
+	phase("会话准备")
 	token, err := s.prepareText(ctx, in)
 	if err != nil {
 		return result, err
@@ -182,6 +195,7 @@ func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inp
 	if token == "" {
 		return result, RetryError("file_prepare_failed", "文件生成预备请求缺少 conduit_token")
 	}
+	phase("获取准入挑战")
 	headers, err := s.requirements(ctx, stages)
 	if err != nil {
 		return result, err
@@ -194,9 +208,17 @@ func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inp
 	payload["supported_encodings"] = []string{"v1"}
 	payload["enable_message_followups"] = true
 	start = time.Now()
-	state, streamErr := s.textStream(ctx, "/backend-api/f/conversation", payload, headers, nil)
+	phase("文件生成流")
+	state, cachedConversation, streamErr := s.fileStream(ctx, payload, headers, kind, extension)
 	n.measure(stages, "文件生成流", start)
 	result.ConversationID = state.result.ConversationID
+	// 明确的参数错误、审核拒绝、限流或令牌失效无需继续轮询到总预算耗尽。
+	if streamErr != nil {
+		ae := AsError(streamErr)
+		if !ae.Retry || ae.RateLimited || ae.Invalidate || ae.Code == "upstream_stream_error" {
+			return result, streamErr
+		}
+	}
 	if result.ConversationID == "" {
 		if streamErr != nil {
 			return result, streamErr
@@ -208,27 +230,55 @@ func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inp
 	}
 	start = time.Now()
 	defer n.measure(stages, "文件结果补查与下载", start)
+	phase("文件结果补查")
+	var terminalSince time.Time
+	var terminalError *APIError
+	grace := n.config(ctx).MetadataTimeout
 	for {
-		v, err := s.json(ctx, "GET", "/backend-api/conversation/"+url.PathEscape(result.ConversationID), nil, nil)
-		if err != nil {
-			return result, err
+		if terminalError != nil && time.Since(terminalSince) >= grace {
+			return result, terminalError
 		}
-		refs := exportRefs(v)
-		var primary, archive *exportRef
-		for i := len(refs) - 1; i >= 0; i-- {
-			ext := strings.ToLower(filepath.Ext(refs[i].Name))
-			if ext == extension && primary == nil {
-				primary = &refs[i]
+		v := cachedConversation
+		cachedConversation = nil
+		if v == nil {
+			diagnostics.PollRequests++
+			diagnostics.LastPollAt = time.Now()
+			pollCtx := ctx
+			cancelPoll := func() {}
+			if terminalError != nil {
+				pollCtx, cancelPoll = context.WithDeadline(ctx, terminalSince.Add(grace))
 			}
-			if ext == ".zip" && archive == nil {
-				archive = &refs[i]
+			v, err = s.json(pollCtx, "GET", "/backend-api/conversation/"+url.PathEscape(result.ConversationID), nil, nil)
+			cancelPoll()
+			if err != nil {
+				diagnostics.PollErrors++
+				diagnostics.LastPollError = AsError(err).Code
+				if ctx.Err() == nil && terminalError != nil && time.Since(terminalSince) >= grace {
+					return result, terminalError
+				}
+				return result, err
 			}
+			diagnostics.LastPollError = ""
+		}
+		inspection := inspectFileConversation(v, extension)
+		primary, archive := inspection.primary, inspection.archive
+		if diagnostics != nil {
+			diagnostics.PrimaryFound = primary != nil
+			diagnostics.ArchiveFound = archive != nil
+			for _, message := range orderedConversationMessages(v) {
+				diagnostics.observe(message)
+			}
+		}
+		if inspection.err != nil {
+			return result, inspection.err
 		}
 		if primary != nil && (kind == "svg" || archive != nil) {
+			phase("主文件地址解析")
 			target, err := s.resolveExport(ctx, result.ConversationID, *primary)
 			if err != nil {
 				return result, err
 			}
+			phase("主文件下载")
 			result.Primary, err = s.downloadExport(ctx, target, extension)
 			if err != nil {
 				return result, err
@@ -242,10 +292,12 @@ func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inp
 					os.Remove(filepath.Join(n.c.ImageDir, ".exports", result.Primary))
 				}
 			}()
+			phase("素材 ZIP 地址解析")
 			target, err = s.resolveExport(ctx, result.ConversationID, *archive)
 			if err != nil {
 				return result, err
 			}
+			phase("素材 ZIP 下载")
 			result.Zip, err = s.downloadExport(ctx, target, ".zip")
 			if err != nil {
 				return result, err
@@ -253,10 +305,30 @@ func (n *Native) Export(ctx context.Context, a Account, kind, prompt string, inp
 			keep = true
 			return result, nil
 		}
+		// 明确的最终回复已经完成时，只留一个元数据窗口等待文件标识同步。
+		// 仅收到 [DONE] 或心跳、但工具仍在执行，不使用此提前退出条件。
+		if inspection.final || state.finished {
+			if terminalSince.IsZero() {
+				terminalSince = time.Now()
+			}
+			terminalError = RetryError("file_output_missing", "上游已结束回复，但未提供完整的生成文件")
+			for _, m := range orderedConversationMessages(v) {
+				if visibleText(m) != "" {
+					terminalError.rawResponse, terminalError.rawResponseTruncated = boundedRawResponse(compactJSON(m))
+				}
+			}
+		} else {
+			terminalSince = time.Time{}
+			terminalError = nil
+		}
+		wait := 2 * time.Second
+		if terminalError != nil {
+			wait = min(wait, time.Until(terminalSince.Add(grace)))
+		}
 		select {
 		case <-ctx.Done():
 			return result, ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(wait):
 		}
 	}
 }

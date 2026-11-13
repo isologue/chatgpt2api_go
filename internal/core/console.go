@@ -67,6 +67,7 @@ func settingsFor(c Config) []consoleSetting {
 		{Key: "CORE_FILE_CONCURRENCY", Label: "PPT / PSD 执行并发", Group: "textfiles", Value: c.fileLimit(), Default: 4, Description: "独立长任务执行池，不占图片任务执行槽位；与图片共享账号槽位、下载及图片解码名额。文件生成需要付费账号。", Related: []string{"CORE_FILE_QUEUE_SIZE", "CORE_ACCOUNT_SLOTS", "CORE_DOWNLOAD_CONCURRENCY"}},
 		{Key: "CORE_FILE_QUEUE_SIZE", Label: "PPT / PSD 等待队列", Group: "textfiles", Value: c.FileQueueSize, Default: 16, Unit: "个", Description: "执行与等待均满时返回429；0表示不排队。任务持久化到PostgreSQL，服务重启时中断任务会标记失败。", Related: []string{"CORE_FILE_CONCURRENCY", "CORE_FILE_TIMEOUT"}},
 		{Key: "CORE_FILE_TIMEOUT", Label: "PPT / PSD 总预算", Group: "textfiles", Value: int(c.fileBudget() / time.Second), Default: 600, Unit: "秒", Description: "从接纳开始，包含排队、校验、参考图上传、生成、轮询和文件下载。", Related: []string{"CORE_FILE_QUEUE_SIZE", "CORE_DOWNLOAD_TIMEOUT"}},
+		{Key: "CORE_FILE_POLL_INTERVAL", Label: "文件生成期间补查间隔", Group: "textfiles", Value: int(c.filePollInterval() / time.Second), Default: 15, Unit: "秒", Description: "生成流尚未结束时，定期查询同一会话；主文件与所需素材 ZIP 齐全后进入下载。一次只查询一个，不切号或重复创建任务。单次查询受元数据超时及文件总预算约束。", Related: []string{"CORE_FILE_TIMEOUT", "CORE_METADATA_TIMEOUT", "CORE_FILE_CONCURRENCY"}},
 		{Key: "CORE_MAX_FILE_BYTES", Label: "导出单文件大小上限", Group: "textfiles", Value: c.fileMax(), Default: 268435456, Unit: "字节", Description: "PPTX、PSD、素材ZIP逐个限流落盘，不把整份文件读入内存。默认256MiB；内容头和文件结构会校验。", Related: []string{"CORE_DOWNLOAD_TIMEOUT", "CORE_FILE_TIMEOUT", "CORE_DOWNLOAD_CONCURRENCY"}},
 		{Key: "CORE_MONITOR_INTERVAL_SECONDS", Label: "监控持久化采样间隔", Group: "output", Value: c.monitorIntervalSeconds(), Default: 10, Unit: "秒", Description: "服务端独立采集并写入 PostgreSQL，关闭页面后仍采样。越小越精细，数据库写入和存储越多；短于采样间隔的尖峰可能未被记录。", Related: []string{"CORE_MONITOR_RETENTION_HOURS"}},
 		{Key: "CORE_MONITOR_RETENTION_HOURS", Label: "监控历史保留时间", Group: "output", Value: c.monitorRetentionHours(), Default: 168, Unit: "小时", Description: "仅清理过期监控采样，不删除调用日志、任务或图片。默认保留 7 天，每小时分批清理。", Related: []string{"CORE_MONITOR_INTERVAL_SECONDS"}},
@@ -159,6 +160,7 @@ type consoleQuery struct {
 	Limit                    int
 	Search, Status, Cursor   string
 	Async, Format            string
+	Kind                     string
 	GroupID                  string
 	KeyID                    string
 	From, To                 *time.Time
@@ -194,6 +196,10 @@ func readConsoleQuery(r *http.Request) (consoleQuery, error) {
 	}
 	q.Async = r.URL.Query().Get("async")
 	q.Format = r.URL.Query().Get("response_format")
+	q.Kind = r.URL.Query().Get("request_kind")
+	if q.Kind != "" && q.Kind != "image" && q.Kind != "file" && q.Kind != "text" {
+		return q, Err(400, "invalid_request_kind", "无效的调用类型")
+	}
 	if q.Async != "" && q.Async != "true" && q.Async != "false" {
 		return q, Err(400, "invalid_async", "调用方式无效")
 	}

@@ -7,6 +7,20 @@ import (
 	"time"
 )
 
+func TestFilePollIntervalSetting(t *testing.T) {
+	base := Config{}
+	if base.filePollInterval() != 15*time.Second {
+		t.Fatal("wrong default file probe interval")
+	}
+	c, err := applySettingValues(base, map[string]json.RawMessage{"CORE_FILE_POLL_INTERVAL": json.RawMessage(`7`)})
+	if err != nil || c.filePollInterval() != 7*time.Second {
+		t.Fatal("file probe interval not configurable", c, err)
+	}
+	if _, err = applySettingValues(base, map[string]json.RawMessage{"CORE_FILE_POLL_INTERVAL": json.RawMessage(`0`)}); err == nil {
+		t.Fatal("accepted nonpositive interval")
+	}
+}
+
 func TestLimiterResizeAndCancellation(t *testing.T) {
 	l := newLimiter(2)
 	if !l.TryAcquire() || !l.TryAcquire() {

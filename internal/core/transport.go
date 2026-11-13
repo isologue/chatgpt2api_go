@@ -243,6 +243,8 @@ func upstreamError(status int, raw []byte, headers ...http.Header) *APIError {
 	var apiErr *APIError
 	if policyError(data) || (len(data) == 0 && isContentPolicyRejection(string(raw))) {
 		apiErr = Err(400, "content_policy_violation", contentPolicyMessage)
+	} else if upstreamInputTooLarge(data) {
+		apiErr = Err(400, "input_too_large", upstreamInputTooLargeMessage)
 	} else if status == 401 {
 		apiErr = RetryError("account_token_invalid", "账号令牌失效")
 		apiErr.Invalidate = true
@@ -266,9 +268,13 @@ func upstreamError(status int, raw []byte, headers ...http.Header) *APIError {
 }
 
 var rateLimitDurationPattern = regexp.MustCompile(`(?i)(?:(?:in|within|请)\s*)?(\d+)\s*(秒|分钟|分|小时|天|seconds?|minutes?|hours?|days?)`)
+var rateLimitWordDurationPattern = regexp.MustCompile(`(?i)\b(?:in|for|within)\s+(?:an?|one)\s+(second|minute|hour|day)s?\b`)
 
 func rateLimitedResponse(status int, data map[string]any, raw []byte) bool {
 	if status == 429 {
+		return true
+	}
+	if upstreamQuotaRejection(upstreamErrorText(data)) {
 		return true
 	}
 	text := strings.ToLower(string(raw))
@@ -316,6 +322,10 @@ func rateLimitCooldown(data map[string]any, raw []byte, headers ...http.Header) 
 	if strings.Contains(strings.ToLower(message), "per hour") || strings.Contains(message, "每小时") {
 		return time.Hour + time.Minute, "message", reason, message
 	}
+	if match := rateLimitWordDurationPattern.FindStringSubmatch(message); len(match) == 2 {
+		unit := map[string]time.Duration{"second": time.Second, "minute": time.Minute, "hour": time.Hour, "day": 24 * time.Hour}[strings.ToLower(match[1])]
+		return unit + time.Minute, "message", reason, message
+	}
 	if len(headers) > 0 {
 		if retryAfter := strings.TrimSpace(headers[0].Get("Retry-After")); retryAfter != "" {
 			if seconds, err := strconv.Atoi(retryAfter); err == nil && seconds > 0 {
@@ -333,14 +343,8 @@ func rateLimitCooldown(data map[string]any, raw []byte, headers ...http.Header) 
 }
 
 func rateLimitMessage(data map[string]any, raw []byte) string {
-	for _, candidate := range []string{
-		str(obj(data["detail"])["message"]),
-		str(obj(data["error"])["message"]),
-		str(data["message"]),
-	} {
-		if strings.TrimSpace(candidate) != "" {
-			return strings.TrimSpace(candidate)
-		}
+	if text := strings.TrimSpace(upstreamErrorText(data)); text != "" {
+		return text
 	}
 	return strings.TrimSpace(string(raw))
 }

@@ -15,7 +15,24 @@ func imageToolRateLimit(message map[string]any) *APIError {
 	}
 	content := obj(message["content"])
 	if str(content["content_type"]) != "system_error" {
-		return nil
+		if str(content["content_type"]) != "text" || str(message["status"]) != "finished_successfully" {
+			return nil
+		}
+		text := str(content["text"])
+		if text == "" {
+			for _, part := range array(content["parts"]) {
+				text += str(part)
+			}
+		}
+		if role == "assistant" && (!assistantImageQuotaPrefix.MatchString(strings.TrimSpace(text)) || visibleText(message) == "") {
+			return nil
+		}
+		if !upstreamQuotaRejection(text) {
+			return nil
+		}
+		err := upstreamError(429, compactJSON(map[string]any{"error": map[string]any{"code": "image_quota_or_rate_limit", "message": text}}))
+		err.rawResponse, err.rawResponseTruncated = boundedRawResponse(compactJSON(message))
+		return err
 	}
 	codes := []string{str(content["name"]), str(content["code"]), str(content["error_code"]), str(obj(content["error"])["code"])}
 	reason := firstString(content["name"], content["code"], content["error_code"], obj(content["error"])["code"])
@@ -33,7 +50,7 @@ func imageToolRateLimit(message map[string]any) *APIError {
 			break
 		}
 	}
-	if !known && !imageToolLimitText.MatchString(text) {
+	if !known && !imageToolLimitText.MatchString(text) && !upstreamQuotaRejection(text) {
 		return nil
 	}
 	if reason == "" {
@@ -131,7 +148,7 @@ func imageStreamFailure(event map[string]any) *APIError {
 			status = 401
 		}
 		err := upstreamError(status, raw)
-		if !err.RateLimited && !err.Invalidate && err.Code != "content_policy_violation" {
+		if !err.RateLimited && !err.Invalidate && err.Code != "content_policy_violation" && err.Code != "input_too_large" {
 			// 明确业务错误不等于账号失效；仍可有限切号，但不据此扣分或停用。
 			err.Code = "upstream_stream_error"
 			err.Message = "上游生成流返回明确错误"

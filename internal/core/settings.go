@@ -117,6 +117,8 @@ func applySettingValues(base Config, values map[string]json.RawMessage) (Config,
 			c.TextTimeout = d
 		case "CORE_FILE_TIMEOUT":
 			c.FileTimeout = d
+		case "CORE_FILE_POLL_INTERVAL":
+			c.FilePollInterval = d
 		case "CORE_MAX_FILE_BYTES":
 			c.MaxFileBytes = int64(v)
 		case "CORE_MONITOR_INTERVAL_SECONDS":

@@ -12,7 +12,7 @@ import (
 type Config struct {
 	Proxy                                                                                                                                                                  proxyConfig
 	TextConcurrency, FileConcurrency, FileQueueSize                                                                                                                        int
-	TextTimeout, FileTimeout                                                                                                                                               time.Duration
+	TextTimeout, FileTimeout, FilePollInterval                                                                                                                             time.Duration
 	MaxFileBytes                                                                                                                                                           int64
 	MonitorIntervalSeconds, MonitorRetentionHours                                                                                                                          int
 	WebDAV                                                                                                                                                                 webDAVConfig
@@ -37,6 +37,7 @@ func LoadConfig() (Config, error) {
 	c.FileQueueSize = 16
 	c.TextTimeout = 180 * time.Second
 	c.FileTimeout = 10 * time.Minute
+	c.FilePollInterval = 15 * time.Second
 	c.MaxFileBytes = 256 << 20
 	if raw := os.Getenv("CORE_PROXY"); raw != "" {
 		c.Proxy, err = decodeProxyConfig([]byte(raw))
@@ -70,7 +71,7 @@ func LoadConfig() (Config, error) {
 		k string
 		p *time.Duration
 		d string
-	}{{"CORE_TEXT_TIMEOUT", &c.TextTimeout, "180s"}, {"CORE_FILE_TIMEOUT", &c.FileTimeout, "10m"}, {"CORE_TOTAL_TIMEOUT", &c.TotalTimeout, "120s"}, {"CORE_SSE_TIMEOUT", &c.SSETimeout, "80s"}, {"CORE_POLL_TIMEOUT", &c.PollTimeout, "10s"}, {"CORE_DOWNLOAD_TIMEOUT", &c.DownloadTimeout, "15s"}, {"CORE_METADATA_TIMEOUT", &c.MetadataTimeout, "30s"}, {"CORE_AVAILABILITY_TTL", &c.Freshness, "900s"}, {"CORE_HOT_IDLE", &c.HotIdle, "24h"}, {"CORE_HOT_MAINTENANCE_INTERVAL", &c.HotMaintenanceInterval, "30m"}, {"CORE_COLD_MAINTENANCE_INTERVAL", &c.ColdMaintenanceInterval, "24h"}}
+	}{{"CORE_TEXT_TIMEOUT", &c.TextTimeout, "180s"}, {"CORE_FILE_TIMEOUT", &c.FileTimeout, "10m"}, {"CORE_FILE_POLL_INTERVAL", &c.FilePollInterval, "15s"}, {"CORE_TOTAL_TIMEOUT", &c.TotalTimeout, "120s"}, {"CORE_SSE_TIMEOUT", &c.SSETimeout, "80s"}, {"CORE_POLL_TIMEOUT", &c.PollTimeout, "10s"}, {"CORE_DOWNLOAD_TIMEOUT", &c.DownloadTimeout, "15s"}, {"CORE_METADATA_TIMEOUT", &c.MetadataTimeout, "30s"}, {"CORE_AVAILABILITY_TTL", &c.Freshness, "900s"}, {"CORE_HOT_IDLE", &c.HotIdle, "24h"}, {"CORE_HOT_MAINTENANCE_INTERVAL", &c.HotMaintenanceInterval, "30m"}, {"CORE_COLD_MAINTENANCE_INTERVAL", &c.ColdMaintenanceInterval, "24h"}}
 	for _, v := range times {
 		*v.p, err = time.ParseDuration(env(v.k, v.d))
 		if err != nil || *v.p <= 0 {

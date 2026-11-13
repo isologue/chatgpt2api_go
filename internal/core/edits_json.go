@@ -196,25 +196,19 @@ func (a *API) editJSONBody(w http.ResponseWriter, r *http.Request, c Config, raw
 		sendError(w, Err(400, "invalid_json", "请求只能包含一个 JSON 对象"))
 		return
 	}
-	provided := 0
-	if len(body.Images) != 0 {
-		provided++
-	}
-	if len(body.Image) != 0 {
-		provided++
-	}
-	if len(body.ImageURL) != 0 {
-		provided++
-	}
-	if provided > 1 {
-		sendError(w, Err(400, "invalid_image_field", "images、image 与 image_url 不能同时提供"))
-		return
-	}
-	if len(body.Images) == 0 {
-		body.Images = body.Image
-	}
-	if len(body.Images) == 0 {
-		body.Images = body.ImageURL
+	// 多种别名指向完全相同且顺序一致的参考图时只取一份；不同内容仍拒绝，避免悄悄换图。
+	for _, images := range []editJSONImages{body.Image, body.ImageURL} {
+		if len(images) == 0 {
+			continue
+		}
+		if len(body.Images) == 0 {
+			body.Images = images
+			continue
+		}
+		if !sameEditJSONImages(body.Images, images) {
+			sendError(w, Err(400, "invalid_image_field", "images、image 与 image_url 同时提供时必须为相同的参考图片，且顺序一致"))
+			return
+		}
 	}
 	if len(body.Images) == 0 {
 		sendError(w, Err(400, "image_required", "至少需要提供一张参考图片（images[].image_url）"))
@@ -456,4 +450,17 @@ func writeEditInput(ctx context.Context, body io.Reader, length int64, target st
 		return editInput{}, Err(400, "invalid_mask", "mask 必须为 PNG 图片")
 	}
 	return editInput{Path: target, Name: filepath.Base(target) + "." + format, MIME: mimeType, Hash: hex.EncodeToString(hash.Sum(nil)), Width: cfg.Width, Height: cfg.Height, Bytes: size}, nil
+}
+
+// 用实际解析的来源比较，兼容同一个 URL 的字符串、url 和 image_url 对象表示。
+func sameEditJSONImages(a, b editJSONImages) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].link() != b[i].link() {
+			return false
+		}
+	}
+	return true
 }
