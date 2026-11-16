@@ -212,6 +212,38 @@ func (t *textStream) consume(e map[string]any, emit func(string) error) error {
 	}
 	return nil
 }
+
+// v1 可省略批量补丁的 o:"patch"。仅接受无路径的操作数组，不能将
+// content.parts 等字段的替换数组或任意业务数据当作可执行补丁。
+func messagePatches(e map[string]any) ([]any, bool) {
+	if str(e["o"]) == "patch" {
+		return array(e["v"]), true
+	}
+	if str(e["o"]) != "" || str(e["p"]) != "" {
+		return nil, false
+	}
+	patches, ok := e["v"].([]any)
+	if !ok || len(patches) == 0 {
+		return nil, false
+	}
+	for _, item := range patches {
+		patch, ok := item.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		switch str(patch["o"]) {
+		case "patch":
+		case "add", "replace", "append", "remove":
+			if !strings.HasPrefix(str(patch["p"]), "/message") {
+				return nil, false
+			}
+		default:
+			return nil, false
+		}
+	}
+	return patches, true
+}
+
 func (t *textStream) applyEvent(e map[string]any, depth int) error {
 	if depth > 32 {
 		return Err(502, "text_patch_too_deep", "上游文本补丁嵌套过深")
@@ -250,8 +282,8 @@ func (t *textStream) applyEvent(e map[string]any, depth int) error {
 		}
 		return nil
 	}
-	if str(e["o"]) == "patch" {
-		for _, item := range array(e["v"]) {
+	if patches, ok := messagePatches(e); ok {
+		for _, item := range patches {
 			if err := t.applyEvent(obj(item), depth+1); err != nil {
 				return err
 			}

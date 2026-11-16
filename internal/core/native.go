@@ -91,7 +91,10 @@ func (n *Native) Close() {
 	}
 }
 func (n *Native) measure(stages map[string]float64, name string, start time.Time) {
-	ms := float64(time.Since(start).Microseconds()) / 1000
+	n.measureDuration(stages, name, time.Since(start))
+}
+func (n *Native) measureDuration(stages map[string]float64, name string, elapsed time.Duration) {
+	ms := float64(elapsed.Microseconds()) / 1000
 	stages[name] += ms
 	n.stageMu.Lock()
 	defer n.stageMu.Unlock()
@@ -542,7 +545,6 @@ func (n *Native) generateOnce(ctx context.Context, a Account, r Request, stages 
 		return nil, withRawResponse(RetryError("no_image_generated", message), state)
 	}
 	for _, ref := range state.Refs {
-		start = time.Now()
 		path := "/backend-api/files/" + ref.ID + "/download"
 		if ref.Sediment {
 			if state.ConversationID == "" {
@@ -550,8 +552,7 @@ func (n *Native) generateOnce(ctx context.Context, a Account, r Request, stages 
 			}
 			path = "/backend-api/conversation/" + state.ConversationID + "/attachment/" + ref.ID + "/download"
 		}
-		metadata, err := s.json(ctx, "GET", path, nil, nil)
-		n.measure(stages, "图片地址解析", start)
+		metadata, err := s.imageDownloadMetadata(ctx, path, stages)
 		if err != nil {
 			return nil, err
 		}
@@ -569,6 +570,54 @@ func (n *Native) generateOnce(ctx context.Context, a Account, r Request, stages 
 		return []Artifact{artifact}, nil
 	}
 	return nil, RetryError("image_url_missing", "上游图片缺少下载地址")
+}
+
+// 生成结果的文件可能晚于 SSE 图片标识就绪；仅对明确的 File not found
+// 原地短重试。其它 404、鉴权、限流和代理错误仍保留原有结算与切号逻辑。
+func (s *session) imageDownloadMetadata(ctx context.Context, path string, stages map[string]float64) (map[string]any, error) {
+	parent := ctx
+	c := s.n.config(ctx)
+	// 解析请求与就绪等待分开记时，避免链路阶段重复累计等待时间。
+	var requestDuration time.Duration
+	defer func() { s.n.measureDuration(stages, "图片地址解析", requestDuration) }()
+	ctx, cancel := context.WithTimeout(ctx, c.MetadataTimeout)
+	defer cancel()
+	for attempt := 0; ; attempt++ {
+		if err := parent.Err(); err != nil {
+			return nil, err
+		}
+		if ctx.Err() != nil {
+			return nil, RetryError("upstream_metadata_timeout", "上游元数据请求超时")
+		}
+		requestStart := time.Now()
+		data, raw, status, err := s.jsonWithStatus(ctx, "GET", path, nil, nil)
+		requestDuration += time.Since(requestStart)
+		if parent.Err() != nil {
+			return nil, parent.Err()
+		}
+		if err == nil || status != 404 || attempt >= c.DownloadRetries {
+			return data, err
+		}
+		var body map[string]any
+		if json.Unmarshal(raw, &body) != nil || !strings.EqualFold(strings.TrimSpace(upstreamErrorText(body)), "File not found") || AsError(err).Code != "upstream_http_404" {
+			return nil, err
+		}
+		// 等待不占用下载/解码名额，也不会额外创建线程。
+		start := time.Now()
+		timer := time.NewTimer(time.Duration(1<<min(attempt, 2)) * 250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			s.n.measure(stages, "图片地址就绪等待", start)
+			if parent.Err() != nil {
+				return nil, parent.Err()
+			}
+			// 局部就绪预算耗尽时保留最后一次 404 及其原始响应。
+			return nil, err
+		case <-timer.C:
+			s.n.measure(stages, "图片地址就绪等待", start)
+		}
+	}
 }
 
 func withRawResponse(err error, state streamState) error {

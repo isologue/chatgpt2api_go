@@ -155,7 +155,7 @@ const demoDefinitions = [
  ['CORE_DOWNLOAD_TIMEOUT','单次图片下载超时','timeouts',15,'获得下载名额后开始计时，包含下载传输与解码等待；下载名额排队受外围预算控制。',['CORE_DOWNLOAD_CONCURRENCY','CORE_VALIDATION_CONCURRENCY','CORE_DOWNLOAD_RETRIES'],'秒'],
  ['CORE_METADATA_TIMEOUT','账号与元数据请求超时','timeouts',30,'限制账号信息与元数据子请求，一次完整校验还受外围预算控制。',['CORE_VERIFY_CONCURRENCY'],'秒'],
  ['CORE_SWITCH_RETRIES','最大切号重试次数','timeouts',2,'首个账号失败后的最大切换次数。2 表示最多尝试 3 个账号。',['CORE_TOTAL_TIMEOUT','CORE_DOWNLOAD_RETRIES'],'次'],
- ['CORE_DOWNLOAD_RETRIES','图片下载重试次数','timeouts',1,'同一张图片首次下载失败后的追加尝试次数，仍失败时再进入切号逻辑。',['CORE_DOWNLOAD_TIMEOUT','CORE_SWITCH_RETRIES'],'次'],
+ ['CORE_DOWNLOAD_RETRIES','图片下载重试次数','timeouts',1,'同一张图片下载失败后的追加尝试次数；图片地址明确返回 File not found 时，也按此次数在原账号短重试。地址解析整体受元数据超时控制，重试耗尽再切号。',['CORE_DOWNLOAD_TIMEOUT','CORE_METADATA_TIMEOUT','CORE_SWITCH_RETRIES'],'次'],
  ['CORE_DB_CONNECTIONS','PostgreSQL 业务连接池','output',32,'业务读写连接数。另有 1 个实例租约连接，总连接数为该值加 1。',['CORE_IMAGE_WORKERS']],
  ['CORE_MAX_IMAGE_BYTES','单张图片大小上限','output',67108864,'拒绝超过上限的图片下载。默认 64 MiB，需结合解码并发评估内存。',['CORE_VALIDATION_CONCURRENCY'],'字节'],
  ['CORE_PUBLIC_URL','图片公开访问地址','output','','留空按当前请求的 IP、域名和端口生成图片 URL。填写域名默认 HTTPS；HTTPS 反代请配置完整公开地址。',['CORE_RESPONSE_FORMAT'],'','text'],

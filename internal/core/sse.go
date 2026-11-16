@@ -194,8 +194,8 @@ func (s *streamState) applyImageEvent(e map[string]any, depth int, messages *[]m
 			s.Diagnostics.TurnUseCase = diagnosticLabel(str(metadata["turn_use_case"]))
 		}
 	}
-	if str(e["o"]) == "patch" {
-		for _, item := range array(e["v"]) {
+	if patches, ok := messagePatches(e); ok {
+		for _, item := range patches {
 			s.applyImageEvent(obj(item), depth+1, messages)
 		}
 		return
@@ -226,15 +226,8 @@ func (s *streamState) consumeImageMessage(message map[string]any) {
 		s.Blocked = true
 	}
 	if role == "assistant" && str(obj(message["content"])["content_type"]) == "text" {
-		var text strings.Builder
-		for _, part := range array(obj(message["content"])["parts"]) {
-			text.WriteString(str(part))
-			if text.Len() >= 1000 {
-				break
-			}
-		}
-		if text.Len() > 0 {
-			s.Text = truncateText(text.String())
+		if text := visibleText(message); text != "" {
+			s.Text = truncateText(text)
 		}
 	}
 	if role == "user" {

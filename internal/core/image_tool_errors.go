@@ -24,10 +24,13 @@ func imageToolRateLimit(message map[string]any) *APIError {
 				text += str(part)
 			}
 		}
-		if role == "assistant" && (!assistantImageQuotaPrefix.MatchString(strings.TrimSpace(text)) || visibleText(message) == "") {
-			return nil
-		}
-		if !upstreamQuotaRejection(text) {
+		if role == "assistant" {
+			// 完整可见最终回复单独按明确额度断言识别，不能扫描隐藏推理。
+			text = visibleText(message)
+			if !assistantImageQuotaRejection(text) {
+				return nil
+			}
+		} else if !upstreamQuotaRejection(text) {
 			return nil
 		}
 		err := upstreamError(429, compactJSON(map[string]any{"error": map[string]any{"code": "image_quota_or_rate_limit", "message": text}}))
@@ -67,13 +70,29 @@ const imageTargetMissingMessage = "未获取到提示词要求的参考图，请
 // 仅匹配明确缺少图片目标的工具诊断；普通助手回复、提示词和进行中的片段不参与分类。
 var imageTargetMissingText = regexp.MustCompile(`(?i)\bno\s+(?:usable|available|valid)\s+(?:image(?:\s+(?:edit|editing))?\s+target|reference\s+image|input\s+image)s?\b|\b(?:cannot|could not|unable to)\s+(?:find|locate|access)\s+(?:the\s+|a\s+|any\s+)?(?:reference|input|original)\s+image\b|(?:未找到|未获取到|无法找到|无法获取|没有)(?:任何)?(?:可用的?)?(?:图片编辑目标|图像编辑目标|参考图(?:片|像)?|原始图(?:片|像)?)`)
 
+var assistantMissingImageRequest = regexp.MustCompile(`(?i)^(?:请(?:重新|再次)?上传[^。！？\n]{0,100}(?:原始[^。！？\n]{0,20}图(?:片)?|原图|参考图(?:片)?)|please (?:re[- ]?upload|upload again)[^.!?\n]{0,100}(?:original|reference|input) image)`)
+var assistantMissingImageReason = regexp.MustCompile(`(?i)(?:目前|现在|当前)?(?:没有|尚未|未能|未)收到[^。！？\n]{0,45}(?:原图|原始[^。！？\n]{0,15}图(?:片)?|参考图(?:片)?)|目前(?:无法确认原图|无法[^。！？\n]{0,30}(?:原图|参考图))|(?:i (?:have not|haven't|haven’t) received|i (?:cannot|can't|can’t) access)[^.!?\n]{0,60}(?:original|reference|input) image`)
+
+func assistantImageTargetMissing(message map[string]any) bool {
+	if str(message["status"]) != "finished_successfully" || str(obj(message["content"])["content_type"]) != "text" {
+		return false
+	}
+	text := strings.TrimSpace(visibleText(message))
+	return assistantMissingImageRequest.MatchString(text) && assistantMissingImageReason.MatchString(text)
+}
+
 func imageToolFailure(message map[string]any) *APIError {
 	if err := imageToolRateLimit(message); err != nil {
 		return err
 	}
 	role := str(obj(message["author"])["role"])
 	if role != "tool" && !(role == "assistant" && yes(obj(message["metadata"])["is_error"])) {
-		return nil
+		if !assistantImageTargetMissing(message) {
+			return nil
+		}
+		err := Err(400, "image_target_missing", imageTargetMissingMessage)
+		err.rawResponse, err.rawResponseTruncated = boundedRawResponse(compactJSON(message))
+		return err
 	}
 	// 当前图片链路内按角色、完成状态和明确诊断识别。
 	// author.name 可能是 t2uay3k.sj1i4kz 等动态别名，不能用名称排除实际图片工具。
