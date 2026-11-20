@@ -154,7 +154,13 @@ func imageStreamFailure(event map[string]any) *APIError {
 			detail = map[string]any{"code": code, "message": str(envelope["message"])}
 		}
 		// 业务错误码单独放在 error_code 时也参与既有审核/限流分类。
-		raw := compactJSON(map[string]any{"error": detail, "error_code": code})
+		// 保留触发错误的 SSE envelope，避免日志只剩下“消息流中的错误”。
+		// 该内容仍受 boundedRawResponse 的 64 KiB 上限约束，不会随异常事件无限增长。
+		raw := compactJSON(map[string]any{
+			"error":         detail,
+			"error_code":    code,
+			"upstream_event": streamErrorEnvelope(event, envelope),
+		})
 		status := 502
 		for _, value := range []any{envelope["status_code"], obj(detail)["status_code"], obj(detail)["status"]} {
 			if number, ok := value.(float64); ok && number >= 400 && number <= 599 {
@@ -177,4 +183,43 @@ func imageStreamFailure(event map[string]any) *APIError {
 		return err
 	}
 	return nil
+}
+
+// streamErrorEnvelope 提取错误事件的诊断上下文。完整事件可能包含大段消息回显，
+// 这里只保留错误相关字段，既能看到上游的 request/trace id 和 reason，也避免把无关正文写入错误日志。
+func streamErrorEnvelope(event, envelope map[string]any) map[string]any {
+	out := map[string]any{}
+	copyStreamErrorFields(out, event)
+	copyStreamErrorFields(out, envelope)
+	if eventType := str(event["type"]); eventType != "" {
+		out["event_type"] = eventType
+	}
+	for _, key := range []string{"v", "metadata"} {
+		if context := streamErrorFields(obj(event[key])); len(context) > 0 {
+			out[key] = context
+		}
+	}
+	if len(out) == 0 {
+		return map[string]any{"event_type": str(event["type"])}
+	}
+	return out
+}
+
+func copyStreamErrorFields(dst, src map[string]any) {
+	for key, value := range streamErrorFields(src) {
+		dst[key] = value
+	}
+}
+
+func streamErrorFields(src map[string]any) map[string]any {
+	out := map[string]any{}
+	for _, key := range []string{
+		"type", "error", "error_code", "code", "message", "detail", "reason",
+		"status", "status_code", "request_id", "trace_id", "retry_after", "name",
+	} {
+		if value, ok := src[key]; ok && value != nil {
+			out[key] = value
+		}
+	}
+	return out
 }

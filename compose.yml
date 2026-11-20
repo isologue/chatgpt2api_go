@@ -20,6 +20,8 @@ services:
         max-size: "20m"
         max-file: "3"
   core:
+    build:
+      context: .
     image: milodk/chatgpt2api-go:latest
     env_file: .env
     environment:

@@ -49,6 +49,26 @@ func TestImageStreamFailureOnlyReadsKnownEnvelopes(t *testing.T) {
 	}
 }
 
+func TestImageStreamFailurePreservesDiagnosticEnvelope(t *testing.T) {
+	event := map[string]any{
+		"type":       "error",
+		"error":      "消息流中的错误",
+		"error_code": "",
+		"reason":     "generation_backend_unavailable",
+		"request_id": "req-upstream-123",
+		"trace_id":   "trace-upstream-456",
+	}
+	err := imageStreamFailure(event)
+	if err == nil || err.Code != "upstream_stream_error" {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+	for _, want := range []string{"upstream_event", "generation_backend_unavailable", "req-upstream-123", "trace-upstream-456"} {
+		if !strings.Contains(string(err.rawResponse), want) {
+			t.Fatalf("raw response lost %q: %s", want, err.rawResponse)
+		}
+	}
+}
+
 func TestImageExplicitStreamErrorsDoNotWastePolling(t *testing.T) {
 	for _, source := range []string{"root", "nested", "metadata", "prepare"} {
 		t.Run(source, func(t *testing.T) {
