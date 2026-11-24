@@ -241,6 +241,12 @@ func validateModelMappings(mappings []modelMapping) error {
 	return nil
 }
 func (e *Engine) resolveModel(public, capability string) (string, error) {
+	switch capability {
+	case "responses":
+		capability = "chat"
+	case "web_search", "web_search_preview":
+		capability = "search"
+	}
 	if public == "" {
 		switch capability {
 		case "image":

@@ -15,6 +15,8 @@ type Request struct {
 	requestKind                string                     // 仅由内部入口赋值，不能由调用方传入或改变幂等指纹。
 	UpstreamModel              string                     `json:"upstream_model,omitempty"`
 	apiKeyID, apiKeyName       string
+	apiRoutes                  []string
+	apiGroupID                 string
 	keyConcurrency             int
 	idemScope, idemFingerprint string
 	inputs                     []editInput
@@ -75,6 +77,26 @@ func NormalizeFormat(s string) (string, error) {
 	}
 	return "", Err(400, "invalid_response_format", "response_format 仅支持 url 或 b64_json/base64")
 }
+func normalizeAccountRoute(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "web", "chatgpt", "chatgpt_web":
+		return "web"
+	case "codex", "codex_cli":
+		return "codex"
+	default:
+		return ""
+	}
+}
+
+func normalizeAccountPlan(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "free", "plus", "pro", "team", "enterprise":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
+}
+
 func (r *Request) Validate(c Config) error {
 	if err := c.validatePrompt(r.Prompt); err != nil {
 		return err
@@ -168,11 +190,16 @@ type Account struct {
 	RefreshToken            string                     `json:"refresh_token,omitempty"`
 	IDToken                 string                     `json:"id_token,omitempty"`
 	ClientID                string                     `json:"client_id,omitempty"`
+	Route                   string                     `json:"route,omitempty"` // web / codex
+	Plan                    string                     `json:"plan,omitempty"`  // free / plus / pro / team / ...
+	GroupID                 string                     `json:"-"`               // PostgreSQL 独立列，仅用于内存选号
 	DeviceID                string                     `json:"device_id,omitempty"`
 	UserAgent               string                     `json:"user_agent,omitempty"`
 	Score                   int                        `json:"score"`
 	Enabled                 bool                       `json:"enabled"`
 	VerifiedAt              time.Time                  `json:"verified_at,omitempty"`
+	CallSuccessCount        int64                      `json:"call_success_count"`
+	CallFailureCount        int64                      `json:"call_failure_count"`
 	SuccessAt               time.Time                  `json:"success_at,omitempty"`
 	AvailableAt             time.Time                  `json:"available_at,omitempty"`
 	RateLimitedUntil        time.Time                  `json:"rate_limited_until,omitempty"`
@@ -193,9 +220,10 @@ type Account struct {
 	LastErrorCode           string                     `json:"last_error_code,omitempty"`
 }
 type Artifact struct {
-	RemoteURL string `json:"remote_url,omitempty"`
-	Name      string `json:"name"`
-	Bytes     int64  `json:"bytes"`
+	Processing *ImageProcessing `json:"-"` // 仅用于调用日志，不改变下游响应和任务结果结构。
+	RemoteURL  string           `json:"remote_url,omitempty"`
+	Name       string           `json:"name"`
+	Bytes      int64            `json:"bytes"`
 }
 type ImageUsage struct {
 	InputTokens         int                `json:"input_tokens"`
@@ -220,6 +248,7 @@ type Generation struct {
 	Usage   *ImageUsage `json:"usage,omitempty"`
 }
 type Attempt struct {
+	ImageProcessing         []ImageProcessing  `json:"image_processing,omitempty"`
 	HTTPStatus              int                `json:"http_status,omitempty"`
 	Error                   *APIError          `json:"error,omitempty"`
 	Warning                 *APIError          `json:"warning,omitempty"`

@@ -123,7 +123,37 @@ func (p *Pool) promote() {
 		p.enqueue(e)
 	}
 }
+
+type AccountSelector struct {
+	Routes  []string
+	GroupID string
+}
+
+func (s AccountSelector) allows(a Account) bool {
+	if s.GroupID != "" && a.GroupID != s.GroupID {
+		return false
+	}
+	if len(s.Routes) == 0 {
+		return true
+	}
+	accountRoute := normalizeAccountRoute(a.Route)
+	if accountRoute == "" {
+		// 兼容线路字段加入前的历史账号；旧账号实际走 Web 链路。
+		accountRoute = "web"
+	}
+	for _, route := range s.Routes {
+		if normalizeAccountRoute(route) != "" && normalizeAccountRoute(route) == accountRoute {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Pool) Acquire(exclude map[string]bool) (Account, bool) {
+	return p.AcquireWithSelector(exclude, AccountSelector{})
+}
+
+func (p *Pool) AcquireWithSelector(exclude map[string]bool, selector AccountSelector) (Account, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.promote()
@@ -136,7 +166,7 @@ func (p *Pool) Acquire(exclude map[string]bool) (Account, bool) {
 	for p.ready.Len() > 0 {
 		e := heap.Pop(&p.ready).(*entry)
 		p.readySlots -= p.slots - e.used
-		if exclude[e.a.ID] {
+		if exclude[e.a.ID] || !selector.allows(e.a) {
 			skipped = append(skipped, e)
 			continue
 		}
@@ -151,6 +181,23 @@ func (p *Pool) Acquire(exclude map[string]bool) (Account, bool) {
 		return a, true
 	}
 	return Account{}, false
+}
+
+// UpdateRouting 修改账号的调度标签，不触发远程校验或 token 刷新。
+func (p *Pool) UpdateRouting(id, route, plan string) Account {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.all[id]
+	if e == nil || e.deleted {
+		return Account{}
+	}
+	p.detach(e)
+	e.a.Route = normalizeAccountRoute(route)
+	e.a.Plan = normalizeAccountPlan(plan)
+	e.paid = paidAccount(e.a)
+	e.a.Revision = max(e.a.Revision+1, time.Now().UnixNano())
+	p.enqueue(e)
+	return e.a
 }
 func (p *Pool) Release(id string, err *APIError) Account { return p.release(id, err, true) }
 func (p *Pool) release(id string, err *APIError, image bool) Account {
@@ -171,6 +218,12 @@ func (p *Pool) release(id string, err *APIError, image bool) Account {
 	if e.used > 0 {
 		e.used--
 		p.used--
+		// 按实际持有槽位的账号尝试累计；维护刷新和安全审核拒绝不计入调用成败。
+		if err == nil {
+			e.a.CallSuccessCount++
+		} else if err.Code != "content_policy_violation" {
+			e.a.CallFailureCount++
+		}
 	}
 	now := time.Now()
 	if err == nil && image {
@@ -264,6 +317,15 @@ func (p *Pool) UpdateCredentials(a Account) Account {
 		e.a.AccessToken = a.AccessToken
 		e.paid = paidAccount(e.a)
 		e.a.RefreshToken = a.RefreshToken
+		if a.Route != "" {
+			e.a.Route = normalizeAccountRoute(a.Route)
+		}
+		if a.Plan != "" {
+			e.a.Plan = normalizeAccountPlan(a.Plan)
+		}
+		if a.GroupID != "" {
+			e.a.GroupID = a.GroupID
+		}
 		if a.IDToken != "" {
 			e.a.IDToken = a.IDToken
 		}

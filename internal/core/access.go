@@ -24,6 +24,8 @@ const adminSessionCookie = "imagecore_admin_session"
 
 type managedAPIKey struct {
 	Concurrency int       `json:"concurrency"`
+	Routes      []string  `json:"routes"`
+	GroupID     string    `json:"group_id"`
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
 	Key         string    `json:"key"`
@@ -96,7 +98,7 @@ func (e *Engine) InitializeAccess(ctx context.Context) error {
 		return err
 	}
 	if tag.RowsAffected() == 1 {
-		_, err = tx.Exec(ctx, "INSERT INTO core_api_keys(id,name,key_value,key_hash,enabled) VALUES('key_default','默认调用密钥',$1,$2,true)", e.Config.APIKey, keyDigest(e.Config.APIKey))
+		_, err = tx.Exec(ctx, "INSERT INTO core_api_keys(id,name,key_value,key_hash,enabled,routes,group_id) VALUES('key_default','默认调用密钥',$1,$2,true,'','')", e.Config.APIKey, keyDigest(e.Config.APIKey))
 		if err != nil {
 			return err
 		}
@@ -110,16 +112,18 @@ func (e *Engine) InitializeAccess(ctx context.Context) error {
 		next.adminDigest = sha256.Sum256([]byte(e.Config.AdminKey))
 		next.hasDigest = true
 	}
-	rows, err := tx.Query(ctx, "SELECT id,name,key_value,enabled,revision,created_at,updated_at,concurrency FROM core_api_keys ORDER BY created_at,id")
+	rows, err := tx.Query(ctx, "SELECT id,name,key_value,enabled,revision,created_at,updated_at,concurrency,routes,group_id FROM core_api_keys ORDER BY created_at,id")
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
 		var k managedAPIKey
-		if err = rows.Scan(&k.ID, &k.Name, &k.Key, &k.Enabled, &k.Revision, &k.CreatedAt, &k.UpdatedAt, &k.Concurrency); err != nil {
+		var routeText string
+		if err = rows.Scan(&k.ID, &k.Name, &k.Key, &k.Enabled, &k.Revision, &k.CreatedAt, &k.UpdatedAt, &k.Concurrency, &routeText, &k.GroupID); err != nil {
 			rows.Close()
 			return err
 		}
+		k.Routes = decodeRoutes(routeText)
 		next.keys[keyDigest(k.Key)] = k
 	}
 	err = rows.Err()
@@ -382,7 +386,7 @@ func (a *API) listAPIKeys(w http.ResponseWriter, r *http.Request) {
 	sortAPIKeys(keys)
 	items := make([]map[string]any, 0, len(keys))
 	for _, k := range keys {
-		items = append(items, map[string]any{"id": k.ID, "name": k.Name, "key": k.Key, "enabled": k.Enabled, "revision": k.Revision, "created_at": k.CreatedAt, "updated_at": k.UpdatedAt, "concurrency": k.Concurrency, "active": a.Engine.keyUsage(k.ID)})
+		items = append(items, map[string]any{"id": k.ID, "name": k.Name, "key": k.Key, "enabled": k.Enabled, "revision": k.Revision, "created_at": k.CreatedAt, "updated_at": k.UpdatedAt, "concurrency": k.Concurrency, "routes": k.Routes, "group_id": k.GroupID, "active": a.Engine.keyUsage(k.ID)})
 	}
 	sendJSON(w, 200, map[string]any{"items": items})
 }
@@ -398,11 +402,13 @@ func (a *API) createAPIKey(w http.ResponseWriter, r *http.Request) { a.writeAPIK
 func (a *API) updateAPIKey(w http.ResponseWriter, r *http.Request) { a.writeAPIKey(w, r, false) }
 func (a *API) writeAPIKey(w http.ResponseWriter, r *http.Request, create bool) {
 	var input struct {
-		Concurrency *int   `json:"concurrency"`
-		Name        string `json:"name"`
-		Key         string `json:"key"`
-		Enabled     bool   `json:"enabled"`
-		Revision    int64  `json:"revision"`
+		Concurrency *int      `json:"concurrency"`
+		Routes      *[]string `json:"routes"`
+		GroupID     *string   `json:"group_id"`
+		Name        string    `json:"name"`
+		Key         string    `json:"key"`
+		Enabled     bool      `json:"enabled"`
+		Revision    int64     `json:"revision"`
 	}
 	if !decodeAdmin(w, r, &input, 4096) {
 		return
@@ -410,6 +416,33 @@ func (a *API) writeAPIKey(w http.ResponseWriter, r *http.Request, create bool) {
 	if input.Concurrency != nil && *input.Concurrency < 0 {
 		sendError(w, Err(400, "invalid_concurrency", "并发上限不能为负数，0 表示不额外限制"))
 		return
+	}
+	var routes []string
+	if input.Routes != nil {
+		seen := map[string]bool{}
+		invalid := false
+		for _, route := range *input.Routes {
+			rawRoute := strings.TrimSpace(route)
+			route = normalizeAccountRoute(rawRoute)
+			if rawRoute == "" || seen[route] {
+				continue
+			}
+			if route == "" {
+				invalid = true
+				continue
+			}
+			seen[route] = true
+			routes = append(routes, route)
+		}
+		if invalid {
+			sendError(w, Err(400, "invalid_routes", "线路仅支持 web 或 codex；留空表示允许全部线路"))
+			return
+		}
+		sort.Strings(routes)
+		if len(routes) > 2 {
+			sendError(w, Err(400, "invalid_routes", "线路仅支持 web 或 codex"))
+			return
+		}
 	}
 	input.Name = strings.TrimSpace(input.Name)
 	if len(input.Name) == 0 || len(input.Name) > 240 {
@@ -453,6 +486,19 @@ func (a *API) writeAPIKey(w http.ResponseWriter, r *http.Request, create bool) {
 			return
 		}
 	}
+	if input.Routes != nil {
+		k.Routes = routes
+	}
+	if input.GroupID != nil {
+		k.GroupID = strings.TrimSpace(*input.GroupID)
+		if k.GroupID != "" {
+			var state string
+			if m.store != nil && m.store.db.QueryRow(r.Context(), "SELECT state FROM core_account_groups WHERE id=$1", k.GroupID).Scan(&state) != nil || state != "active" {
+				sendError(w, Err(400, "invalid_group", "调用密钥绑定的分组不存在或未启用"))
+				return
+			}
+		}
+	}
 	if input.Key != "" {
 		k.Key = input.Key
 	}
@@ -473,10 +519,10 @@ func (a *API) writeAPIKey(w http.ResponseWriter, r *http.Request, create bool) {
 		defer cancel()
 		var err error
 		if create {
-			_, err = m.store.db.Exec(ctx, "INSERT INTO core_api_keys(id,name,key_value,key_hash,enabled,revision,created_at,updated_at,concurrency) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)", k.ID, k.Name, k.Key, hash, k.Enabled, k.Revision, k.CreatedAt, k.UpdatedAt, k.Concurrency)
+			_, err = m.store.db.Exec(ctx, "INSERT INTO core_api_keys(id,name,key_value,key_hash,enabled,revision,created_at,updated_at,concurrency,routes,group_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)", k.ID, k.Name, k.Key, hash, k.Enabled, k.Revision, k.CreatedAt, k.UpdatedAt, k.Concurrency, encodeRoutes(k.Routes), k.GroupID)
 		} else {
 			var rev int64
-			err = m.store.db.QueryRow(ctx, "UPDATE core_api_keys SET name=$1,key_value=$2,key_hash=$3,enabled=$4,revision=revision+1,updated_at=$5  ,concurrency=$8 WHERE id=$6 AND revision=$7 RETURNING revision", k.Name, k.Key, hash, k.Enabled, k.UpdatedAt, k.ID, input.Revision, k.Concurrency).Scan(&rev)
+			err = m.store.db.QueryRow(ctx, "UPDATE core_api_keys SET name=$1,key_value=$2,key_hash=$3,enabled=$4,revision=revision+1,updated_at=$5,concurrency=$8,routes=$9,group_id=$10 WHERE id=$6 AND revision=$7 RETURNING revision", k.Name, k.Key, hash, k.Enabled, k.UpdatedAt, k.ID, input.Revision, k.Concurrency, encodeRoutes(k.Routes), k.GroupID).Scan(&rev)
 		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			sendError(w, Err(409, "key_conflict", "密钥已变化，请重新加载"))
@@ -543,6 +589,18 @@ func (a *API) deleteAPIKey(w http.ResponseWriter, r *http.Request) {
 	delete(next.keys, hash)
 	m.snapshot.Store(next)
 	sendJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func encodeRoutes(routes []string) string { return strings.Join(routes, ",") }
+func decodeRoutes(value string) []string {
+	var out []string
+	for _, route := range strings.Split(value, ",") {
+		if route = normalizeAccountRoute(route); route != "" {
+			out = append(out, route)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func sortAPIKeys(keys []managedAPIKey) {

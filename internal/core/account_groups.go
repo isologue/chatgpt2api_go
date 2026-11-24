@@ -377,6 +377,8 @@ func (a *API) moveAccountGroup(w http.ResponseWriter, r *http.Request) {
 		Search  string `json:"q"`
 		Status  string `json:"status"`
 		GroupID string `json:"group_id"`
+		Route   string `json:"route"`
+		Plan    string `json:"plan"`
 		Target  string `json:"target_group_id"`
 	}
 	if !decodeAdmin(w, r, &in, 4<<20) {
@@ -387,11 +389,17 @@ func (a *API) moveAccountGroup(w http.ResponseWriter, r *http.Request) {
 		sendError(w, AsError(importErr))
 		return
 	}
+	if !validAccountRouting(in.Route, in.Plan) {
+		sendError(w, Err(400, "invalid_selection", "线路或套餐筛选无效"))
+		return
+	}
+	in.Route = normalizeAccountRoute(in.Route)
+	in.Plan = normalizeAccountPlan(in.Plan)
 	if in.Target == "" || len(in.Target) > 256 || !validGroupSelection(in.IDs, in.AllMatching, in.Search, in.Status, in.GroupID) {
 		sendError(w, Err(400, "invalid_selection", "请选择账号和目标分组，或选择全部筛选结果"))
 		return
 	}
-	ctx, cancel := context.WithTimeout(withAccountImportRange(withSelectionGroup(r.Context(), in.GroupID), imported), 5*time.Second)
+	ctx, cancel := context.WithTimeout(withAccountRouting(withAccountImportRange(withSelectionGroup(r.Context(), in.GroupID), imported), in.Route, in.Plan), 5*time.Second)
 	defer cancel()
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -418,7 +426,7 @@ func (a *API) moveAccountGroup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a.startAdminJob(w, r, s, j, func(j *adminJob) {
-		a.runGroupMove(s, j, uniqueAccountIDs(in.IDs), in.AllMatching, consoleQuery{Search: in.Search, Status: in.Status, GroupID: in.GroupID, ImportedFrom: imported.From, ImportedTo: imported.To}, in.Target, "")
+		a.runGroupMove(s, j, uniqueAccountIDs(in.IDs), in.AllMatching, consoleQuery{Search: in.Search, Status: in.Status, GroupID: in.GroupID, ImportedFrom: imported.From, ImportedTo: imported.To, Route: in.Route, Plan: in.Plan}, in.Target, "")
 	})
 }
 func (a *API) deleteAccountGroup(w http.ResponseWriter, r *http.Request) {

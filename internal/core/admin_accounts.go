@@ -55,6 +55,9 @@ type accountManager interface {
 	GetAdminJob(context.Context, string) (adminJob, error)
 	ListAdminJobs(context.Context) ([]adminJob, error)
 }
+type accountRoutingManager interface {
+	SetAccountRouting(context.Context, string, *string, *string) error
+}
 type filteredAccountManager interface {
 	AccountIDsMatching(context.Context, string, int, string, string) ([]string, error)
 	AccountCountMatching(context.Context, string, string) (int, error)
@@ -65,6 +68,7 @@ func (a *API) registerAccountManagement(m *http.ServeMux) {
 	m.HandleFunc("POST /admin/accounts/import", a.admin(a.importAccounts))
 	a.registerAccountPush(m)
 	a.registerAccountGroups(m)
+	a.registerAccountOAuth(m)
 	m.HandleFunc("GET /admin/accounts/export", a.admin(a.exportAccounts))
 	m.HandleFunc("POST /admin/accounts/verify", a.admin(a.verifyAccounts))
 	m.HandleFunc("POST /admin/accounts/refresh-token", a.admin(a.verifyAccounts))
@@ -90,14 +94,32 @@ func managementError(w http.ResponseWriter, err error) {
 }
 func (a *API) setAccountEnabled(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Enabled *bool `json:"enabled"`
+		Enabled *bool   `json:"enabled"`
+		Route   *string `json:"route"`
+		Plan    *string `json:"plan"`
 	}
 	if !decodeAdmin(w, r, &input, 1024) {
 		return
 	}
-	if input.Enabled == nil {
-		sendError(w, Err(400, "missing_enabled", "必须指定 enabled"))
+	if input.Enabled == nil && input.Route == nil && input.Plan == nil {
+		sendError(w, Err(400, "missing_account_update", "必须指定 enabled、route 或 plan"))
 		return
+	}
+	if input.Route != nil {
+		value := normalizeAccountRoute(*input.Route)
+		if value == "" {
+			sendError(w, Err(400, "invalid_route", "线路仅支持 web 或 codex"))
+			return
+		}
+		input.Route = &value
+	}
+	if input.Plan != nil {
+		value := normalizeAccountPlan(*input.Plan)
+		if value == "" {
+			sendError(w, Err(400, "invalid_plan", "套餐仅支持 free、plus、pro、team 或 enterprise"))
+			return
+		}
+		input.Plan = &value
 	}
 	s, ok := a.manager(w)
 	if !ok {
@@ -108,12 +130,46 @@ func (a *API) setAccountEnabled(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	id := r.PathValue("id")
-	if err := s.SetAccountEnabled(ctx, id, *input.Enabled); err != nil {
-		managementError(w, err)
-		return
+	if input.Enabled != nil {
+		if err := s.SetAccountEnabled(ctx, id, *input.Enabled); err != nil {
+			managementError(w, err)
+			return
+		}
+		a.Engine.Pool.SetEnabled(id, *input.Enabled)
 	}
-	a.Engine.Pool.SetEnabled(id, *input.Enabled)
-	sendJSON(w, 200, map[string]any{"id": id, "enabled": *input.Enabled})
+	if input.Route != nil || input.Plan != nil {
+		routing, ok := s.(accountRoutingManager)
+		if !ok {
+			sendError(w, Err(503, "routing_update_unavailable", "存储不支持账号线路/套餐修改"))
+			return
+		}
+		if err := routing.SetAccountRouting(ctx, id, input.Route, input.Plan); err != nil {
+			managementError(w, err)
+			return
+		}
+		current := Account{}
+		if existing, ok := a.Engine.Pool.Get(id); ok {
+			current = existing
+		}
+		if input.Route != nil {
+			current.Route = *input.Route
+		}
+		if input.Plan != nil {
+			current.Plan = *input.Plan
+		}
+		a.Engine.Pool.UpdateRouting(id, current.Route, current.Plan)
+	}
+	result := map[string]any{"id": id}
+	if input.Enabled != nil {
+		result["enabled"] = *input.Enabled
+	}
+	if input.Route != nil {
+		result["route"] = *input.Route
+	}
+	if input.Plan != nil {
+		result["plan"] = *input.Plan
+	}
+	sendJSON(w, 200, result)
 }
 func (a *API) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	s, ok := a.manager(w)
@@ -136,6 +192,9 @@ func (a *API) deleteAccount(w http.ResponseWriter, r *http.Request) {
 func validAccountSelection(search, status string) bool {
 	return len(search) <= 256 && (status == "" || status == "enabled" || status == "disabled" || status == "available" || status == "rate_limited" || status == "cooling")
 }
+func validAccountRouting(route, plan string) bool {
+	return (route == "" || normalizeAccountRoute(route) != "") && (plan == "" || normalizeAccountPlan(plan) != "")
+}
 
 func (a *API) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 	s, ok := a.manager(w)
@@ -154,6 +213,8 @@ func (a *API) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 		Search  string `json:"q"`
 		Status  string `json:"status"`
 		GroupID string `json:"group_id"`
+		Route   string `json:"route"`
+		Plan    string `json:"plan"`
 	}
 	if !decodeAdmin(w, r, &input, 4<<20) {
 		return
@@ -163,6 +224,12 @@ func (a *API) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 		sendError(w, AsError(importErr))
 		return
 	}
+	if !validAccountRouting(input.Route, input.Plan) {
+		sendError(w, Err(400, "invalid_selection", "线路或套餐筛选无效"))
+		return
+	}
+	input.Route = normalizeAccountRoute(input.Route)
+	input.Plan = normalizeAccountPlan(input.Plan)
 	if input.AllMatching == (len(input.IDs) > 0) || len(input.IDs) > 10000 || (!validAccountSelection(input.Search, input.Status) || len(input.GroupID) > 256) {
 		sendError(w, Err(400, "invalid_selection", "请选择账号，或指定 all_matching:true 及有效筛选条件"))
 		return
@@ -193,7 +260,8 @@ func (a *API) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 	j.Total = len(ids)
 	if input.AllMatching {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		total, err := store.AccountCountMatching(withAccountImportRange(withSelectionGroup(ctx, input.GroupID), imported), input.Search, input.Status)
+		selection := withAccountRouting(withAccountImportRange(withSelectionGroup(ctx, input.GroupID), imported), input.Route, input.Plan)
+		total, err := store.AccountCountMatching(selection, input.Search, input.Status)
 		cancel()
 		if err != nil {
 			managementError(w, err)
@@ -254,7 +322,8 @@ func (a *API) deleteAccounts(w http.ResponseWriter, r *http.Request) {
 		} else {
 			for {
 				ctx, cancel := context.WithTimeout(a.Engine.root, 5*time.Second)
-				page, err := store.AccountIDsMatching(withAccountImportRange(withSelectionGroup(ctx, input.GroupID), imported), cursor, 100, input.Search, input.Status)
+				selection := withAccountRouting(withAccountImportRange(withSelectionGroup(ctx, input.GroupID), imported), input.Route, input.Plan)
+				page, err := store.AccountIDsMatching(selection, cursor, 100, input.Search, input.Status)
 				cancel()
 				if err != nil {
 					j.Status = "failed"
@@ -516,6 +585,8 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 		Search  string `json:"q"`
 		Status  string `json:"status"`
 		GroupID string `json:"group_id"`
+		Route   string `json:"route"`
+		Plan    string `json:"plan"`
 	}
 	if !decodeAdmin(w, r, &input, 4<<20) {
 		return
@@ -525,6 +596,12 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 		sendError(w, AsError(importErr))
 		return
 	}
+	if !validAccountRouting(input.Route, input.Plan) {
+		sendError(w, Err(400, "invalid_selection", "线路或套餐筛选无效"))
+		return
+	}
+	input.Route = normalizeAccountRoute(input.Route)
+	input.Plan = normalizeAccountPlan(input.Plan)
 	if input.All && (input.GroupID != "" || imported.From != nil || imported.To != nil) {
 		input.All = false
 		input.AllMatching = true
@@ -585,7 +662,8 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 		if input.All {
 			total, err = s.AccountCount(ctx)
 		} else {
-			total, err = store.AccountCountMatching(withAccountImportRange(withSelectionGroup(ctx, input.GroupID), imported), input.Search, input.Status)
+			selection := withAccountRouting(withAccountImportRange(withSelectionGroup(ctx, input.GroupID), imported), input.Route, input.Plan)
+			total, err = store.AccountCountMatching(selection, input.Search, input.Status)
 		}
 		cancel()
 		if err != nil {
@@ -669,7 +747,8 @@ func (a *API) verifyAccounts(w http.ResponseWriter, r *http.Request) {
 				if input.All {
 					page, err = s.AccountIDs(ctx, cursor, 100)
 				} else {
-					page, err = store.AccountIDsMatching(withAccountImportRange(withSelectionGroup(ctx, input.GroupID), imported), cursor, 100, input.Search, input.Status)
+					selection := withAccountRouting(withAccountImportRange(withSelectionGroup(ctx, input.GroupID), imported), input.Route, input.Plan)
+					page, err = store.AccountIDsMatching(selection, cursor, 100, input.Search, input.Status)
 				}
 				cancel()
 				if err != nil {

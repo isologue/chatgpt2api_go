@@ -40,7 +40,7 @@ func parseAccountRow(raw json.RawMessage, context map[string]json.RawMessage) (A
 	if len(auth) == 0 {
 		auth = obj(credentials["authConfig"])
 	}
-	foreign := len(credentials) > 0 || str(m["type"]) == "codex" || m["id_token"] != nil || m["session_token"] != nil
+	foreign := len(credentials) > 0 || str(m["type"]) == "codex" || m["id_token"] != nil || m["session_token"] != nil || strings.EqualFold(str(m["is_codex"]), "true") || normalizeAccountRoute(str(m["route"])) == "codex" || str(m["client_id"]) == "app_EMoamEEZ73f0CkXaXp7hrann"
 	if platform := str(m["platform"]); platform != "" && platform != "openai" {
 		return Account{}, fmt.Errorf("仅支持 OpenAI 账号")
 	}
@@ -132,6 +132,19 @@ func parseAccountRow(raw json.RawMessage, context map[string]json.RawMessage) (A
 	a.AccessToken = at
 	a.Enabled = enabled
 	a.IdentityID = accountIdentity(at)
+	// 导入数据中的线路优先；Codex 导出通常通过 type/client_id/is_codex 标识。
+	a.Route = normalizeAccountRoute(str(m["route"]))
+	if a.Route == "" {
+		if str(m["type"]) == "codex" || strings.EqualFold(str(m["is_codex"]), "true") || str(m["client_id"]) == "app_EMoamEEZ73f0CkXaXp7hrann" {
+			a.Route = "codex"
+		} else {
+			a.Route = "web"
+		}
+	}
+	a.Plan = normalizeAccountPlan(str(m["plan"]))
+	if a.Plan == "" {
+		a.Plan = normalizeAccountPlan(str(m["plan_type"]))
+	}
 	if fp := obj(m["fp"]); len(fp) > 0 {
 		if a.DeviceID == "" {
 			a.DeviceID = str(fp["device_id"])
@@ -143,6 +156,13 @@ func parseAccountRow(raw json.RawMessage, context map[string]json.RawMessage) (A
 	if a.Extra == nil {
 		a.Extra = map[string]json.RawMessage{}
 	}
+	// Codex 的 ChatGPT-Account-ID 可能位于顶层、credentials、auth_config 或
+	// source_record 中。顶层副本便于运行时读取，source_record 仍完整保留。
+	if accountID := firstNonEmptyString(m["account_id"], m["chatgpt_account_id"], credentials["account_id"], credentials["chatgpt_account_id"], auth["account_id"], auth["chatgpt_account_id"]); accountID != "" {
+		if len(a.Extra["account_id"]) == 0 {
+			a.Extra["account_id"], _ = json.Marshal(accountID)
+		}
+	}
 	if foreign && len(a.Extra["source_record"]) == 0 {
 		a.Extra["source_record"] = append(json.RawMessage(nil), raw...)
 	}
@@ -151,4 +171,13 @@ func parseAccountRow(raw json.RawMessage, context map[string]json.RawMessage) (A
 		a.Extra["import_context"] = b
 	}
 	return a, nil
+}
+
+func firstNonEmptyString(values ...any) string {
+	for _, value := range values {
+		if text := strings.TrimSpace(str(value)); text != "" {
+			return text
+		}
+	}
+	return ""
 }

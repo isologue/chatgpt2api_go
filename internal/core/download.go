@@ -161,6 +161,7 @@ func (n *Native) transfer(ctx context.Context, link string, stages map[string]fl
 	if ctx.Err() != nil {
 		return artifact, ctx.Err()
 	}
+	processing := newImageProcessing(ctx, config.Width, config.Height, format)
 	// GIF 保留原始文件与动画帧，不进入缩放队列或重新编码。
 	if target, ok := ctx.Value(imageResizeTargetKey{}).(imageSize); ok && target.Width > 0 && format != "gif" {
 		queueStart := time.Now()
@@ -218,6 +219,12 @@ func (n *Native) transfer(ctx context.Context, link string, stages map[string]fl
 				return artifact, Err(507, "image_storage_failed", "替换原始图片文件失败")
 			}
 			temp, file, count = resized.Name(), resized, stat.Size()
+			processing.OutputWidth, processing.OutputHeight = fittedImageSize(bounds.Dx(), bounds.Dy(), target)
+			processing.Resized = processing.OutputWidth != bounds.Dx() || processing.OutputHeight != bounds.Dy()
+			processing.Reason = "resized"
+			if !processing.Resized {
+				processing.Reason = "reencoded"
+			}
 		}
 		n.measure(stages, "图片尺寸缩放", resizeStart)
 	}
@@ -232,5 +239,6 @@ func (n *Native) transfer(ctx context.Context, link string, stages map[string]fl
 	if e = os.Rename(temp, filepath.Join(n.c.ImageDir, name)); e != nil {
 		return artifact, Err(507, "image_storage_failed", "保存图片文件失败")
 	}
-	return Artifact{Name: name, Bytes: count}, nil
+	processing.Name = name
+	return Artifact{Name: name, Bytes: count, Processing: processing}, nil
 }

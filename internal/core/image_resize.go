@@ -60,12 +60,7 @@ func resizeDecodedImage(src image.Image, target imageSize, format string, dst io
 	if sw == target.Width && sh == target.Height {
 		return errors.New("source already matches resize target")
 	}
-	w, h := target.Width, target.Height
-	if int64(target.Width)*int64(sh) <= int64(target.Height)*int64(sw) {
-		h = max(1, int(int64(sh)*int64(target.Width)/int64(sw)))
-	} else {
-		w = max(1, int(int64(sw)*int64(target.Height)/int64(sh)))
-	}
+	w, h := fittedImageSize(sw, sh, target)
 	// 请求尺寸只作为外接边界；直接输出等比例缩放后的尺寸，不扩画布或补边。
 	var canvas draw.Image
 	if format == "jpeg" {
@@ -84,6 +79,16 @@ func resizeDecodedImage(src image.Image, target imageSize, format string, dst io
 	default:
 		return nativewebp.Encode(limited, canvas, &nativewebp.Options{CompressionLevel: nativewebp.BestSpeed})
 	}
+}
+
+func fittedImageSize(sw, sh int, target imageSize) (w, h int) {
+	w, h = target.Width, target.Height
+	if int64(target.Width)*int64(sh) <= int64(target.Height)*int64(sw) {
+		h = max(1, int(int64(sh)*int64(target.Width)/int64(sw)))
+	} else {
+		w = max(1, int(int64(sw)*int64(target.Height)/int64(sh)))
+	}
+	return w, h
 }
 
 type imageLimitWriter struct {

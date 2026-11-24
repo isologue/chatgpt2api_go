@@ -157,8 +157,8 @@ func imageStreamFailure(event map[string]any) *APIError {
 		// 保留触发错误的 SSE envelope，避免日志只剩下“消息流中的错误”。
 		// 该内容仍受 boundedRawResponse 的 64 KiB 上限约束，不会随异常事件无限增长。
 		raw := compactJSON(map[string]any{
-			"error":         detail,
-			"error_code":    code,
+			"error":          detail,
+			"error_code":     code,
 			"upstream_event": streamErrorEnvelope(event, envelope),
 		})
 		status := 502

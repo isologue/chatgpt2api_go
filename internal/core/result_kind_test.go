@@ -15,6 +15,8 @@ func TestRequestLogKindIndependentOfModelAndAsync(t *testing.T) {
 			{"arbitrary alias", "custom", "image", "my-picture-alias", "image", 1},
 			{"text sharing image name", "chat_x", "text", "gpt-image-2", "text", 0},
 			{"file sharing image name", "filetask_x", "file", "gpt-image-2.6", "file", 0},
+			{"audio model alias", "audio_x", "audio", "whisper-1", "audio", 0},
+			{"legacy audio", "audio_old", "", "transcribe", "audio", 0},
 			{"legacy task", "task_old", "", "renamed-or-removed-alias", "image", 0},
 			{"legacy text", "chat_old", "", "gpt-image-2", "text", 0},
 			{"legacy file", "filetask_old", "", "gpt-image-2", "file", 0},
@@ -29,7 +31,7 @@ func TestRequestLogKindIndependentOfModelAndAsync(t *testing.T) {
 					t.Fatal(err)
 				}
 				v := values.([]any)
-				if len(v) != 18 || v[17] != tt.want || v[8] != async {
+				if len(v) != 19 || v[17] != tt.want || v[8] != async {
 					t.Fatal(v)
 				}
 			})

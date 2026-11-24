@@ -442,7 +442,7 @@ func (e *Engine) generate(ctx context.Context, r Request) (*Generation, []Attemp
 			if ctx.Err() != nil {
 				return nil, attempts, AsError(ctx.Err())
 			}
-			a, ok := e.Pool.Acquire(excluded)
+			a, ok := e.Pool.AcquireWithSelector(excluded, AccountSelector{Routes: r.apiRoutes, GroupID: r.apiGroupID})
 			if !ok {
 				if last != nil {
 					return nil, attempts, last
@@ -478,6 +478,9 @@ func (e *Engine) generate(ctx context.Context, r Request) (*Generation, []Attemp
 				ae = RetryError("no_image_generated", "上游未生成图片")
 			}
 			at := Attempt{AccountID: a.ID, Email: a.Email, Started: start, DurationMS: time.Since(start).Milliseconds(), Stages: stages, TotalBudgetExemptReason: imageBudgetExemptReason(ctx)}
+			if ae == nil && len(images) > 0 && images[0].Processing != nil {
+				at.ImageProcessing = []ImageProcessing{*images[0].Processing}
+			}
 			if diagnostics.Stream != nil || diagnostics.Poll != nil {
 				at.Diagnostics = diagnostics
 			}
@@ -499,7 +502,7 @@ func (e *Engine) generate(ctx context.Context, r Request) (*Generation, []Attemp
 			}
 			if ae == nil {
 				im := images[0]
-				if config := configIn(ctx, e.CurrentConfig()); config.WebDAV.Enabled {
+				if config := configIn(ctx, e.CurrentConfig()); config.WebDAV.Enabled && (r.Format != "b64_json" || config.WebDAV.UploadBase64) {
 					uploadStart := time.Now()
 					remote, uploadErr := e.webdav.uploadFile(ctx, config, im.Name, stages)
 					attempts[len(attempts)-1].DurationMS += time.Since(uploadStart).Milliseconds()

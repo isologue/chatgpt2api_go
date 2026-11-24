@@ -98,6 +98,10 @@ func consoleAccountTime(value any) time.Time {
 		if value != nil {
 			return *value
 		}
+	case *string:
+		if value != nil {
+			return consoleAccountTime(*value)
+		}
 	case string:
 		if strings.TrimSpace(value) == "" {
 			return time.Time{}

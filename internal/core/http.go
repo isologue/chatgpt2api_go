@@ -20,6 +20,7 @@ import (
 type API struct {
 	Engine    *Engine
 	responses *limiter
+	oauth     *accountOAuthManager
 }
 
 func NewHandler(e *Engine) http.Handler {
@@ -29,7 +30,7 @@ func NewHandler(e *Engine) http.Handler {
 	if e.responses == nil {
 		e.responses = newLimiter(e.Config.ResponseConcurrency)
 	}
-	a := &API{Engine: e, responses: e.responses}
+	a := &API{Engine: e, responses: e.responses, oauth: newAccountOAuthManager()}
 	m := http.NewServeMux()
 	m.HandleFunc("GET /healthz", a.health)
 	m.HandleFunc("GET /readyz", a.ready)
@@ -37,6 +38,7 @@ func NewHandler(e *Engine) http.Handler {
 	a.registerConsole(m)
 	a.registerAccess(m)
 	a.registerText(m)
+	a.registerAudio(m)
 	a.registerExports(m)
 	m.HandleFunc("POST /v1/images/generations", a.auth(a.captureCreate))
 	m.HandleFunc("POST /v1/images/edits", a.auth(a.edit))
@@ -146,6 +148,8 @@ func (a *API) serveSubmission(w http.ResponseWriter, r *http.Request, req Reques
 	if identity, ok := r.Context().Value(apiIdentityKey{}).(managedAPIKey); ok {
 		req.apiKeyID = identity.ID
 		req.apiKeyName = identity.Name
+		req.apiRoutes = append([]string(nil), identity.Routes...)
+		req.apiGroupID = identity.GroupID
 		req.keyConcurrency = identity.Concurrency
 	}
 	if capture, ok := r.Context().Value(wireCaptureKey{}).(*wireCapture); ok {

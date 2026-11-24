@@ -116,3 +116,33 @@ func TestAvailabilitySQLIncludesAllStates(t *testing.T) {
 		}
 	}
 }
+
+func TestAvailabilityAcceptsDatabaseCooldownPointer(t *testing.T) {
+	now := time.Now().UTC()
+	future := now.Add(time.Minute).Format(time.RFC3339Nano)
+	past := now.Add(-time.Minute).Format(time.RFC3339Nano)
+	var missing *string
+	for _, tc := range []struct {
+		name  string
+		value *string
+		want  string
+	}{
+		{"future cooldown", &future, "cooling"},
+		{"expired cooldown", &past, "available"},
+		{"missing cooldown", missing, "available"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := accountAvailabilityFromFields(map[string]any{
+				"enabled":      true,
+				"available_at": tc.value,
+				"quota":        float64(5),
+			}, now)
+			if got.Status != tc.want {
+				t.Fatalf("status = %s, want %s", got.Status, tc.want)
+			}
+			if tc.want == "cooling" && !got.RecoveryAt.Equal(now.Add(time.Minute)) {
+				t.Fatalf("recovery_at = %s, want %s", got.RecoveryAt, now.Add(time.Minute))
+			}
+		})
+	}
+}

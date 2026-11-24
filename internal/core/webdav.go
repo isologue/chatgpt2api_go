@@ -24,6 +24,7 @@ import (
 // 地址、用户名和密码的默认值均为空；只在管理页明确启用后上传。
 type webDAVConfig struct {
 	Enabled        bool   `json:"enabled"`
+	UploadBase64   bool   `json:"upload_base64"`
 	URL            string `json:"url"`
 	PublicURL      string `json:"public_url"`
 	Root           string `json:"root"`

@@ -120,7 +120,7 @@ func (n *Native) Snapshot() map[string]any {
 		hist[k] = map[string]any{"count": h.Count, "mean_ms": h.Sum / float64(h.Count), "max_ms": h.Max, "histogram": h.Buckets, "bucket_upper_ms": stageBounds}
 	}
 	n.stageMu.Unlock()
-	return map[string]any{"account_persistence_errors": n.persistenceFailures.Load(), "account_refresh_succeeded": n.refreshSucceeded.Load(), "account_refresh_failed": n.refreshFailed.Load(), "account_info_refresh_succeeded": n.refreshSucceeded.Load(), "account_info_refresh_failed": n.refreshFailed.Load(), "account_info_refresh_active": n.accountInfoRefreshActive.Load(), "access_token_refresh_succeeded": n.accessTokenRefreshSucceeded.Load(), "access_token_refresh_failed": n.accessTokenRefreshFailed.Load(), "access_token_refresh_active": n.accessTokenRefreshActive.Load(), "last_refresh_success_unix": n.lastRefreshSuccess.Load(), "last_refresh_failure_unix": n.lastRefreshFailure.Load(), "replenishment_active": n.replenishment.Used(), "replenishment_limit": n.replenishment.Limit(), "replenishment_waiting": n.replenishment.Waiting(), "pow_active": n.pow.Used(), "pow_waiting": n.pow.Waiting(), "pow_limit": n.pow.Limit(), "sse_hard_timeouts": n.sseHardTimeouts.Load(), "stream_timeout_recoveries": n.streamRecoveries.Load(), "turnstile_solver_failures": n.turnstileFailures.Load(), "generation_started": n.started.Load(), "sse_active": n.activeSSE.Load(), "verification_active": n.verifyActive.Load(), "verification_limit": n.verify.Limit(), "verification_waiting": n.verify.Waiting(), "manual_verification_active": n.manualVerifyActive.Load(), "manual_verification_limit": n.manualVerify.Limit(), "manual_verification_waiting": n.manualVerify.Waiting(), "hot_maintenance_active": n.hotMaintenance.Used(), "hot_maintenance_waiting": n.hotMaintenance.Waiting(), "hot_maintenance_limit": n.hotMaintenance.Limit(), "cold_maintenance_active": n.coldMaintenance.Used(), "cold_maintenance_waiting": n.coldMaintenance.Waiting(), "cold_maintenance_limit": n.coldMaintenance.Limit(), "download_active": n.downloadActive.Load(), "download_waiting": n.downloadWaiting.Load(), "download_limit": n.downloads.Limit(), "download_bytes": n.downloadBytes.Load(), "validation_active": n.validationActive.Load(), "validation_waiting": n.validationWaiting.Load(), "validation_limit": n.validation.Limit(), "stages": hist}
+	return map[string]any{"account_persistence_errors": n.persistenceFailures.Load(), "account_refresh_succeeded": n.refreshSucceeded.Load(), "account_refresh_failed": n.refreshFailed.Load(), "account_info_refresh_succeeded": n.refreshSucceeded.Load(), "account_info_refresh_failed": n.refreshFailed.Load(), "account_info_refresh_active": n.accountInfoRefreshActive.Load(), "access_token_refresh_succeeded": n.accessTokenRefreshSucceeded.Load(), "access_token_refresh_failed": n.accessTokenRefreshFailed.Load(), "access_token_refresh_active": n.accessTokenRefreshActive.Load(), "last_refresh_success_unix": n.lastRefreshSuccess.Load(), "last_refresh_failure_unix": n.lastRefreshFailure.Load(), "replenishment_active": n.replenishment.Used(), "replenishment_limit": n.replenishment.Limit(), "replenishment_waiting": n.replenishment.Waiting(), "pow_active": n.pow.Used(), "pow_waiting": n.pow.Waiting(), "pow_limit": n.pow.Limit(), "sse_hard_timeouts": n.sseHardTimeouts.Load(), "stream_timeout_recoveries": n.streamRecoveries.Load(), "turnstile_solver_failures": n.turnstileFailures.Load(), "generation_started": n.started.Load(), "sse_active": n.activeSSE.Load(), "verification_active": n.verifyActive.Load(), "verification_limit": n.verify.Limit(), "verification_waiting": n.verify.Waiting(), "manual_verification_active": n.manualVerifyActive.Load(), "manual_verification_limit": n.manualVerify.Limit(), "manual_verification_waiting": n.manualVerify.Waiting(), "hot_maintenance_active": n.hotMaintenance.Used(), "hot_maintenance_waiting": n.hotMaintenance.Waiting(), "hot_maintenance_limit": n.hotMaintenance.Limit(), "cold_maintenance_active": n.coldMaintenance.Used(), "cold_maintenance_waiting": n.coldMaintenance.Waiting(), "cold_maintenance_limit": n.coldMaintenance.Limit(), "download_active": n.downloadActive.Load(), "download_waiting": n.downloadWaiting.Load(), "download_limit": n.downloads.Limit(), "download_bytes": n.downloadBytes.Load(), "validation_active": n.validationActive.Load(), "validation_waiting": n.validationWaiting.Load(), "validation_limit": n.validation.Limit(), "stages": hist, "proxy_routes": n.routes.snapshot()}
 }
 func tokenExpiring(token string) bool {
 	parts := strings.Split(token, ".")
@@ -150,6 +150,24 @@ func (n *Native) ensureAccount(ctx context.Context, a Account) (Account, error) 
 		}
 	}
 	return fresh, err
+}
+
+// ensureCodexAccount keeps Codex requests on the Codex authentication path.
+// Web account metadata endpoints are not a prerequisite for Codex Responses and
+// can reject a valid Codex-only account or add three extra upstream calls.
+func (n *Native) ensureCodexAccount(ctx context.Context, a Account) (Account, error) {
+	if current, ok := n.pool.Get(a.ID); ok {
+		a = current
+	}
+	if !tokenExpiring(a.AccessToken) {
+		return a, nil
+	}
+	if a.RefreshToken == "" {
+		err := RetryError("account_token_expired", "账号 AT 已过期且没有 RT")
+		err.Invalidate = true
+		return a, err
+	}
+	return n.refreshAccessToken(context.WithValue(ctx, refreshSourceContextKey{}, "codex"), a)
 }
 func (n *Native) checkAccount(ctx context.Context, a Account, force bool) (Account, error) {
 	gate, active := n.verify, &n.verifyActive
@@ -420,10 +438,18 @@ func (n *Native) generateOnce(ctx context.Context, a Account, r Request, stages 
 		}
 	}
 	start := time.Now()
-	a, err := n.ensureAccount(ctx, a)
+	var err error
+	if normalizeAccountRoute(a.Route) == "codex" {
+		a, err = n.ensureCodexAccount(ctx, a)
+	} else {
+		a, err = n.ensureAccount(ctx, a)
+	}
 	n.measure(stages, "账号校验", start)
 	if err != nil {
 		return nil, err
+	}
+	if normalizeAccountRoute(a.Route) == "codex" {
+		return n.generateCodex(ctx, a, r, stages)
 	}
 	s := n.session(a)
 	defer s.close()

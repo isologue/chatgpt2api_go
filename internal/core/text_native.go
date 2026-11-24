@@ -25,6 +25,7 @@ type textInput struct {
 	Effort        string
 	Inputs        []editInput
 	File          bool
+	Metadata      map[string]any
 }
 type textSource struct {
 	Title   string `json:"title"`

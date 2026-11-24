@@ -120,15 +120,23 @@ func (a *API) logRejectedRequest(r *http.Request, c *wireCapture) {
 		// 只在拒绝时提取列表元数据，不给正常请求增加一次 JSON 扫描。
 		_ = json.Unmarshal(c.request, &req)
 	}
-	req.requestKind = "image"
+	if req.requestKind == "" {
+		req.requestKind = "image"
+	}
+	if strings.HasPrefix(r.URL.Path, "/v1/audio/") {
+		req.requestKind = "audio"
+		if req.Model == "" {
+			req.Model = "gpt-transcribe"
+		}
+	}
 	if req.Model == "" {
 		req.Model = "gpt-image-2"
 	}
 	config := a.Engine.CurrentConfig()
-	if !config.AllowUserFormat || req.Format == "" {
+	if req.requestKind != "audio" && (!config.AllowUserFormat || req.Format == "") {
 		req.Format = config.DefaultFormat
 	}
-	if format, err := NormalizeFormat(req.Format); err == nil {
+	if format, err := NormalizeFormat(req.Format); req.requestKind != "audio" && err == nil {
 		req.Format = format
 	}
 	if identity, ok := r.Context().Value(apiIdentityKey{}).(managedAPIKey); ok {

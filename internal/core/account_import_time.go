@@ -21,6 +21,7 @@ type accountImportDates struct {
 }
 type accountImportRange struct{ From, To *time.Time }
 type accountImportRangeKey struct{}
+type accountRoutingKey struct{}
 
 func parseAccountImportRange(from, to string) (accountImportRange, error) {
 	var span accountImportRange
@@ -55,7 +56,15 @@ func selectedAccountImportRange(ctx context.Context) accountImportRange {
 	return span
 }
 func withAccountQuery(ctx context.Context, q consoleQuery) context.Context {
-	return withAccountImportRange(withSelectionGroup(ctx, q.GroupID), accountImportRange{q.ImportedFrom, q.ImportedTo})
+	ctx = withAccountImportRange(withSelectionGroup(ctx, q.GroupID), accountImportRange{q.ImportedFrom, q.ImportedTo})
+	return context.WithValue(ctx, accountRoutingKey{}, [2]string{q.Route, q.Plan})
+}
+func selectedAccountRouting(ctx context.Context) (string, string) {
+	v, _ := ctx.Value(accountRoutingKey{}).([2]string)
+	return v[0], v[1]
+}
+func withAccountRouting(ctx context.Context, route, plan string) context.Context {
+	return context.WithValue(ctx, accountRoutingKey{}, [2]string{route, plan})
 }
 
 // 只拼接实际生效的日期条件，使用独立时间列及参数，避免 JSON 转换和全量内存过滤。

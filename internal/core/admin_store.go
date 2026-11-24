@@ -56,6 +56,7 @@ func (s *Postgres) InsertManagedAccounts(ctx context.Context, accounts []Account
 			return nil, err
 		}
 		a.IdentityID = accountIdentity(a.AccessToken)
+		a.GroupID = groups[i]
 		inserted = append(inserted, a)
 	}
 	if err = results.Close(); err != nil {
@@ -124,6 +125,34 @@ func (s *Postgres) SetAccountEnabled(ctx context.Context, id string, enabled boo
 	}
 	return err
 }
+func (s *Postgres) SetAccountRouting(ctx context.Context, id string, route, plan *string) error {
+	var current []byte
+	if err := s.db.QueryRow(ctx, "SELECT data FROM core_accounts WHERE id=$1", id).Scan(&current); err != nil {
+		return err
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(current, &fields); err != nil {
+		return err
+	}
+	if route != nil {
+		fields["route"] = *route
+	}
+	if plan != nil {
+		fields["plan"] = *plan
+	}
+	// 与运行态 SaveAccount 的版本条件保持一致，避免在途请求用旧快照覆盖管理修改。
+	fields["revision"] = time.Now().UnixNano()
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	tag, err := s.db.Exec(ctx, "UPDATE core_accounts SET data=$2,updated_at=now() WHERE id=$1", id, raw)
+	if err == nil && tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return err
+}
+
 func (s *Postgres) DeleteManagedAccount(ctx context.Context, id string) error {
 	tag, err := s.db.Exec(ctx, "DELETE FROM core_accounts WHERE id=$1", id)
 	if err == nil && tag.RowsAffected() == 0 {
@@ -150,7 +179,10 @@ func (s *Postgres) AccountIDs(ctx context.Context, after string, limit int) ([]s
 func (s *Postgres) AccountIDsMatching(ctx context.Context, after string, limit int, search, status string) ([]string, error) {
 	args := []any{after, search, status, limit, selectionGroup(ctx)}
 	importClause := accountImportSQL(selectedAccountImportRange(ctx), &args)
-	rows, err := s.db.Query(ctx, `SELECT id FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%')`+availabilitySQL("3")+accountGroupSQL(selectionGroup(ctx), "5")+importClause+` ORDER BY id LIMIT $4`, args...)
+	route, plan := selectedAccountRouting(ctx)
+	routeArg, planArg := len(args)+1, len(args)+2
+	args = append(args, route, plan)
+	rows, err := s.db.Query(ctx, fmt.Sprintf(`SELECT id FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%')`+availabilitySQL("3")+accountGroupSQL(selectionGroup(ctx), "5")+importClause+` AND ($%d='' OR COALESCE(NULLIF(data->>'route',''),'web')=$%d) AND ($%d='' OR COALESCE(data->>'plan','')=$%d) ORDER BY id LIMIT $4`, routeArg, routeArg, planArg, planArg), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -168,8 +200,11 @@ func (s *Postgres) AccountIDsMatching(ctx context.Context, after string, limit i
 func (s *Postgres) AccountCountMatching(ctx context.Context, search, status string) (int, error) {
 	args := []any{search, status, selectionGroup(ctx)}
 	importClause := accountImportSQL(selectedAccountImportRange(ctx), &args)
+	route, plan := selectedAccountRouting(ctx)
+	routeArg, planArg := len(args)+1, len(args)+2
+	args = append(args, route, plan)
 	var count int
-	err := s.db.QueryRow(ctx, `SELECT count(*) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%')`+availabilitySQL("2")+accountGroupSQL(selectionGroup(ctx), "3")+importClause, args...).Scan(&count)
+	err := s.db.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%')`+availabilitySQL("2")+accountGroupSQL(selectionGroup(ctx), "3")+importClause+` AND ($%d='' OR COALESCE(NULLIF(data->>'route',''),'web')=$%d) AND ($%d='' OR COALESCE(data->>'plan','')=$%d)`, routeArg, routeArg, planArg, planArg), args...).Scan(&count)
 	return count, err
 }
 func (s *Postgres) DeleteManagedAccounts(ctx context.Context, ids []string) ([]string, error) {
@@ -264,9 +299,9 @@ func (s *Postgres) RecoverAdminJobs(ctx context.Context) error {
 // is intended for an operator-controlled backup/migration download.
 func (s *Postgres) ExportAccounts(ctx context.Context, w io.Writer) error {
 	q := exportSelection(ctx)
-	args := []any{q.Search, q.Status, q.GroupID}
+	args := []any{q.Search, q.Status, q.GroupID, q.Route, q.Plan}
 	importClause := accountImportSQL(accountImportRange{q.ImportedFrom, q.ImportedTo}, &args)
-	rows, err := s.db.Query(ctx, `SELECT data || jsonb_build_object('imported_at',imported_at,'enabled',COALESCE(managed_enabled,(data->>'enabled')::boolean,false),'group_id',group_id,'group_name',(SELECT name FROM core_account_groups WHERE id=group_id),'group_description',(SELECT description FROM core_account_groups WHERE id=group_id)) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%')`+availabilitySQL("2")+accountGroupSQL(q.GroupID, "3")+importClause+` ORDER BY id`, args...)
+	rows, err := s.db.Query(ctx, `SELECT data || jsonb_build_object('imported_at',imported_at,'enabled',COALESCE(managed_enabled,(data->>'enabled')::boolean,false),'group_id',group_id,'group_name',(SELECT name FROM core_account_groups WHERE id=group_id),'group_description',(SELECT description FROM core_account_groups WHERE id=group_id)) FROM core_accounts WHERE ($1='' OR COALESCE(data->>'email','') ILIKE '%'||$1||'%' OR id ILIKE '%'||$1||'%')`+availabilitySQL("2")+accountGroupSQL(q.GroupID, "3")+importClause+` AND ($4='' OR COALESCE(NULLIF(data->>'route',''),'web')=$4) AND ($5='' OR COALESCE(data->>'plan','')=$5) ORDER BY id`, args...)
 	if err != nil {
 		return err
 	}

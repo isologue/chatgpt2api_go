@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
@@ -108,9 +110,25 @@ func decodeProxyConfig(raw []byte) (proxyConfig, error) {
 	return p, p.validate()
 }
 
+type proxyStats struct {
+	leases             atomic.Int64
+	active             atomic.Int64
+	reused             atomic.Int64
+	requests           atomic.Int64
+	success            atomic.Int64
+	failure            atomic.Int64
+	connectionFailures atomic.Int64
+	leaseWaitMS        atomic.Int64
+	leaseWaitMaxMS     atomic.Int64
+	upstreamMS         atomic.Int64
+	upstreamMaxMS      atomic.Int64
+}
+
 type proxyEntry struct {
 	client tlsclient.HttpClient
+	target string
 	refs   int
+	stats  proxyStats
 }
 type proxyRouter struct {
 	mu        sync.Mutex
@@ -125,23 +143,32 @@ func newProxyRouter() *proxyRouter {
 	return &proxyRouter{entries: map[string]*proxyEntry{}, allowed: map[string]bool{}}
 }
 
+// lease is kept as a small compatibility wrapper for existing tests and admin
+// code. Internal sessions use leaseEntry so request metrics can identify the
+// concrete proxy client.
 func (p *proxyRouter) lease(ctx context.Context, c Config) (tlsclient.HttpClient, func(), error) {
+	client, _, release, err := p.leaseEntry(ctx, c)
+	return client, release, err
+}
+
+func (p *proxyRouter) leaseEntry(ctx context.Context, c Config) (tlsclient.HttpClient, *proxyEntry, func(), error) {
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	pc := c.Proxy.normalized(c.ProxyURL)
 	if err := pc.validate(); err != nil {
-		return nil, nil, Err(503, "invalid_proxy_config", err.Error())
+		return nil, nil, nil, Err(503, "invalid_proxy_config", err.Error())
 	}
+	waitStart := time.Now()
 	p.mu.Lock()
+	waitMS := time.Since(waitStart).Milliseconds()
 	defer p.mu.Unlock()
 	if p.closed {
-		return nil, nil, Err(503, "shutting_down", "服务正在停止")
+		return nil, nil, nil, Err(503, "shutting_down", "服务正在停止")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	// 缓存只保留当前配置的出口和仍在使用的旧出口，没有另一个 64 出口限制。
 	configKey := c.TLSProfile + "\x00" + pc.Mode + "\x00" + strings.Join(pc.Proxies, "\n")
 	if configKey != p.configKey {
 		p.configKey = configKey
@@ -172,15 +199,27 @@ func (p *proxyRouter) lease(ctx context.Context, c Config) (tlsclient.HttpClient
 		cc.ProxyURL = target
 		client, err := newTransport(cc)
 		if err != nil {
-			return nil, nil, Err(502, "proxy_transport_failed", "无法初始化代理传输，请检查代理地址")
+			return nil, nil, nil, Err(502, "proxy_transport_failed", "无法初始化代理传输，请检查代理地址")
 		}
-		entry = &proxyEntry{client: client}
+		entry = &proxyEntry{client: client, target: target}
 		p.entries[key] = entry
+	} else {
+		entry.stats.reused.Add(1)
 	}
 	entry.refs++
+	entry.stats.leases.Add(1)
+	entry.stats.active.Add(1)
+	entry.stats.leaseWaitMS.Add(waitMS)
+	for {
+		old := entry.stats.leaseWaitMaxMS.Load()
+		if waitMS <= old || entry.stats.leaseWaitMaxMS.CompareAndSwap(old, waitMS) {
+			break
+		}
+	}
 	var once sync.Once
-	return entry.client, func() {
+	return entry.client, entry, func() {
 		once.Do(func() {
+			entry.stats.active.Add(-1)
 			p.mu.Lock()
 			defer p.mu.Unlock()
 			entry.refs--
@@ -190,6 +229,47 @@ func (p *proxyRouter) lease(ctx context.Context, c Config) (tlsclient.HttpClient
 			}
 		})
 	}, nil
+}
+
+func (p *proxyRouter) snapshot() []map[string]any {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	routes := make([]map[string]any, 0, len(p.entries))
+	for _, entry := range p.entries {
+		leases := entry.stats.leases.Load()
+		requests := entry.stats.requests.Load()
+		failures := entry.stats.failure.Load()
+		avgWait, avgUpstream := float64(0), float64(0)
+		if leases > 0 {
+			avgWait = float64(entry.stats.leaseWaitMS.Load()) / float64(leases)
+		}
+		if requests > 0 {
+			avgUpstream = float64(entry.stats.upstreamMS.Load()) / float64(requests)
+		}
+		reuseRate := float64(0)
+		if leases > 0 {
+			reuseRate = float64(entry.stats.reused.Load()) / float64(leases)
+		}
+		failureRate := float64(0)
+		if requests > 0 {
+			failureRate = float64(failures) / float64(requests)
+		}
+		target := entry.target
+		if target == "" {
+			target = "direct"
+		} else if parsed, err := url.Parse(target); err == nil {
+			target = parsed.Host
+		}
+		routes = append(routes, map[string]any{
+			"target": target, "active": entry.stats.active.Load(), "leases": leases,
+			"reused": entry.stats.reused.Load(), "client_reuse_rate": reuseRate,
+			"requests": requests, "success": entry.stats.success.Load(), "failure": failures,
+			"connection_failures": entry.stats.connectionFailures.Load(), "failure_rate": failureRate,
+			"lease_wait_avg_ms": avgWait, "lease_wait_max_ms": entry.stats.leaseWaitMaxMS.Load(),
+			"upstream_avg_ms": avgUpstream, "upstream_max_ms": entry.stats.upstreamMaxMS.Load(),
+		})
+	}
+	return routes
 }
 func (p *proxyRouter) close() {
 	p.mu.Lock()
@@ -210,6 +290,7 @@ func (s *session) close() {
 	if s.routeRelease != nil {
 		s.routeRelease()
 		s.routeRelease = nil
+		s.routeEntry = nil
 	}
 }
 func (s *session) do(req *fhttp.Request) (*fhttp.Response, error) {
@@ -229,17 +310,39 @@ func (s *session) do(req *fhttp.Request) (*fhttp.Response, error) {
 				s.routeMu.Unlock()
 				return nil, Err(503, "proxy_unavailable", "代理路由尚未初始化")
 			}
-			client, release, err := s.n.routes.lease(req.Context(), c)
+			client, entry, release, err := s.n.routes.leaseEntry(req.Context(), c)
 			if err != nil {
 				s.routeMu.Unlock()
 				return nil, err
 			}
-			s.routeClient, s.routeRelease, s.routeProxy = client, release, c.Proxy.Mode == "proxy"
+			s.routeClient, s.routeRelease, s.routeProxy, s.routeEntry = client, release, c.Proxy.Mode == "proxy", entry
 		}
 	}
-	client, proxy := s.routeClient, s.routeProxy
+	client, proxy, entry := s.routeClient, s.routeProxy, s.routeEntry
 	s.routeMu.Unlock()
+	started := time.Now()
+	if entry != nil {
+		entry.stats.requests.Add(1)
+	}
 	resp, err := client.Do(req)
+	if entry != nil {
+		ms := time.Since(started).Milliseconds()
+		entry.stats.upstreamMS.Add(ms)
+		for {
+			old := entry.stats.upstreamMaxMS.Load()
+			if ms <= old || entry.stats.upstreamMaxMS.CompareAndSwap(old, ms) {
+				break
+			}
+		}
+		if err != nil || resp == nil || resp.StatusCode >= 400 {
+			entry.stats.failure.Add(1)
+			if err != nil {
+				entry.stats.connectionFailures.Add(1)
+			}
+		} else {
+			entry.stats.success.Add(1)
+		}
+	}
 	if err != nil && proxy {
 		if req.Context().Err() != nil {
 			return nil, req.Context().Err()

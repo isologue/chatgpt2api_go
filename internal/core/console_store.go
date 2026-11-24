@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -19,7 +20,9 @@ func (s *Postgres) ConsoleAccounts(ctx context.Context, q consoleQuery) (map[str
 	}
 	args := []any{cursor, q.Search, q.Status, q.Limit + 1, q.GroupID}
 	importClause := accountImportSQL(accountImportRange{q.ImportedFrom, q.ImportedTo}, &args)
-	rows, err := s.db.Query(ctx, `SELECT id, COALESCE(data->>'email',''), COALESCE((data->>'score')::int,0), COALESCE(managed_enabled,(data->>'enabled')::boolean,false), right(COALESCE(data->>'access_token',''),6), COALESCE(data->>'refresh_token','')<>'', data->>'verified_at', data->>'success_at', data->>'available_at',jsonb_build_object('imported_at',imported_at,'hot',COALESCE((data->>'hot')::boolean,false),'quota',data->'quota','quota_reset_at',data->'quota_reset_at','rate_limited_until',data->'rate_limited_until','rate_limit_reason',data->'rate_limit_reason','rate_limit_source',data->'rate_limit_source','rate_limit_message',data->'rate_limit_message','status',data->'status','last_error_code',data->'last_error_code','last_refresh_at',data->'last_refresh_at','last_refresh_error',data->'last_refresh_error','next_refresh_at',data->'next_refresh_at','last_token_refresh_at',data->'last_token_refresh_at','last_token_refresh_error',data->'last_token_refresh_error','last_token_refresh_error_at',data->'last_token_refresh_error_at','group_id',group_id,'group_name',(SELECT name FROM core_account_groups WHERE id=group_id)) FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%')`+availabilitySQL("3")+accountGroupSQL(q.GroupID, "5")+importClause+` ORDER BY id LIMIT $4`, args...)
+	routeArg, planArg := len(args)+1, len(args)+2
+	args = append(args, q.Route, q.Plan)
+	rows, err := s.db.Query(ctx, `SELECT id, COALESCE(data->>'email',''), COALESCE((data->>'score')::int,0), COALESCE(managed_enabled,(data->>'enabled')::boolean,false), right(COALESCE(data->>'access_token',''),6), COALESCE(data->>'refresh_token','')<>'', data->>'verified_at', data->>'success_at', data->>'available_at',jsonb_build_object('call_success_count',COALESCE((data->>'call_success_count')::bigint,0),'call_failure_count',COALESCE((data->>'call_failure_count')::bigint,0),'imported_at',imported_at,'hot',COALESCE((data->>'hot')::boolean,false),'quota',data->'quota','quota_reset_at',data->'quota_reset_at','rate_limited_until',data->'rate_limited_until','rate_limit_reason',data->'rate_limit_reason','rate_limit_source',data->'rate_limit_source','rate_limit_message',data->'rate_limit_message','status',data->'status','last_error_code',data->'last_error_code','last_refresh_at',data->'last_refresh_at','last_refresh_error',data->'last_refresh_error','next_refresh_at',data->'next_refresh_at','last_token_refresh_at',data->'last_token_refresh_at','last_token_refresh_error',data->'last_token_refresh_error','last_token_refresh_error_at',data->'last_token_refresh_error_at','route',COALESCE(NULLIF(data->>'route',''),'web'),'plan',COALESCE(data->>'plan',''),'group_id',group_id,'group_name',(SELECT name FROM core_account_groups WHERE id=group_id)) FROM core_accounts WHERE id>$1 AND ($2='' OR COALESCE(data->>'email','') ILIKE '%'||$2||'%' OR id ILIKE '%'||$2||'%')`+availabilitySQL("3")+accountGroupSQL(q.GroupID, "5")+importClause+fmt.Sprintf(` AND ($%d='' OR COALESCE(NULLIF(data->>'route',''),'web')=$%d) AND ($%d='' OR COALESCE(data->>'plan','')=$%d)`, routeArg, routeArg, planArg, planArg)+` ORDER BY id LIMIT $4`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -70,14 +73,14 @@ type requestCursor struct {
 // 历史日志不依赖当前模型映射推断类型，也不读取原始请求/响应；搜索请求属于对话。
 const consoleRequestKindSQL = `CASE
  WHEN request_kind IN ('text','search') THEN 'text'
- WHEN request_kind IN ('image','file') THEN request_kind
+ WHEN request_kind IN ('image','file','audio') THEN request_kind
  WHEN request_kind='' AND left(id,5)='chat_' THEN 'text'
  WHEN request_kind='' AND left(id,9)='filetask_' THEN 'file'
  WHEN request_kind='' AND (left(id,5)='task_' OR model='gpt-image-2' OR image_count>0) THEN 'image'
  ELSE 'unknown' END`
 
 func (s *Postgres) ConsoleRequests(ctx context.Context, q consoleQuery) (map[string]any, error) {
-	if q.Kind != "" && q.Kind != "image" && q.Kind != "file" && q.Kind != "text" {
+	if q.Kind != "" && q.Kind != "image" && q.Kind != "file" && q.Kind != "text" && q.Kind != "audio" {
 		return nil, Err(400, "invalid_request_kind", "无效的调用类型")
 	}
 	if q.Status != "" && q.Status != "succeeded" && q.Status != "failed" && q.Status != "safety_rejected" {
@@ -92,7 +95,17 @@ func (s *Postgres) ConsoleRequests(ctx context.Context, q consoleQuery) (map[str
 			return nil, Err(400, "invalid_cursor", "分页游标无效")
 		}
 	}
-	rows, err := s.db.Query(ctx, `SELECT id, created_at, model, is_async, response_format, status, duration_ms, started_at,finished_at,queue_ms,COALESCE(switch_count,(SELECT count(*) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(attempts)='array' THEN attempts ELSE '[]'::jsonb END) WITH ORDINALITY AS a(item, ord) WHERE COALESCE(item->>'code','')<>'' AND ord < CASE WHEN jsonb_typeof(attempts)='array' THEN jsonb_array_length(attempts) ELSE 0 END)),api_key_id,api_key_name,upstream_model,`+consoleRequestKindSQL+` FROM core_requests WHERE (created_at,id)<($1,$2) AND ($3='' OR id ILIKE '%'||$3||'%' OR model ILIKE '%'||$3||'%' OR upstream_model ILIKE '%'||$3||'%') AND ($4='' OR status=$4) AND ($6='' OR is_async=($6='true')) AND ($7='' OR response_format=$7) AND ($8::timestamptz IS NULL OR created_at >= $8) AND ($9::timestamptz IS NULL OR created_at < $9) AND ($10='' OR api_key_id=$10) AND ($11='' OR (`+consoleRequestKindSQL+`)=$11) ORDER BY created_at DESC,id DESC LIMIT $5`, cursor.Created, cursor.ID, q.Search, q.Status, q.Limit+1, q.Async, q.Format, q.From, q.To, q.KeyID, q.Kind)
+	// 计数与列表共用筛选条件；总数不受分页游标影响，只在第一页统计。
+	filter := `($1='' OR id ILIKE '%'||$1||'%' OR model ILIKE '%'||$1||'%' OR upstream_model ILIKE '%'||$1||'%') AND ($2='' OR status=$2) AND ($3='' OR is_async=($3='true')) AND ($4='' OR response_format=$4) AND ($5::timestamptz IS NULL OR created_at >= $5) AND ($6::timestamptz IS NULL OR created_at < $6) AND ($7='' OR api_key_id=$7) AND ($8='' OR (`+consoleRequestKindSQL+`)=$8)`
+	args := []any{q.Search, q.Status, q.Async, q.Format, q.From, q.To, q.KeyID, q.Kind}
+	var total int64
+	if q.Cursor == "" {
+		if err := s.db.QueryRow(ctx, `SELECT count(*) FROM core_requests WHERE `+filter, args...).Scan(&total); err != nil {
+			return nil, err
+		}
+	}
+	args = append(args, cursor.Created, cursor.ID, q.Limit+1)
+	rows, err := s.db.Query(ctx, `SELECT id, created_at, model, is_async, response_format, status, duration_ms, started_at,finished_at,queue_ms,COALESCE(switch_count,(SELECT count(*) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(attempts)='array' THEN attempts ELSE '[]'::jsonb END) WITH ORDINALITY AS a(item, ord) WHERE COALESCE(item->>'code','')<>'' AND ord < CASE WHEN jsonb_typeof(attempts)='array' THEN jsonb_array_length(attempts) ELSE 0 END)),api_key_id,api_key_name,upstream_model,`+consoleRequestKindSQL+`,image_resized FROM core_requests WHERE `+filter+` AND (created_at,id)<($9,$10) ORDER BY created_at DESC,id DESC LIMIT $11`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -108,20 +121,25 @@ func (s *Postgres) ConsoleRequests(ctx context.Context, q consoleQuery) (map[str
 		var started, finished *time.Time
 		var queue *int64
 		var switches int
-		if err := rows.Scan(&id, &created, &model, &async, &format, &status, &duration, &started, &finished, &queue, &switches, &keyID, &keyName, &upstreamModel, &kind); err != nil {
+		var resized *bool
+		if err := rows.Scan(&id, &created, &model, &async, &format, &status, &duration, &started, &finished, &queue, &switches, &keyID, &keyName, &upstreamModel, &kind, &resized); err != nil {
 			return nil, err
 		}
 		if len(items) == q.Limit {
 			next = encodeConsoleCursor(last)
 			break
 		}
-		items = append(items, map[string]any{"id": id, "created_at": created, "model": model, "upstream_model": upstreamModel, "request_kind": kind, "is_async": async, "response_format": format, "status": status, "duration_ms": duration, "started_at": started, "finished_at": finished, "queue_ms": queue, "switch_count": switches, "api_key_id": keyID, "api_key_name": keyName})
+		items = append(items, map[string]any{"id": id, "created_at": created, "model": model, "upstream_model": upstreamModel, "request_kind": kind, "is_async": async, "response_format": format, "status": status, "duration_ms": duration, "started_at": started, "finished_at": finished, "queue_ms": queue, "switch_count": switches, "image_resized": resized, "api_key_id": keyID, "api_key_name": keyName})
 		last = requestCursor{Created: created, ID: id}
 	}
 	if rows.Err() != nil {
 		return nil, rows.Err()
 	}
-	return map[string]any{"items": items, "next_cursor": next}, nil
+	result := map[string]any{"items": items, "next_cursor": next}
+	if q.Cursor == "" {
+		result["total"] = total
+	}
+	return result, nil
 }
 func (s *Postgres) ConsoleRequest(ctx context.Context, id string) (map[string]any, error) {
 	var upstreamModel, kind string
@@ -146,5 +164,5 @@ func (s *Postgres) ConsoleRequest(ctx context.Context, id string) (map[string]an
 			return nil, err
 		}
 	}
-	return map[string]any{"id": reqID, "created_at": created, "model": model, "upstream_model": upstreamModel, "request_kind": kind, "is_async": async, "response_format": format, "status": status, "duration_ms": duration, "attempts": aa, "error": ae, "started_at": started, "finished_at": finished, "queue_ms": queue, "api_key_id": keyID, "api_key_name": keyName}, nil
+	return map[string]any{"id": reqID, "created_at": created, "model": model, "upstream_model": upstreamModel, "request_kind": kind, "is_async": async, "response_format": format, "status": status, "duration_ms": duration, "attempts": aa, "image_resized": imageResizeSummary(aa), "error": ae, "started_at": started, "finished_at": finished, "queue_ms": queue, "api_key_id": keyID, "api_key_name": keyName}, nil
 }

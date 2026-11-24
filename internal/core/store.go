@@ -52,6 +52,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS core_accounts_identity ON core_accounts(identi
 CREATE TABLE IF NOT EXISTS core_access(id int PRIMARY KEY CHECK(id=1),admin_hash text NOT NULL,session_hash text NOT NULL DEFAULT '',session_created_at timestamptz,revision bigint NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS core_api_keys(id text PRIMARY KEY,name text NOT NULL,key_value text NOT NULL,key_hash text NOT NULL UNIQUE,enabled boolean NOT NULL DEFAULT true,revision bigint NOT NULL DEFAULT 0,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now());
 ALTER TABLE core_api_keys ADD COLUMN IF NOT EXISTS concurrency bigint NOT NULL DEFAULT 0 CHECK(concurrency>=0);
+ALTER TABLE core_api_keys ADD COLUMN IF NOT EXISTS routes text NOT NULL DEFAULT '';
+ALTER TABLE core_api_keys ADD COLUMN IF NOT EXISTS group_id text NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS core_account_push(id int PRIMARY KEY CHECK(id=1),enabled boolean NOT NULL DEFAULT false,key_hash text NOT NULL DEFAULT '',revision bigint NOT NULL DEFAULT 0);
 ALTER TABLE core_account_push ADD COLUMN IF NOT EXISTS key_value text NOT NULL DEFAULT '';
 INSERT INTO core_account_push(id) VALUES(1) ON CONFLICT DO NOTHING;
@@ -75,6 +77,7 @@ ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS finished_at timestamptz;
 ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS queue_ms bigint;
 ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS switch_count int;
 ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS image_count int;
+ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS image_resized boolean;
 ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS api_key_id text NOT NULL DEFAULT '';
 ALTER TABLE core_requests ADD COLUMN IF NOT EXISTS api_key_name text NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS core_requests_key_page ON core_requests(api_key_id,created_at DESC,id DESC);
@@ -130,7 +133,7 @@ func (s *Postgres) Close() {
 	}
 }
 func (s *Postgres) LoadAccounts(ctx context.Context) ([]Account, error) {
-	rows, err := s.db.Query(ctx, "SELECT data || jsonb_build_object('enabled',COALESCE(managed_enabled,(data->>'enabled')::boolean,false)) FROM core_accounts")
+	rows, err := s.db.Query(ctx, "SELECT data || jsonb_build_object('enabled',COALESCE(managed_enabled,(data->>'enabled')::boolean,false)), group_id FROM core_accounts")
 	if err != nil {
 		return nil, err
 	}
@@ -138,13 +141,15 @@ func (s *Postgres) LoadAccounts(ctx context.Context) ([]Account, error) {
 	var out []Account
 	for rows.Next() {
 		var b []byte
+		var groupID string
 		var a Account
-		if err = rows.Scan(&b); err != nil {
+		if err = rows.Scan(&b, &groupID); err != nil {
 			return nil, err
 		}
 		if err = json.Unmarshal(b, &a); err != nil {
 			return nil, err
 		}
+		a.GroupID = groupID
 		out = append(out, a)
 	}
 	return out, rows.Err()
@@ -240,15 +245,17 @@ type batchLogStore interface {
 	LogBatch(context.Context, []requestLog) error
 }
 
-const requestLogInsert = "INSERT INTO core_requests(id,created_at,started_at,finished_at,queue_ms,switch_count,image_count,model,is_async,response_format,status,duration_ms,attempts,error,api_key_id,api_key_name,upstream_model,request_kind) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)"
+const requestLogInsert = "INSERT INTO core_requests(id,created_at,started_at,finished_at,queue_ms,switch_count,image_count,model,is_async,response_format,status,duration_ms,attempts,error,api_key_id,api_key_name,upstream_model,request_kind,image_resized) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)"
 
 // 新日志使用入口类型；兼容直接调用 Store.Log 的旧调用与扩展。
 func requestLogKind(id string, r Request) string {
 	switch r.requestKind {
-	case "image", "text", "file":
+	case "image", "text", "file", "audio":
 		return r.requestKind
 	}
 	switch {
+	case strings.HasPrefix(id, "audio_"):
+		return "audio"
 	case strings.HasPrefix(id, "chat_"):
 		return "text"
 	case strings.HasPrefix(id, "filetask_"):
@@ -294,7 +301,7 @@ func requestLogValues(l requestLog) (any, error) {
 	if l.err == nil {
 		images = l.req.N
 	}
-	return []any{l.id, timing.Finished, started, timing.Finished, timing.QueueMS, switches, images, l.req.Model, l.req.Async, l.req.Format, status, l.duration.Milliseconds(), a, eb, l.req.apiKeyID, l.req.apiKeyName, l.req.UpstreamModel, requestLogKind(l.id, l.req)}, nil
+	return []any{l.id, timing.Finished, started, timing.Finished, timing.QueueMS, switches, images, l.req.Model, l.req.Async, l.req.Format, status, l.duration.Milliseconds(), a, eb, l.req.apiKeyID, l.req.apiKeyName, l.req.UpstreamModel, requestLogKind(l.id, l.req), imageResizeSummary(l.attempts)}, nil
 }
 
 func (s *Postgres) Log(ctx context.Context, id string, r Request, attempts []Attempt, e *APIError, d time.Duration) error {

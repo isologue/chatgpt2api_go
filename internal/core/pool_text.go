@@ -50,23 +50,31 @@ func (h *textAccountHeap) Pop() any {
 	return e
 }
 func textAvailable(a Account) time.Time { return maxTime(a.AvailableAt, a.NextRefreshAt) }
-func paidAccount(a Account) bool {
+func accountPlan(a Account) string {
+	if plan := normalizeAccountPlan(a.Plan); plan != "" {
+		return plan
+	}
 	var plans []string
-	for _, k := range []string{"plan_type", "type", "account_type", "chatgpt_plan_type"} {
+	for _, k := range []string{"plan_type", "type", "account_type", "chatgpt_plan_type", "subscription_plan", "plan"} {
 		var v string
 		_ = json.Unmarshal(a.Extra[k], &v)
-		plans = append(plans, strings.ToLower(v))
+		plans = append(plans, strings.ToLower(strings.TrimSpace(v)))
 	}
 	claims := tokenClaims(a.AccessToken)
-	plans = append(plans, strings.ToLower(str(obj(claims["https://api.openai.com/auth"])["chatgpt_plan_type"])))
-	for _, v := range plans {
-		switch v {
-		case "plus", "team", "pro", "enterprise", "business":
-			return true
+	auth := obj(claims["https://api.openai.com/auth"])
+	plans = append(plans, strings.ToLower(strings.TrimSpace(str(auth["chatgpt_plan_type"]))))
+	for _, value := range plans {
+		switch value {
+		case "free", "":
+			continue
+		case "plus", "team", "pro", "enterprise", "business", "edu":
+			return value
 		}
 	}
-	return false
+	return "free"
 }
+
+func paidAccount(a Account) bool { return accountPlan(a) != "free" }
 func (p *Pool) detachText(e *entry) {
 	if e.textIndex < 0 {
 		return
@@ -91,6 +99,10 @@ func (p *Pool) enqueueText(e *entry) {
 	}
 }
 func (p *Pool) AcquireText(exclude map[string]bool, paid bool) (Account, bool) {
+	return p.acquireTextWithSelector(exclude, paid, AccountSelector{})
+}
+
+func (p *Pool) acquireTextWithSelector(exclude map[string]bool, paid bool, selector AccountSelector) (Account, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for p.textDelayed.Len() > 0 && !textAvailable(p.textDelayed.items[0].a).After(time.Now()) {
@@ -108,7 +120,7 @@ func (p *Pool) AcquireText(exclude map[string]bool, paid bool) (Account, bool) {
 			return Account{}, false
 		}
 		e := heap.Pop(&p.textReady).(*entry)
-		if exclude[e.a.ID] {
+		if exclude[e.a.ID] || !selector.allows(e.a) {
 			skipped = append(skipped, e)
 			continue
 		}

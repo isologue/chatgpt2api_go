@@ -20,7 +20,7 @@ type Config struct {
 	PowConcurrency, ThumbnailConcurrency                                                                                                                                   int
 	ValidationConcurrency                                                                                                                                                  int
 	OAuthURL                                                                                                                                                               string
-	Listen, DatabaseURL, APIKey, AdminKey, PublicURL, ImageDir, ProxyURL, UpstreamURL, UpstreamModel, TLSProfile                                                           string
+	Listen, DatabaseURL, APIKey, AdminKey, PublicURL, ImageDir, ProxyURL, UpstreamURL, UpstreamModel, CodexModel, CodexImageModel, TLSProfile                              string
 	Workers, QueueSize, DownloadConcurrency, AccountSlots, SwitchRetries, DownloadRetries, DBConnections, VerifyConcurrency, ResponseConcurrency, LogWriters, LogQueueSize int
 	ImportMaxMiB, HotPoolSize                                                                                                                                              int
 	TotalTimeout, SSETimeout, PollTimeout, DownloadTimeout, MetadataTimeout, Freshness, HotIdle, HotMaintenanceInterval, ColdMaintenanceInterval                           time.Duration
@@ -30,7 +30,7 @@ type Config struct {
 }
 
 func LoadConfig() (Config, error) {
-	c := Config{WebDAV: webDAVConfig{Concurrency: 16, TimeoutSeconds: 30, Retries: 1}, OAuthURL: os.Getenv("CORE_OAUTH_URL"), Listen: env("CORE_LISTEN", ":9080"), DatabaseURL: os.Getenv("CORE_DATABASE_URL"), APIKey: os.Getenv("CORE_API_KEY"), AdminKey: os.Getenv("CORE_ADMIN_KEY"), PublicURL: os.Getenv("CORE_PUBLIC_URL"), ImageDir: env("CORE_IMAGE_DIR", "data/images"), ProxyURL: os.Getenv("CORE_PROXY_URL"), UpstreamURL: strings.TrimRight(env("CORE_UPSTREAM_URL", "https://chatgpt.com"), "/"), UpstreamModel: env("CORE_UPSTREAM_MODEL", "gpt-6"), TLSProfile: env("CORE_TLS_PROFILE", "chrome_110"), DefaultFormat: env("CORE_RESPONSE_FORMAT", "url"), AllowUserFormat: true}
+	c := Config{WebDAV: webDAVConfig{Concurrency: 16, TimeoutSeconds: 30, Retries: 1}, OAuthURL: os.Getenv("CORE_OAUTH_URL"), Listen: env("CORE_LISTEN", ":9080"), DatabaseURL: os.Getenv("CORE_DATABASE_URL"), APIKey: os.Getenv("CORE_API_KEY"), AdminKey: os.Getenv("CORE_ADMIN_KEY"), PublicURL: os.Getenv("CORE_PUBLIC_URL"), ImageDir: env("CORE_IMAGE_DIR", "data/images"), ProxyURL: os.Getenv("CORE_PROXY_URL"), UpstreamURL: strings.TrimRight(env("CORE_UPSTREAM_URL", "https://chatgpt.com"), "/"), UpstreamModel: env("CORE_UPSTREAM_MODEL", "gpt-6"), CodexModel: env("CORE_CODEX_MODEL", "gpt-6-luna"), CodexImageModel: env("CORE_CODEX_IMAGE_MODEL", "gpt-image-2.6"), TLSProfile: env("CORE_TLS_PROFILE", "chrome_110"), DefaultFormat: env("CORE_RESPONSE_FORMAT", "url"), AllowUserFormat: true}
 	var err error
 	c.TextConcurrency = 100
 	c.FileConcurrency = 4

@@ -53,11 +53,13 @@ func applyImageParameters(payload map[string]any, extra map[string]json.RawMessa
 // 内部扩展参数独立持久化；不修改公共 Request JSON，也不允许调用方注入内部字段。
 type storedImageRequest struct {
 	Request
-	Extra map[string]json.RawMessage `json:"_image_extra,omitempty"`
+	Extra  map[string]json.RawMessage `json:"_image_extra,omitempty"`
+	Routes []string                   `json:"_account_routes,omitempty"`
+	Group  string                     `json:"_account_group,omitempty"`
 }
 
 func marshalStoredRequest(r Request) ([]byte, error) {
-	return json.Marshal(storedImageRequest{Request: r, Extra: r.extraFields})
+	return json.Marshal(storedImageRequest{Request: r, Extra: r.extraFields, Routes: append([]string(nil), r.apiRoutes...), Group: r.apiGroupID})
 }
 func unmarshalStoredRequest(raw []byte, r *Request) error {
 	stored := storedImageRequest{Request: *r}
@@ -66,5 +68,7 @@ func unmarshalStoredRequest(raw []byte, r *Request) error {
 	}
 	*r = stored.Request
 	r.extraFields = stored.Extra
+	r.apiRoutes = append([]string(nil), stored.Routes...)
+	r.apiGroupID = stored.Group
 	return nil
 }

@@ -56,17 +56,23 @@ func textAPIError(ctx context.Context, err error) *APIError {
 	return AsError(err)
 }
 func (e *Engine) runText(ctx context.Context, in textInput, identity managedAPIKey, emit func(string) error) (result textResult, apiErr *APIError) {
+	g, ok := e.Generator.(textGenerator)
+	if !ok {
+		return result, Err(503, "text_unavailable", "当前生成器不支持聊天和搜索")
+	}
+	req := Request{requestKind: "text", UpstreamModel: in.UpstreamModel, Prompt: in.Messages[len(in.Messages)-1].Content, Model: in.Model, apiKeyID: identity.ID, apiKeyName: identity.Name, keyConcurrency: identity.Concurrency}
+	return e.runTextOperation(ctx, req, AccountSelector{}, func(ctx context.Context, account Account, stages map[string]float64, wrapped func(string) error) (textResult, error) {
+		return g.Text(ctx, account, in, stages, wrapped)
+	}, emit)
+}
+
+// 文本与语音共享准入、账号槽位、总预算、切号及日志，避免音频绕过并发限制。
+func (e *Engine) runTextOperation(ctx context.Context, req Request, selector AccountSelector, generate func(context.Context, Account, map[string]float64, func(string) error) (textResult, error), emit func(string) error) (result textResult, apiErr *APIError) {
 	e.admission.RLock()
 	if e.closing.Load() {
 		e.admission.RUnlock()
 		return result, Err(503, "shutting_down", "服务正在停止")
 	}
-	g, ok := e.Generator.(textGenerator)
-	if !ok {
-		e.admission.RUnlock()
-		return result, Err(503, "text_unavailable", "当前生成器不支持聊天和搜索")
-	}
-	req := Request{requestKind: "text", UpstreamModel: in.UpstreamModel, Prompt: in.Messages[len(in.Messages)-1].Content, Model: in.Model, apiKeyID: identity.ID, apiKeyName: identity.Name, keyConcurrency: identity.Concurrency}
 	release, err := e.acquireKey(req)
 	if err != nil {
 		e.admission.RUnlock()
@@ -75,7 +81,7 @@ func (e *Engine) runText(ctx context.Context, in textInput, identity managedAPIK
 	if !e.textSlots.TryAcquire() {
 		release()
 		e.admission.RUnlock()
-		return result, Err(429, "text_concurrency_full", "聊天与搜索并发已满")
+		return result, Err(429, "text_concurrency_full", "聊天、搜索与语音转写并发已满")
 	}
 	e.wg.Add(1)
 	e.admission.RUnlock()
@@ -83,7 +89,11 @@ func (e *Engine) runText(ctx context.Context, in textInput, identity managedAPIK
 	defer release()
 	defer e.textSlots.Release()
 	started := time.Now()
-	id := "chat_" + uuid.NewString()
+	prefix := "chat_"
+	if req.requestKind == "audio" {
+		prefix = "audio_"
+	}
+	id := prefix + uuid.NewString()
 	var persisted chan struct{}
 	if c, ok := ctx.Value(wireCaptureKey{}).(*wireCapture); ok {
 		c.id = id
@@ -110,22 +120,22 @@ func (e *Engine) runText(ctx context.Context, in textInput, identity managedAPIK
 	}
 	for i := 0; i <= config.SwitchRetries; i++ {
 		if ctx.Err() != nil {
-			return result, textAPIError(ctx, ctx.Err())
+			return result, operationAPIError(ctx, req.requestKind, ctx.Err())
 		}
-		account, ok := e.Pool.AcquireText(exclude, false)
+		account, ok := e.Pool.acquireTextWithSelector(exclude, false, selector)
 		if !ok {
 			if apiErr != nil {
 				return result, apiErr
 			}
-			return result, Err(503, "no_available_account", "暂无可用聊天账号槽位")
+			return result, Err(503, "no_available_account", "暂无符合条件的可用账号槽位")
 		}
 		exclude[account.ID] = true
 		at := time.Now()
 		stages := map[string]float64{}
-		result, err = g.Text(ctx, account, in, stages, wrapped)
+		result, err = generate(ctx, account, stages, wrapped)
 		var ae *APIError
 		if err != nil {
-			ae = textAPIError(ctx, err)
+			ae = operationAPIError(ctx, req.requestKind, err)
 		}
 		updated := e.Pool.ReleaseText(account.ID, ae)
 		persist, done := context.WithTimeout(e.root, 5*time.Second)
@@ -137,6 +147,10 @@ func (e *Engine) runText(ctx context.Context, in textInput, identity managedAPIK
 		attempt := Attempt{AccountID: account.ID, Email: account.Email, Started: at, DurationMS: time.Since(at).Milliseconds(), Stages: stages}
 		if ae != nil {
 			attempt.Code = ae.Code
+			attempt.HTTPStatus = ae.Status
+			attempt.Error = Err(ae.Status, ae.Code, ae.Message)
+			attempt.RawResponse = string(ae.rawResponse)
+			attempt.RawResponseTruncated = ae.rawResponseTruncated
 		}
 		attempts = append(attempts, attempt)
 		if ae == nil {
@@ -149,6 +163,14 @@ func (e *Engine) runText(ctx context.Context, in textInput, identity managedAPIK
 	}
 	return result, apiErr
 }
+func operationAPIError(ctx context.Context, kind string, err error) *APIError {
+	ae := textAPIError(ctx, err)
+	if kind == "audio" && ae.Code == "text_timeout" {
+		return Err(504, "audio_timeout", "语音转写请求总预算已耗尽")
+	}
+	return ae
+}
+
 func (a *API) registerText(m *http.ServeMux) {
 	for route, kind := range map[string]string{"POST /v1/chat/completions": "chat", "POST /v1/responses": "responses", "POST /v1/search": "search", "POST /v1/messages": "messages"} {
 		kind := kind
@@ -226,10 +248,25 @@ func parseText(body map[string]json.RawMessage, kind string) (textInput, bool, e
 	if v, ok := body["stream"]; ok && json.Unmarshal(v, &stream) != nil {
 		return in, false, Err(400, "invalid_stream", "stream 应为布尔值")
 	}
-	for _, key := range []string{"functions", "function_call", "previous_response_id", "conversation", "background", "response_format", "tool_choice", "audio", "modalities", "temperature", "top_p", "top_k", "max_tokens", "max_completion_tokens", "max_output_tokens", "stop", "stop_sequences", "seed", "presence_penalty", "frequency_penalty", "logprobs", "top_logprobs", "reasoning", "thinking"} {
+	unsupported := []string{"functions", "function_call", "conversation", "audio", "modalities", "temperature", "top_p", "top_k", "max_tokens", "max_completion_tokens", "stop", "stop_sequences", "seed", "presence_penalty", "frequency_penalty", "logprobs", "top_logprobs"}
+	if kind == "responses" {
+		// These are valid Responses envelope fields even though the legacy
+		// conversation upstream does not use them directly.
+		unsupported = append(unsupported, "previous_response_id", "background", "response_format", "tool_choice", "reasoning", "thinking")
+	} else {
+		unsupported = append(unsupported, "previous_response_id", "background", "response_format", "tool_choice", "reasoning", "thinking")
+	}
+	for _, key := range unsupported {
 		if _, ok := body[key]; ok {
 			return in, false, Err(400, "unsupported_parameter", "当前适配暂不支持 "+key)
 		}
+	}
+	if raw, ok := body["metadata"]; ok {
+		var metadata map[string]any
+		if json.Unmarshal(raw, &metadata) != nil || metadata == nil {
+			return in, false, Err(400, "invalid_metadata", "metadata 应为 JSON 对象")
+		}
+		in.Metadata = metadata
 	}
 	if v, ok := body["n"]; ok {
 		var n int
@@ -245,12 +282,16 @@ func parseText(body map[string]json.RawMessage, kind string) (textInput, bool, e
 		for _, tool := range tools {
 			t, _ := rawString(tool["type"])
 			if t != "web_search" && t != "web_search_preview" && t != "web_search_preview_2025_03_11" {
-				return in, false, Err(400, "unsupported_tool", "当前文本适配仅支持 web_search 工具")
+				return in, false, Err(400, "unsupported_tool", "当前文本适配仅支持 web_search/web_search_preview 工具")
 			}
 			in.Search = true
 		}
 	}
-	if _, ok := body["web_search_options"]; ok {
+	if raw, ok := body["web_search_options"]; ok {
+		var options map[string]any
+		if json.Unmarshal(raw, &options) != nil || options == nil {
+			return in, false, Err(400, "invalid_web_search_options", "web_search_options 应为 JSON 对象")
+		}
 		in.Search = true
 	}
 	if v, ok := body["reasoning_effort"]; ok {
@@ -385,8 +426,23 @@ func (a *API) serveText(w http.ResponseWriter, r *http.Request, in textInput, st
 	outputID := "msg_" + uuid.NewString()
 	started := false
 	var emit func(string) error
+	metadata := in.Metadata
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
 	response := func(status, text string) map[string]any {
-		return map[string]any{"id": id, "object": "response", "created_at": created, "status": status, "model": in.Model, "output": []any{map[string]any{"id": outputID, "type": "message", "role": "assistant", "status": status, "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}}}}
+		usage := responsesUsage{}
+		if status == "completed" || status == "failed" {
+			usage = estimateResponsesUsage(in, text)
+		}
+		return responsesPayload(id, outputID, created, status, in.Model, text, usage, nil, metadata)
+	}
+	startedResponse := func(status, text string, result textResult) map[string]any {
+		usage := responsesUsage{}
+		if status == "completed" || status == "failed" {
+			usage = estimateResponsesUsage(in, text)
+		}
+		return responsesPayload(id, outputID, created, status, in.Model, text, usage, result.Sources, metadata)
 	}
 	if stream {
 		emit = func(delta string) error {
@@ -424,6 +480,7 @@ func (a *API) serveText(w http.ResponseWriter, r *http.Request, in textInput, st
 			return writeSSE(w, "", map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": in.Model, "choices": []any{map[string]any{"index": 0, "delta": map[string]string{"role": "assistant", "content": delta}, "finish_reason": nil}}})
 		}
 	}
+	var ae *APIError
 	result, ae := a.Engine.runText(r.Context(), in, identity, emit)
 	if ae != nil {
 		if !started {
@@ -433,7 +490,7 @@ func (a *API) serveText(w http.ResponseWriter, r *http.Request, in textInput, st
 			payload := map[string]any{"error": ae}
 			if kind == "responses" {
 				event = "response.failed"
-				v := response("failed", result.Text)
+				v := startedResponse("failed", result.Text, result)
 				v["error"] = ae
 				payload = map[string]any{"type": event, "response": v}
 			}
@@ -444,13 +501,12 @@ func (a *API) serveText(w http.ResponseWriter, r *http.Request, in textInput, st
 	if !stream {
 		switch kind {
 		case "responses":
-			v := response("completed", result.Text)
-			v["sources"] = result.Sources
-			sendJSON(w, 200, v)
+			sendJSON(w, 200, startedResponse("completed", result.Text, result))
 		case "search":
 			sendJSON(w, 200, map[string]any{"conversation_id": result.ConversationID, "status": result.Status, "answer": result.Text, "sources": result.Sources, "assistant_message_id": result.MessageID})
 		case "messages":
-			sendJSON(w, 200, map[string]any{"id": outputID, "type": "message", "role": "assistant", "model": in.Model, "content": []any{map[string]string{"type": "text", "text": result.Text}}, "stop_reason": "end_turn", "stop_sequence": nil, "usage": map[string]int{"input_tokens": 0, "output_tokens": 0}})
+			usage := estimateResponsesUsage(in, result.Text)
+			sendJSON(w, 200, map[string]any{"id": outputID, "type": "message", "role": "assistant", "model": in.Model, "content": []any{map[string]string{"type": "text", "text": result.Text}}, "stop_reason": "end_turn", "stop_sequence": nil, "usage": usage})
 		default:
 			sendJSON(w, 200, map[string]any{"id": id, "object": "chat.completion", "created": created, "model": in.Model, "choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": result.Text}, "finish_reason": "stop"}}, "sources": result.Sources})
 		}
@@ -463,15 +519,17 @@ func (a *API) serveText(w http.ResponseWriter, r *http.Request, in textInput, st
 	}
 	switch kind {
 	case "responses":
-		_ = writeSSE(w, "response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": outputID, "output_index": 0, "content_index": 0, "text": result.Text})
-		v := response("completed", result.Text)
+		v := startedResponse("completed", result.Text, result)
 		item := array(v["output"])[0]
-		_ = writeSSE(w, "response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": outputID, "output_index": 0, "content_index": 0, "part": array(obj(item)["content"])[0]})
+		part := array(obj(item)["content"])[0]
+		_ = writeSSE(w, "response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": outputID, "output_index": 0, "content_index": 0, "text": result.Text, "annotations": obj(part)["annotations"]})
+		_ = writeSSE(w, "response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": outputID, "output_index": 0, "content_index": 0, "part": part})
 		_ = writeSSE(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": item})
 		_ = writeSSE(w, "response.completed", map[string]any{"type": "response.completed", "response": v})
 	case "messages":
+		usage := estimateResponsesUsage(in, result.Text)
 		_ = writeSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
-		_ = writeSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}, "usage": map[string]int{"output_tokens": 0}})
+		_ = writeSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}, "usage": usage})
 		_ = writeSSE(w, "message_stop", map[string]string{"type": "message_stop"})
 	default:
 		_ = writeSSE(w, "", map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": in.Model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}, "sources": result.Sources})

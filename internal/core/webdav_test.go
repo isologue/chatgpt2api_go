@@ -252,13 +252,18 @@ func TestWebDAVAdminPersistenceSecretsAndConflicts(t *testing.T) {
 		t.Fatal("stale revision accepted")
 	}
 	dc.Password = ""
+	dc.UploadBase64 = true
 	if w = save(dc, 1, false); w.Code != 200 || e.CurrentConfig().WebDAV.Password != "test-password" {
 		t.Fatal("blank password did not preserve secret")
 	}
 	saved, _ := store.LoadSettings(context.Background())
 	loaded, err := applySettingValues(c, saved.Values)
-	if err != nil || loaded.WebDAV.Password != "test-password" {
+	if err != nil || loaded.WebDAV.Password != "test-password" || !loaded.WebDAV.UploadBase64 || !e.CurrentConfig().WebDAV.UploadBase64 {
 		t.Fatal("startup restore failed", err)
+	}
+	w = requestJSON(t, h, "GET", "/admin/webdav", "", c.AdminKey)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"upload_base64":true`) {
+		t.Fatal("saved toggle not returned", w.Code, w.Body.String())
 	}
 	w = requestJSON(t, h, "POST", "/admin/webdav/test", "{}", c.AdminKey)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "\"success\":true") {
@@ -283,17 +288,39 @@ func (s *warningLogStore) Log(ctx context.Context, id string, r Request, attempt
 	return s.memoryStore.Log(ctx, id, r, attempts, e, d)
 }
 func TestWebDAVSyncAsyncBase64AndUploadFailureNoAccountRetry(t *testing.T) {
-	for _, mode := range []string{"url", "b64_json", "async", "failure-url", "failure-b64_json", "failure-async", "disabled"} {
-		t.Run(mode, func(t *testing.T) {
+	for _, tc := range []struct {
+		name                                string
+		async, base64, uploadBase64         bool
+		failUpload, disabled, useDefaultB64 bool
+	}{
+		{name: "url"},
+		{name: "async-url", async: true},
+		{name: "base64-default-off", base64: true},
+		{name: "async-base64-default-off", async: true, base64: true},
+		{name: "base64-opt-in", base64: true, uploadBase64: true},
+		{name: "async-base64-opt-in", async: true, base64: true, uploadBase64: true},
+		{name: "forced-default-base64", base64: true, useDefaultB64: true},
+		{name: "failure-url", failUpload: true},
+		{name: "failure-base64", base64: true, uploadBase64: true, failUpload: true},
+		{name: "failure-async-url", async: true, failUpload: true},
+		{name: "webdav-disabled", disabled: true},
+		{name: "webdav-disabled-base64-opt-in", base64: true, uploadBase64: true, disabled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			f := newDAVFixture(t)
 			c := testConfig(t)
 			c.WebDAV = f.config()
-			failed := strings.HasPrefix(mode, "failure-")
+			c.WebDAV.UploadBase64 = tc.uploadBase64
+			failed := tc.failUpload
 			if failed {
 				c.WebDAV.Password = "wrong"
 			}
-			if mode == "disabled" {
+			if tc.disabled {
 				c.WebDAV.Enabled = false
+			}
+			if tc.useDefaultB64 {
+				c.AllowUserFormat = false
+				c.DefaultFormat = "b64_json"
 			}
 			image := tinyPNG()
 			os.WriteFile(c.ImageDir+"/fixture.png", image, 0600)
@@ -307,12 +334,13 @@ func TestWebDAVSyncAsyncBase64AndUploadFailureNoAccountRetry(t *testing.T) {
 			defer e.Close()
 			h := NewHandler(e)
 			body := map[string]any{"prompt": "mock only", "n": 1}
-			isAsync := strings.HasSuffix(mode, "async")
-			isB64 := strings.HasSuffix(mode, "b64_json")
+			isAsync, isB64 := tc.async, tc.base64
 			if isAsync {
 				body["async"] = true
 			}
-			if isB64 {
+			if tc.useDefaultB64 {
+				body["response_format"] = "url"
+			} else if isB64 {
 				body["response_format"] = "base64"
 			}
 			raw, _ := json.Marshal(body)
@@ -361,7 +389,7 @@ func TestWebDAVSyncAsyncBase64AndUploadFailureNoAccountRetry(t *testing.T) {
 				}
 			} else {
 				want := f.server.URL + "/public/"
-				if failed || mode == "disabled" {
+				if failed || tc.disabled {
 					want = c.PublicURL + "/images/fixture.png"
 				}
 				if !strings.HasPrefix(generation.Data[0]["url"], want) {
@@ -386,13 +414,14 @@ func TestWebDAVSyncAsyncBase64AndUploadFailureNoAccountRetry(t *testing.T) {
 			if _, err := os.Stat(c.ImageDir + "/fixture.png"); err != nil {
 				t.Fatal(err)
 			}
-			if (failed || mode == "disabled") && f.put.Load() != 0 {
-				t.Fatal("unexpected upload")
+			var wantPuts int64
+			if !failed && !tc.disabled && (!isB64 || tc.uploadBase64) {
+				wantPuts = 1
 			}
-			if !failed && mode != "disabled" && f.put.Load() != 1 {
-				t.Fatal("expected one PUT")
+			if got := f.put.Load(); got != wantPuts {
+				t.Fatalf("got %d uploads, want %d", got, wantPuts)
 			}
-			if isAsync && !failed {
+			if isAsync && !isB64 && !failed && !tc.disabled {
 				os.Remove(c.ImageDir + "/fixture.png")
 				w = requestJSON(t, h, "GET", "/v1/images/tasks/"+taskID, "", c.APIKey)
 				if w.Code != 200 || !strings.Contains(w.Body.String(), f.server.URL+"/public/") {

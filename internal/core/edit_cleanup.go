@@ -8,7 +8,13 @@ import (
 
 // 仅由已持有数据库调度租约的启动流程调用。重启后未完成任务已标记失败。
 func CleanupEditInputs(c Config) error {
-	dir := filepath.Join(c.ImageDir, ".edit-inputs")
+	if err := cleanupInputDirectory(filepath.Join(c.ImageDir, ".edit-inputs"), "edit-"); err != nil {
+		return err
+	}
+	return cleanupInputDirectory(filepath.Join(c.ImageDir, ".audio-inputs"), "audio-")
+}
+
+func cleanupInputDirectory(dir, prefix string) error {
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return nil
@@ -17,7 +23,7 @@ func CleanupEditInputs(c Config) error {
 		return err
 	}
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), "edit-") {
+		if strings.HasPrefix(entry.Name(), prefix) {
 			if err = os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
 				return err
 			}

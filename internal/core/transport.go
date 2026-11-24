@@ -37,6 +37,7 @@ type session struct {
 	routeMu      sync.Mutex
 	routeClosed  bool
 	routeProxy   bool
+	routeEntry   *proxyEntry
 }
 
 func newTransport(c Config) (tlsclient.HttpClient, error) {
@@ -130,12 +131,17 @@ func aRaw(value string) json.RawMessage {
 func (s *session) request(ctx context.Context, method, path string, payload any, extra map[string]string) (*http.Response, error) {
 
 	var body io.Reader
-	if payload != nil {
+	if reader, ok := payload.(io.Reader); ok {
+		body = reader
+	} else if payload != nil {
 		body = bytes.NewReader(compactJSON(payload))
 	}
 	req, err := http.NewRequestWithContext(ctx, method, s.n.c.UpstreamURL+path, body)
 	if err != nil {
 		return nil, err
+	}
+	if sized, ok := payload.(interface{ Size() int64 }); ok {
+		req.ContentLength = sized.Size()
 	}
 	sec := func(key, fallback string) string {
 		if value := accountFingerprintValue(s.a, key); value != "" {
